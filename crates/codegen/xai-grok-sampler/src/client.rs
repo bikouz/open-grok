@@ -78,13 +78,14 @@ impl GrokRequestHeaders<'_> {
 /// so we only handle that form. HTTP-dates silently return `None` and
 /// the caller falls back to exponential backoff.
 /// Capped at 120s to prevent absurdly long sleeps from a misbehaving upstream.
-/// Deserialize a Responses API SSE event, with a fallback for xAI-specific
-/// tool types (e.g., `x_search`) that `async_openai` can't parse.
+/// Deserialize a Responses API SSE event, with fallbacks for valid wire
+/// shapes that `async_openai` can't parse.
 ///
 /// The API echoes the request's `tools` array in `ResponseCompleted` and
 /// `ResponseCreated` events. If we sent `{"type": "x_search"}`, the response
-/// includes it, and `rs::Tool` deserialization fails. On failure, we strip
-/// unrecognized tools from the raw JSON and retry.
+/// includes it, and `rs::Tool` deserialization fails. Custom-tool events can
+/// also omit fields that async-openai 0.33.1 requires. On failure, we normalize
+/// those compatibility gaps, strip unrecognized tools, and retry.
 ///
 /// On `response.completed` / `response.incomplete`, this also rewrites
 /// `response.usage.total_tokens` in place to the live context length
@@ -102,6 +103,8 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
         Err(first_err) => {
             // Try sanitizing: parse as Value, strip unknown tools, retry.
             if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
+                normalize_response_event_compat(&mut value);
+
                 // Strip tools that async_openai's rs::Tool can't deserialize
                 // (e.g., xAI-specific "x_search"). Instead of maintaining a
                 // hardcoded allowlist, try deserializing each tool entry —
@@ -127,6 +130,69 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     };
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
+}
+
+/// Normalize valid custom-tool stream shapes that async-openai 0.33.1 models
+/// more strictly than the wire protocol used by some Responses deployments.
+///
+/// The normalization mutates only missing compatibility fields. In particular,
+/// optional `status` and provider extension fields remain on the raw object for
+/// deserialization by newer dependency versions.
+fn normalize_response_event_compat(value: &mut serde_json::Value) {
+    let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+
+    match event_type {
+        "response.output_item.added" => {
+            if let Some(item) = value.get_mut("item") {
+                fill_missing_custom_tool_call_id(item);
+            }
+        }
+        "response.completed" | "response.failed" | "response.incomplete" => {
+            if let Some(output) = value
+                .pointer_mut("/response/output")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for item in output {
+                    fill_missing_custom_tool_call_id(item);
+                }
+            }
+        }
+        "response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done" => {
+            let Some(event) = value.as_object_mut() else {
+                return;
+            };
+            if !event.contains_key("item_id") {
+                let item_id = event
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                event.insert("item_id".to_owned(), serde_json::Value::String(item_id));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fill_missing_custom_tool_call_id(item: &mut serde_json::Value) {
+    let Some(item) = item.as_object_mut() else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("custom_tool_call")
+        || item.contains_key("id")
+    {
+        return;
+    }
+    let Some(call_id) = item
+        .get("call_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    item.insert("id".to_owned(), serde_json::Value::String(call_id));
 }
 
 /// On terminal Responses API events (`response.completed` /
@@ -2571,6 +2637,145 @@ mod tests {
         let client = SamplingClient::new(cfg).expect("client should build");
         // Must not panic.
         client.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletions);
+    }
+
+    #[test]
+    fn deserialize_response_event_fills_custom_tool_call_id_on_output_item_added() {
+        let sse = r#"{
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {
+                "type": "custom_tool_call",
+                "call_id": "call_custom_1",
+                "name": "code",
+                "input": "",
+                "status": "in_progress"
+            }
+        }"#;
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(sse).is_err());
+
+        let event = deserialize_response_event(sse).expect("compatibility frame should parse");
+        let rs::ResponseStreamEvent::ResponseOutputItemAdded(event) = event else {
+            panic!("expected ResponseOutputItemAdded");
+        };
+        let rs::OutputItem::CustomToolCall(call) = event.item else {
+            panic!("expected CustomToolCall");
+        };
+        assert_eq!(call.call_id, "call_custom_1");
+        assert_eq!(call.id, "call_custom_1");
+        assert_eq!(call.name, "code");
+        assert_eq!(call.input, "");
+    }
+
+    #[test]
+    fn deserialize_response_event_fills_custom_tool_call_id_in_terminal_output_arrays() {
+        for (event_type, response_status) in [
+            ("response.completed", "completed"),
+            ("response.incomplete", "incomplete"),
+            ("response.failed", "failed"),
+        ] {
+            let sse = serde_json::json!({
+                "type": event_type,
+                "sequence_number": 2,
+                "response": {
+                    "id": "resp_custom_1",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": "grok-build",
+                    "status": response_status,
+                    "output": [{
+                        "type": "custom_tool_call",
+                        "call_id": "call_custom_2",
+                        "name": "code",
+                        "input": "println!(\"hello\");",
+                        "status": "completed",
+                        "provider_extension": { "retained": true }
+                    }]
+                }
+            })
+            .to_string();
+            assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&sse).is_err());
+
+            let event = deserialize_response_event(&sse)
+                .unwrap_or_else(|error| panic!("{event_type} compatibility frame: {error}"));
+            let output = match event {
+                rs::ResponseStreamEvent::ResponseCompleted(event) => event.response.output,
+                rs::ResponseStreamEvent::ResponseIncomplete(event) => event.response.output,
+                rs::ResponseStreamEvent::ResponseFailed(event) => event.response.output,
+                other => panic!("unexpected terminal event: {other:?}"),
+            };
+            let rs::OutputItem::CustomToolCall(call) = &output[0] else {
+                panic!("expected CustomToolCall");
+            };
+            assert_eq!(call.call_id, "call_custom_2");
+            assert_eq!(call.id, "call_custom_2");
+            assert_eq!(call.name, "code");
+            assert_eq!(call.input, "println!(\"hello\");");
+        }
+    }
+
+    #[test]
+    fn deserialize_response_event_fills_custom_input_delta_item_id_from_call_id() {
+        let sse = r#"{
+            "type": "response.custom_tool_call_input.delta",
+            "sequence_number": 3,
+            "output_index": 1,
+            "call_id": "call_custom_3",
+            "delta": "partial input",
+            "status": "in_progress",
+            "provider_extension": { "retained": true }
+        }"#;
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(sse).is_err());
+
+        let event = deserialize_response_event(sse).expect("compatibility frame should parse");
+        let rs::ResponseStreamEvent::ResponseCustomToolCallInputDelta(event) = event else {
+            panic!("expected ResponseCustomToolCallInputDelta");
+        };
+        assert_eq!(event.item_id, "call_custom_3");
+        assert_eq!(event.output_index, 1);
+        assert_eq!(event.delta, "partial input");
+    }
+
+    #[test]
+    fn deserialize_response_event_fills_custom_input_done_item_id_from_call_id() {
+        let sse = r#"{
+            "type": "response.custom_tool_call_input.done",
+            "sequence_number": 4,
+            "output_index": 2,
+            "call_id": "call_custom_4",
+            "input": "complete input",
+            "status": "completed",
+            "provider_extension": { "retained": true }
+        }"#;
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(sse).is_err());
+
+        let event = deserialize_response_event(sse).expect("compatibility frame should parse");
+        let rs::ResponseStreamEvent::ResponseCustomToolCallInputDone(event) = event else {
+            panic!("expected ResponseCustomToolCallInputDone");
+        };
+        assert_eq!(event.item_id, "call_custom_4");
+        assert_eq!(event.output_index, 2);
+        assert_eq!(event.input, "complete input");
+    }
+
+    #[test]
+    fn normalize_response_event_compat_preserves_optional_custom_tool_fields() {
+        let mut value = serde_json::json!({
+            "type": "response.custom_tool_call_input.delta",
+            "sequence_number": 5,
+            "output_index": 3,
+            "call_id": "call_custom_5",
+            "delta": "input",
+            "status": "in_progress",
+            "provider_extension": { "retained": true }
+        });
+
+        normalize_response_event_compat(&mut value);
+
+        assert_eq!(value["item_id"], "call_custom_5");
+        assert_eq!(value["status"], "in_progress");
+        assert_eq!(value["provider_extension"]["retained"], true);
     }
 
     /// `response.completed` carrying
