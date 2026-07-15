@@ -162,17 +162,17 @@ pub(crate) fn budget_recap_items(
 }
 
 /// Trailing normalization shared by [`build_recap_items`] and
-/// [`budget_recap_items`]: pop a trailing tool run — trailing `ToolResult`s and
-/// any trailing `Assistant` with `tool_calls` (complete runs included) — so it ends on
-/// a clean boundary and the appended `User` instruction never follows a
-/// `tool_use`/`tool_result`.
-fn pop_trailing_tool_run(items: &mut Vec<ConversationItem>) {
+/// [`budget_recap_items`]: pop a trailing tool run — trailing `ToolResult`s or
+/// native `CustomToolOutput`s and any trailing `Assistant` with `tool_calls`
+/// (complete runs included) — so it ends on a clean boundary and the appended
+/// `User` instruction never follows a tool call or output.
+pub(crate) fn pop_trailing_tool_run(items: &mut Vec<ConversationItem>) {
     while let Some(last) = items.last() {
         match last {
             ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => {
                 items.pop();
             }
-            ConversationItem::ToolResult(_) => {
+            ConversationItem::ToolResult(_) | ConversationItem::CustomToolOutput(_) => {
                 items.pop();
             }
             _ => break,
@@ -770,6 +770,31 @@ mod tests {
         ];
         pop_trailing_tool_run(&mut clean);
         assert_eq!(clean.len(), 2, "a clean (non-tool) tail is left untouched");
+    }
+
+    #[test]
+    fn pop_trailing_removes_native_custom_output_and_owning_call() {
+        use xai_grok_sampling_types::CustomToolOutputItem;
+
+        let mut items = vec![
+            ConversationItem::user("hi"),
+            ConversationItem::assistant_tool_calls(vec![mk_tool_call("code-call", "{}")]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("code-call", "progress")
+                    .with_item_id("notify-1")
+                    .with_name("exec"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("code-call", "done")
+                    .with_item_id("result-1")
+                    .with_name("exec"),
+            ),
+        ];
+
+        pop_trailing_tool_run(&mut items);
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], ConversationItem::User(_)));
     }
 
     #[test]

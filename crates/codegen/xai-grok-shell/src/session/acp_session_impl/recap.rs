@@ -42,18 +42,10 @@ impl SessionActor {
         // message whose tool_calls have no matching ToolResult yet. The
         // Anthropic Messages API rejects this with "tool_use ids were found
         // without tool_result blocks". Truncate the trailing incomplete
-        // assistant+tool_result run.
-        while let Some(last) = items.last() {
-            match last {
-                ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => {
-                    items.pop();
-                }
-                ConversationItem::ToolResult(_) => {
-                    items.pop();
-                }
-                _ => break,
-            }
-        }
+        // assistant+tool-output run. Use the same normalization as `/recap`
+        // so native Responses custom-tool outputs cannot leave their owning
+        // assistant call dangling either.
+        crate::session::helpers::session_recap::pop_trailing_tool_run(&mut items);
 
         // Wrap the question in a <system-reminder> user message.
         let tag = self.reminder_wrapper_tag();
