@@ -276,6 +276,11 @@ pub struct ToolResultItem {
     /// separate follow-up user message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ContentPart>,
+    /// Ordered native output blocks for Responses tools that return mixed
+    /// text/images. This is separate from legacy `content` + `images` so old
+    /// persisted conversations retain their exact behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordered_content: Vec<CustomToolOutputContent>,
 }
 
 /// One native Responses custom-tool-call output.
@@ -608,7 +613,10 @@ fn encode_custom_tool_call_id(call_id: &str, item_id: &str) -> Arc<str> {
     ))
 }
 
-fn decode_custom_tool_call_id(value: &str) -> Option<(&str, &str)> {
+/// Decode the opaque legacy custom-call identity used in generic tool-result
+/// rows. Downstream history repair uses this to compare provider call IDs
+/// across old and native custom-output representations.
+pub fn decode_custom_tool_call_id(value: &str) -> Option<(&str, &str)> {
     let encoded = value.strip_prefix(CUSTOM_TOOL_CALL_ID_PREFIX)?;
     let (call_id_len, payload) = encoded.split_once(':')?;
     let call_id_len = call_id_len.parse::<usize>().ok()?;
@@ -929,6 +937,36 @@ impl ConversationRequest {
         occurrences
     }
 
+    /// Locate `original` images in ordered function-tool outputs (notably the
+    /// Code Mode `wait` function) using their flattened Responses positions.
+    pub fn original_detail_function_output_images(
+        &self,
+    ) -> Vec<OriginalDetailCustomOutputImageOccurrence> {
+        let mut occurrences = Vec::new();
+        let mut input_item_index = 0;
+
+        for item in &self.items {
+            if let ConversationItem::ToolResult(output) = item {
+                for (output_content_index, part) in output.ordered_content.iter().enumerate() {
+                    if let CustomToolOutputContent::Image {
+                        url,
+                        detail: CustomToolOutputImageDetail::Original,
+                    } = part
+                    {
+                        occurrences.push(OriginalDetailCustomOutputImageOccurrence {
+                            input_item_index,
+                            output_content_index,
+                            image_url: url.clone(),
+                        });
+                    }
+                }
+            }
+            input_item_index += conversation_item_to_input_items(item).len();
+        }
+
+        occurrences
+    }
+
     /// Locate named native custom-tool outputs in the flattened Responses
     /// input so the sampler can restore the wire-only `name` field.
     pub fn named_custom_tool_outputs(&self) -> Vec<NamedCustomToolOutputOccurrence> {
@@ -976,6 +1014,14 @@ impl ConversationRequest {
                     // images/PDFs). On 413 retry these are the largest payloads.
                     stripped += t.images.len();
                     t.images.clear();
+                    for part in &mut t.ordered_content {
+                        if matches!(part, CustomToolOutputContent::Image { .. }) {
+                            *part = CustomToolOutputContent::Text {
+                                text: Arc::<str>::from("[image removed — conversation too large]"),
+                            };
+                            stripped += 1;
+                        }
+                    }
                 }
                 ConversationItem::CustomToolOutput(output) => {
                     for part in &mut output.content {
@@ -1508,6 +1554,7 @@ impl ConversationItem {
             tool_call_id: tool_call_id.into(),
             content: Arc::<str>::from(content.into()),
             images: Vec::new(),
+            ordered_content: Vec::new(),
         })
     }
 
@@ -1542,6 +1589,29 @@ impl ConversationItem {
             tool_call_id: tool_call_id.into(),
             content: Arc::<str>::from(content.into()),
             images,
+            ordered_content: Vec::new(),
+        })
+    }
+
+    /// Create a function-tool result whose mixed content order and image
+    /// fidelity must survive Responses replay (for example Code Mode `wait`).
+    pub fn tool_result_with_ordered_content(
+        tool_call_id: impl Into<String>,
+        ordered_content: Vec<CustomToolOutputContent>,
+    ) -> Self {
+        let text = ordered_content
+            .iter()
+            .filter_map(|part| match part {
+                CustomToolOutputContent::Text { text } => Some(text.as_ref()),
+                CustomToolOutputContent::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        Self::ToolResult(ToolResultItem {
+            tool_call_id: tool_call_id.into(),
+            content: Arc::<str>::from(text),
+            images: Vec::new(),
+            ordered_content,
         })
     }
 
@@ -2038,6 +2108,7 @@ impl From<ChatRequestMessage> for ConversationItem {
                     tool_call_id: msg.tool_call_id.unwrap_or_default(),
                     content: Arc::<str>::from(content),
                     images: Vec::new(),
+                    ordered_content: Vec::new(),
                 })
             }
         }
@@ -2197,7 +2268,31 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             }
         }
         ConversationItem::ToolResult(t) => {
-            if t.images.is_empty() {
+            if !t.ordered_content.is_empty() {
+                let blocks = t
+                    .ordered_content
+                    .into_iter()
+                    .map(|part| match part {
+                        CustomToolOutputContent::Text { text } => ChatContentBlock::Text {
+                            text: text.as_ref().to_owned(),
+                        },
+                        CustomToolOutputContent::Image { url, .. } => ChatContentBlock::ImageUrl {
+                            image_url: ImageUrl {
+                                url: url.as_ref().to_owned(),
+                            },
+                        },
+                    })
+                    .collect();
+                ChatRequestMessage {
+                    role: Role::Tool,
+                    content: MessageContent::Blocks(blocks),
+                    name: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(t.tool_call_id),
+                    model_id: None,
+                    reasoning_content: None,
+                }
+            } else if t.images.is_empty() {
                 ChatRequestMessage::tool(t.tool_call_id, t.content.as_ref().to_owned())
             } else {
                 let mut blocks = vec![ChatContentBlock::Text {
@@ -2716,6 +2811,23 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
 }
 
 /// Convert a ConversationItem to Responses API InputItem(s)
+fn custom_tool_output_content_to_responses(part: &CustomToolOutputContent) -> rs::InputContent {
+    match part {
+        CustomToolOutputContent::Text { text } => {
+            rs::InputContent::InputText(rs::InputTextContent {
+                text: text.as_ref().to_owned(),
+            })
+        }
+        CustomToolOutputContent::Image { url, detail } => {
+            rs::InputContent::InputImage(rs::InputImageContent {
+                detail: detail.to_responses_api(),
+                file_id: None,
+                image_url: Some(url.as_ref().to_owned()),
+            })
+        }
+    }
+}
+
 fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputItem> {
     match item {
         ConversationItem::System(s) => {
@@ -2793,7 +2905,14 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
         }
         ConversationItem::ToolResult(t) => {
             if let Some((call_id, _)) = decode_custom_tool_call_id(&t.tool_call_id) {
-                let output = if t.images.is_empty() {
+                let output = if !t.ordered_content.is_empty() {
+                    rs::CustomToolCallOutputOutput::List(
+                        t.ordered_content
+                            .iter()
+                            .map(custom_tool_output_content_to_responses)
+                            .collect(),
+                    )
+                } else if t.images.is_empty() {
                     rs::CustomToolCallOutputOutput::Text(t.content.as_ref().to_owned())
                 } else {
                     let mut parts: Vec<rs::InputContent> =
@@ -2821,7 +2940,14 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
             }
             // Tool results are sent as FunctionCallOutput items.
             // When images are present, use Content variant with text + image blocks.
-            let output = if t.images.is_empty() {
+            let output = if !t.ordered_content.is_empty() {
+                rs::FunctionCallOutput::Content(
+                    t.ordered_content
+                        .iter()
+                        .map(custom_tool_output_content_to_responses)
+                        .collect(),
+                )
+            } else if t.images.is_empty() {
                 rs::FunctionCallOutput::Text(t.content.as_ref().to_owned())
             } else {
                 let mut parts: Vec<rs::InputContent> =
@@ -2857,20 +2983,7 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                         output
                             .content
                             .iter()
-                            .map(|part| match part {
-                                CustomToolOutputContent::Text { text } => {
-                                    rs::InputContent::InputText(rs::InputTextContent {
-                                        text: text.as_ref().to_owned(),
-                                    })
-                                }
-                                CustomToolOutputContent::Image { url, detail } => {
-                                    rs::InputContent::InputImage(rs::InputImageContent {
-                                        detail: detail.to_responses_api(),
-                                        file_id: None,
-                                        image_url: Some(url.as_ref().to_owned()),
-                                    })
-                                }
-                            })
+                            .map(custom_tool_output_content_to_responses)
                             .collect(),
                     )
                 };
@@ -3286,6 +3399,13 @@ pub fn transform_conversation_cwd(
                 if t.content.contains(source_cwd) {
                     t.content = Arc::<str>::from(t.content.replace(source_cwd, target_cwd));
                 }
+                for part in &mut t.ordered_content {
+                    if let CustomToolOutputContent::Text { text } = part
+                        && text.contains(source_cwd)
+                    {
+                        *text = Arc::<str>::from(text.replace(source_cwd, target_cwd));
+                    }
+                }
             }
             ConversationItem::CustomToolOutput(output) => {
                 for part in &mut output.content {
@@ -3668,6 +3788,34 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
             .collect()
     };
 
+    let custom_tool_output_content_to_anthropic = |part: &CustomToolOutputContent| -> ContentBlock {
+        match part {
+            CustomToolOutputContent::Text { text } => ContentBlock::Text {
+                text: text.as_ref().to_owned(),
+                cache_control: None,
+            },
+            CustomToolOutputContent::Image { url, .. } => {
+                let source = if let Some(rest) = url.strip_prefix("data:") {
+                    if let Some((media_type, data)) = rest.split_once(";base64,") {
+                        ImageSource::Base64 {
+                            media_type: media_type.to_string(),
+                            data: data.to_string(),
+                        }
+                    } else {
+                        ImageSource::Url {
+                            url: url.as_ref().to_owned(),
+                        }
+                    }
+                } else {
+                    ImageSource::Url {
+                        url: url.as_ref().to_owned(),
+                    }
+                };
+                ContentBlock::Image { source }
+            }
+        }
+    };
+
     // Flush pending assistant blocks into a message
     let flush_assistant = |pending: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
         if !pending.is_empty() {
@@ -3739,7 +3887,14 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
             }
             ConversationItem::ToolResult(t) => {
                 flush_assistant(&mut pending_assistant, &mut messages);
-                let content = if t.images.is_empty() {
+                let content = if !t.ordered_content.is_empty() {
+                    ToolResultContent::Blocks(
+                        t.ordered_content
+                            .iter()
+                            .map(custom_tool_output_content_to_anthropic)
+                            .collect(),
+                    )
+                } else if t.images.is_empty() {
                     ToolResultContent::Text(t.content.as_ref().to_owned())
                 } else {
                     let mut blocks = vec![ContentBlock::Text {
@@ -3780,31 +3935,7 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                 let blocks: Vec<ContentBlock> = output
                     .content
                     .iter()
-                    .map(|part| match part {
-                        CustomToolOutputContent::Text { text } => ContentBlock::Text {
-                            text: text.as_ref().to_owned(),
-                            cache_control: None,
-                        },
-                        CustomToolOutputContent::Image { url, .. } => {
-                            let source = if let Some(rest) = url.strip_prefix("data:") {
-                                if let Some((media_type, data)) = rest.split_once(";base64,") {
-                                    ImageSource::Base64 {
-                                        media_type: media_type.to_string(),
-                                        data: data.to_string(),
-                                    }
-                                } else {
-                                    ImageSource::Url {
-                                        url: url.as_ref().to_owned(),
-                                    }
-                                }
-                            } else {
-                                ImageSource::Url {
-                                    url: url.as_ref().to_owned(),
-                                }
-                            };
-                            ContentBlock::Image { source }
-                        }
-                    })
+                    .map(custom_tool_output_content_to_anthropic)
                     .collect();
                 let content = match blocks.as_slice() {
                     [ContentBlock::Text { text, .. }] => ToolResultContent::Text(text.clone()),
@@ -4434,6 +4565,46 @@ mod tests {
                     "type": "input_image",
                     // async-openai 0.33.1 has no Original variant; the
                     // occurrence helper tells the sampler to patch this.
+                    "detail": "high",
+                    "image_url": "data:image/png;base64,iVBOR"
+                },
+                {"type": "input_text", "text": "B"}
+            ])
+        );
+    }
+
+    #[test]
+    fn ordered_function_output_replay_preserves_a_image_b_order_and_detail() {
+        let item = ConversationItem::tool_result_with_ordered_content(
+            "call-wait",
+            vec![
+                CustomToolOutputContent::text("A"),
+                CustomToolOutputContent::image(
+                    "data:image/png;base64,iVBOR",
+                    CustomToolOutputImageDetail::Original,
+                ),
+                CustomToolOutputContent::text("B"),
+            ],
+        );
+        let request = ConversationRequest::from_items(vec![item]);
+        assert_eq!(
+            request.original_detail_function_output_images(),
+            vec![OriginalDetailCustomOutputImageOccurrence {
+                input_item_index: 0,
+                output_content_index: 1,
+                image_url: Arc::<str>::from("data:image/png;base64,iVBOR"),
+            }]
+        );
+
+        let wire = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        assert_eq!(wire["input"][0]["type"], "function_call_output");
+        assert_eq!(wire["input"][0]["call_id"], "call-wait");
+        assert_eq!(
+            wire["input"][0]["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "A"},
+                {
+                    "type": "input_image",
                     "detail": "high",
                     "image_url": "data:image/png;base64,iVBOR"
                 },

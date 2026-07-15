@@ -1,7 +1,8 @@
 //! ConversationRequest assembly — image compaction, pruning, repair, memory injection.
 
 use xai_grok_sampling_types::{
-    ContentPart, ConversationItem, ConversationRequest, ToolSpec, TraceContext,
+    ContentPart, ConversationItem, ConversationRequest, CustomToolOutputContent, ToolSpec,
+    TraceContext,
 };
 
 use super::ChatStateActor;
@@ -180,30 +181,65 @@ pub(crate) fn prune_conversation(conversation: &mut [ConversationItem], config: 
             continue;
         }
 
-        let ConversationItem::ToolResult(tool_result) = &mut conversation[i] else {
-            continue;
-        };
-
         // Never prune recent turns.
         if turn_from_end < config.keep_last_n_turns {
             continue;
         }
 
-        // Hard clear: very old tool results → replace entirely.
-        if turn_from_end >= config.hard_clear_age_turns {
-            if tool_result.content.as_ref() != HARD_CLEAR_PLACEHOLDER {
-                tool_result.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
-            }
-            continue;
-        }
+        match &mut conversation[i] {
+            ConversationItem::ToolResult(tool_result) => {
+                // Hard clear: very old tool results → replace entirely.
+                if turn_from_end >= config.hard_clear_age_turns {
+                    tool_result.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
+                    tool_result.images.clear();
+                    tool_result.ordered_content.clear();
+                    continue;
+                }
 
-        // Soft trim: large tool results → keep head + tail.
-        let content_len = tool_result.content.chars().count();
-        if content_len > config.soft_trim_threshold {
-            let head = safe_char_slice(&tool_result.content, 0, config.soft_trim_head);
-            let tail = safe_char_slice_tail(&tool_result.content, config.soft_trim_tail);
-            tool_result.content =
-                std::sync::Arc::<str>::from(format!("{head}{SOFT_TRIM_SEPARATOR}{tail}"));
+                let source = if tool_result.ordered_content.is_empty() {
+                    tool_result.content.as_ref().to_owned()
+                } else {
+                    tool_result
+                        .ordered_content
+                        .iter()
+                        .filter_map(|part| match part {
+                            xai_grok_sampling_types::CustomToolOutputContent::Text { text } => {
+                                Some(text.as_ref())
+                            }
+                            xai_grok_sampling_types::CustomToolOutputContent::Image { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("")
+                };
+                if source.chars().count() > config.soft_trim_threshold {
+                    let head = safe_char_slice(&source, 0, config.soft_trim_head);
+                    let tail = safe_char_slice_tail(&source, config.soft_trim_tail);
+                    let trimmed = format!("{head}{SOFT_TRIM_SEPARATOR}{tail}");
+                    tool_result.content = std::sync::Arc::<str>::from(trimmed.clone());
+                    tool_result.images.clear();
+                    tool_result.ordered_content =
+                        vec![xai_grok_sampling_types::CustomToolOutputContent::text(
+                            trimmed,
+                        )];
+                }
+            }
+            ConversationItem::CustomToolOutput(output) => {
+                if turn_from_end >= config.hard_clear_age_turns {
+                    output.content = vec![xai_grok_sampling_types::CustomToolOutputContent::text(
+                        HARD_CLEAR_PLACEHOLDER,
+                    )];
+                    continue;
+                }
+                let source = output.text_content();
+                if source.chars().count() > config.soft_trim_threshold {
+                    let head = safe_char_slice(&source, 0, config.soft_trim_head);
+                    let tail = safe_char_slice_tail(&source, config.soft_trim_tail);
+                    output.content = vec![xai_grok_sampling_types::CustomToolOutputContent::text(
+                        format!("{head}{SOFT_TRIM_SEPARATOR}{tail}"),
+                    )];
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -295,29 +331,42 @@ fn serialized_json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> usize {
     counter.0
 }
 
-/// Serialized JSON frame of one image content part with an empty URL —
-/// `{"type":"image","url":""}`. The real payload adds exactly `url.len()` on
-/// top: an inline base64 `data:` URL contains no JSON-escaped characters, so
-/// its encoded length equals its raw length. Identical in our internal JSON and
-/// on the public-API wire (the base64 bytes are the same in both).
-const IMAGE_PART_FRAME_BYTES: usize = r#"{"type":"image","url":""}"#.len();
-
-/// Exact serialized size of a single inline image part (frame + raw URL bytes).
-fn image_part_bytes(url: &str) -> usize {
-    IMAGE_PART_FRAME_BYTES + url.len()
+/// Exact serialized size of an inline image value from its cheap blank-URL
+/// frame plus the raw URL bytes. Base64 data URLs contain no JSON escapes.
+fn image_value_bytes<T: serde::Serialize + ?Sized>(blank_value: &T, url: &str) -> usize {
+    serialized_json_bytes(blank_value) + url.len()
 }
 
 /// Count of inline images in the conversation — for observability only.
 fn inline_image_count(conversation: &[ConversationItem]) -> usize {
     conversation
         .iter()
-        .filter_map(|item| match item {
-            ConversationItem::User(u) => Some(u),
-            _ => None,
+        .map(|item| match item {
+            ConversationItem::User(user) => user
+                .content
+                .iter()
+                .filter(|part| matches!(part, ContentPart::Image { .. }))
+                .count(),
+            ConversationItem::ToolResult(result) => {
+                result
+                    .images
+                    .iter()
+                    .filter(|part| matches!(part, ContentPart::Image { .. }))
+                    .count()
+                    + result
+                        .ordered_content
+                        .iter()
+                        .filter(|part| matches!(part, CustomToolOutputContent::Image { .. }))
+                        .count()
+            }
+            ConversationItem::CustomToolOutput(output) => output
+                .content
+                .iter()
+                .filter(|part| matches!(part, CustomToolOutputContent::Image { .. }))
+                .count(),
+            _ => 0,
         })
-        .flat_map(|u| u.content.iter())
-        .filter(|p| matches!(p, ContentPart::Image { .. }))
-        .count()
+        .sum()
 }
 
 /// Outcome of [`compact_images_to_byte_budget`], surfaced for logging and
@@ -348,16 +397,55 @@ fn conversation_body_bytes(conversation: &[ConversationItem]) -> usize {
     let mut blanked = conversation.to_vec();
     let mut image_url_bytes = 0usize;
     for item in &mut blanked {
-        if let ConversationItem::User(user) = item {
-            for part in &mut user.content {
-                if let ContentPart::Image { url } = part {
-                    image_url_bytes += url.len();
-                    *url = std::sync::Arc::<str>::from("");
+        match item {
+            ConversationItem::User(user) => {
+                for part in &mut user.content {
+                    if let ContentPart::Image { url } = part {
+                        image_url_bytes += url.len();
+                        *url = std::sync::Arc::<str>::from("");
+                    }
                 }
             }
+            ConversationItem::ToolResult(result) => {
+                for part in &mut result.images {
+                    if let ContentPart::Image { url } = part {
+                        image_url_bytes += url.len();
+                        *url = std::sync::Arc::<str>::from("");
+                    }
+                }
+                for part in &mut result.ordered_content {
+                    if let CustomToolOutputContent::Image { url, .. } = part {
+                        image_url_bytes += url.len();
+                        *url = std::sync::Arc::<str>::from("");
+                    }
+                }
+            }
+            ConversationItem::CustomToolOutput(output) => {
+                for part in &mut output.content {
+                    if let CustomToolOutputContent::Image { url, .. } = part {
+                        image_url_bytes += url.len();
+                        *url = std::sync::Arc::<str>::from("");
+                    }
+                }
+            }
+            _ => {}
         }
     }
     serialized_json_bytes(&blanked) + image_url_bytes
+}
+
+#[derive(Clone, Copy)]
+enum InlineImageLocation {
+    User { item_idx: usize, part_idx: usize },
+    ToolResultImage { item_idx: usize, part_idx: usize },
+    ToolResultOrdered { item_idx: usize, part_idx: usize },
+    CustomToolOutput { item_idx: usize, part_idx: usize },
+}
+
+struct InlineImageCandidate {
+    location: InlineImageLocation,
+    image_bytes: usize,
+    placeholder_bytes: usize,
 }
 
 /// Replace the oldest inline images with [`IMAGE_COMPACT_PLACEHOLDER`] until
@@ -404,42 +492,151 @@ pub(crate) fn compact_images_to_byte_budget(
         };
     }
 
-    // The text part each evicted image is replaced with. Measured once: every
-    // eviction shrinks the body by the image part's bytes and grows it back by
-    // this placeholder's bytes, so the net saving is `image - placeholder`.
-    let placeholder = ContentPart::Text {
+    // Each content family has its own serialized frame. Measure both exact
+    // placeholder forms once, then retain the image frame's detail metadata
+    // while measuring each candidate.
+    let content_placeholder = ContentPart::Text {
         text: std::sync::Arc::<str>::from(IMAGE_COMPACT_PLACEHOLDER),
     };
-    let placeholder_bytes = serialized_json_bytes(&placeholder);
+    let content_placeholder_bytes = serialized_json_bytes(&content_placeholder);
+    let ordered_placeholder = CustomToolOutputContent::text(IMAGE_COMPACT_PLACEHOLDER);
+    let ordered_placeholder_bytes = serialized_json_bytes(&ordered_placeholder);
 
-    // (item_idx, part_idx, exact serialized image-part bytes) for every inline
-    // image, oldest-first.
-    let mut images: Vec<(usize, usize, usize)> = Vec::new();
+    // Every inline image, oldest-first across all conversation output forms.
+    let mut images = Vec::new();
     for (i, item) in conversation.iter().enumerate() {
-        if let ConversationItem::User(user) = item {
-            for (j, part) in user.content.iter().enumerate() {
-                if let ContentPart::Image { url } = part {
-                    images.push((i, j, image_part_bytes(url)));
+        match item {
+            ConversationItem::User(user) => {
+                for (j, part) in user.content.iter().enumerate() {
+                    if let ContentPart::Image { url } = part {
+                        let blank = ContentPart::Image {
+                            url: std::sync::Arc::<str>::from(""),
+                        };
+                        images.push(InlineImageCandidate {
+                            location: InlineImageLocation::User {
+                                item_idx: i,
+                                part_idx: j,
+                            },
+                            image_bytes: image_value_bytes(&blank, url),
+                            placeholder_bytes: content_placeholder_bytes,
+                        });
+                    }
                 }
             }
+            ConversationItem::ToolResult(result) => {
+                for (j, part) in result.images.iter().enumerate() {
+                    if let ContentPart::Image { url } = part {
+                        let blank = ContentPart::Image {
+                            url: std::sync::Arc::<str>::from(""),
+                        };
+                        images.push(InlineImageCandidate {
+                            location: InlineImageLocation::ToolResultImage {
+                                item_idx: i,
+                                part_idx: j,
+                            },
+                            image_bytes: image_value_bytes(&blank, url),
+                            placeholder_bytes: content_placeholder_bytes,
+                        });
+                    }
+                }
+                for (j, part) in result.ordered_content.iter().enumerate() {
+                    if let CustomToolOutputContent::Image { url, detail } = part {
+                        let blank = CustomToolOutputContent::Image {
+                            url: std::sync::Arc::<str>::from(""),
+                            detail: *detail,
+                        };
+                        images.push(InlineImageCandidate {
+                            location: InlineImageLocation::ToolResultOrdered {
+                                item_idx: i,
+                                part_idx: j,
+                            },
+                            image_bytes: image_value_bytes(&blank, url),
+                            placeholder_bytes: ordered_placeholder_bytes,
+                        });
+                    }
+                }
+            }
+            ConversationItem::CustomToolOutput(output) => {
+                for (j, part) in output.content.iter().enumerate() {
+                    if let CustomToolOutputContent::Image { url, detail } = part {
+                        let blank = CustomToolOutputContent::Image {
+                            url: std::sync::Arc::<str>::from(""),
+                            detail: *detail,
+                        };
+                        images.push(InlineImageCandidate {
+                            location: InlineImageLocation::CustomToolOutput {
+                                item_idx: i,
+                                part_idx: j,
+                            },
+                            image_bytes: image_value_bytes(&blank, url),
+                            placeholder_bytes: ordered_placeholder_bytes,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     // Evict oldest-first until the body fits again, keeping the newest images.
     let mut running = current_bytes;
     let mut evicted = 0usize;
-    for &(i, j, image_bytes) in &images {
+    for image in images {
         if running <= target_bytes {
             break;
         }
-        if let ConversationItem::User(user) = &mut conversation[i]
-            && let Some(part) = user.content.get_mut(j)
-        {
-            *part = placeholder.clone();
-            // Net body saving: the image part leaves, the placeholder takes its
-            // slot. Everything else (siblings, commas, brackets) is untouched,
-            // so this is the exact change in the serialized body size.
-            running = running.saturating_sub(image_bytes.saturating_sub(placeholder_bytes));
+        let replaced = match image.location {
+            InlineImageLocation::User { item_idx, part_idx } => {
+                if let ConversationItem::User(user) = &mut conversation[item_idx]
+                    && let Some(part) = user.content.get_mut(part_idx)
+                {
+                    *part = content_placeholder.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+            InlineImageLocation::ToolResultImage { item_idx, part_idx } => {
+                if let ConversationItem::ToolResult(result) = &mut conversation[item_idx]
+                    && let Some(part) = result.images.get_mut(part_idx)
+                {
+                    *part = content_placeholder.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+            InlineImageLocation::ToolResultOrdered { item_idx, part_idx } => {
+                if let ConversationItem::ToolResult(result) = &mut conversation[item_idx]
+                    && let Some(part) = result.ordered_content.get_mut(part_idx)
+                {
+                    *part = ordered_placeholder.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+            InlineImageLocation::CustomToolOutput { item_idx, part_idx } => {
+                if let ConversationItem::CustomToolOutput(output) = &mut conversation[item_idx]
+                    && let Some(part) = output.content.get_mut(part_idx)
+                {
+                    *part = ordered_placeholder.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if replaced {
+            // Everything outside the part (siblings, commas, brackets) is
+            // unchanged, so replacing the exact serialized frames updates the
+            // body measurement byte-for-byte. Tiny URLs can be smaller than
+            // the explanatory placeholder; account for that increase too.
+            if image.image_bytes >= image.placeholder_bytes {
+                running -= image.image_bytes - image.placeholder_bytes;
+            } else {
+                running += image.placeholder_bytes - image.image_bytes;
+            }
             evicted += 1;
         }
     }
@@ -850,6 +1047,82 @@ mod tests {
         assert_eq!(image_parts(&conv), 1, "newest image survives");
         assert!(has_placeholder(&conv[0]), "oldest turn evicted");
         assert!(has_image(&conv[1]), "newest turn keeps an image");
+    }
+
+    #[test]
+    fn image_budget_covers_user_and_tool_output_images() {
+        use xai_grok_sampling_types::{CustomToolOutputImageDetail, CustomToolOutputItem};
+
+        let image_url = |fill: char| {
+            std::sync::Arc::<str>::from(format!(
+                "data:image/png;base64,{}",
+                fill.to_string().repeat(TEST_IMG_BYTES)
+            ))
+        };
+        let mut conv = vec![
+            user_with_image_of_bytes("user", TEST_IMG_BYTES),
+            ConversationItem::tool_result_with_images(
+                "legacy",
+                "legacy image",
+                vec![ContentPart::Image {
+                    url: image_url('B'),
+                }],
+            ),
+            ConversationItem::tool_result_with_ordered_content(
+                "ordered",
+                vec![CustomToolOutputContent::Image {
+                    url: image_url('C'),
+                    detail: CustomToolOutputImageDetail::High,
+                }],
+            ),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::new(
+                "custom",
+                [CustomToolOutputContent::Image {
+                    url: image_url('D'),
+                    detail: CustomToolOutputImageDetail::Original,
+                }],
+            )),
+        ];
+
+        assert_eq!(inline_image_count(&conv), 4);
+        let current = conversation_body_bytes(&conv);
+        assert_eq!(current, serde_json::to_vec(&conv).unwrap().len());
+
+        let outcome = compact_images_to_byte_budget(&mut conv, current, 0);
+
+        assert_eq!(outcome.evicted, 4);
+        assert_eq!(inline_image_count(&conv), 0);
+        assert_eq!(
+            outcome.body_bytes_after,
+            conversation_body_bytes(&conv),
+            "incremental accounting must match the compacted wire body"
+        );
+        assert!(matches!(
+            &conv[1],
+            ConversationItem::ToolResult(result)
+                if matches!(
+                    result.images.as_slice(),
+                    [ContentPart::Text { text }] if text.as_ref() == IMAGE_COMPACT_PLACEHOLDER
+                )
+        ));
+        assert!(matches!(
+            &conv[2],
+            ConversationItem::ToolResult(result)
+                if matches!(
+                    result.ordered_content.as_slice(),
+                    [CustomToolOutputContent::Text { text }]
+                        if text.as_ref() == IMAGE_COMPACT_PLACEHOLDER
+                )
+        ));
+        assert!(matches!(
+            &conv[3],
+            ConversationItem::CustomToolOutput(output)
+                if matches!(
+                    output.content.as_slice(),
+                    [CustomToolOutputContent::Text { text }]
+                        if text.as_ref() == IMAGE_COMPACT_PLACEHOLDER
+                )
+        ));
     }
 
     #[test]

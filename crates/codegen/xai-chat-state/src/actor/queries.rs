@@ -208,6 +208,9 @@ impl ChatStateActor {
                 xai_grok_sampling_types::ConversationItem::ToolResult(_) => {
                     counts.tool_result += 1;
                 }
+                xai_grok_sampling_types::ConversationItem::CustomToolOutput(_) => {
+                    counts.tool_result += 1;
+                }
                 xai_grok_sampling_types::ConversationItem::System(_) => {}
                 xai_grok_sampling_types::ConversationItem::BackendToolCall(_) => {}
                 xai_grok_sampling_types::ConversationItem::Reasoning(_) => {}

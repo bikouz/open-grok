@@ -63,7 +63,41 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
                     .sum::<usize>();
             (bytes as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
-        ConversationItem::ToolResult(tr) => xai_token_estimation::estimate_tokens(&tr.content),
+        ConversationItem::ToolResult(tr) => {
+            if tr.ordered_content.is_empty() {
+                xai_token_estimation::estimate_tokens(&tr.content)
+            } else {
+                let (bytes, images) =
+                    tr.ordered_content
+                        .iter()
+                        .fold((0usize, 0u64), |(bytes, images), part| match part {
+                            xai_grok_sampling_types::CustomToolOutputContent::Text { text } => {
+                                (bytes + text.len(), images)
+                            }
+                            xai_grok_sampling_types::CustomToolOutputContent::Image { .. } => {
+                                (bytes, images + 1)
+                            }
+                        });
+                (bytes as u64) / xai_token_estimation::BYTES_PER_TOKEN
+                    + xai_token_estimation::estimate_image_tokens(images)
+            }
+        }
+        ConversationItem::CustomToolOutput(output) => {
+            let (bytes, images) =
+                output
+                    .content
+                    .iter()
+                    .fold((0usize, 0u64), |(bytes, images), part| match part {
+                        xai_grok_sampling_types::CustomToolOutputContent::Text { text } => {
+                            (bytes + text.len(), images)
+                        }
+                        xai_grok_sampling_types::CustomToolOutputContent::Image { .. } => {
+                            (bytes, images + 1)
+                        }
+                    });
+            (bytes as u64) / xai_token_estimation::BYTES_PER_TOKEN
+                + xai_token_estimation::estimate_image_tokens(images)
+        }
         ConversationItem::BackendToolCall(b) => {
             xai_token_estimation::estimate_tokens(&b.text_summary())
         }

@@ -1985,7 +1985,10 @@ impl SamplingClient {
         // (e.g., x_search). These are injected as raw JSON after serialization.
         let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
-        let original_detail_custom_output_images = request.original_detail_custom_output_images();
+        let mut original_detail_custom_output_images =
+            request.original_detail_custom_output_images();
+        original_detail_custom_output_images
+            .extend(request.original_detail_function_output_images());
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -2022,7 +2025,10 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
-        let original_detail_custom_output_images = request.original_detail_custom_output_images();
+        let mut original_detail_custom_output_images =
+            request.original_detail_custom_output_images();
+        original_detail_custom_output_images
+            .extend(request.original_detail_function_output_images());
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -2873,13 +2879,25 @@ mod tests {
                 .with_item_id("out-code")
                 .with_name("exec"),
             ),
+            xai_grok_sampling_types::ConversationItem::tool_result_with_ordered_content(
+                "call-wait",
+                vec![
+                    xai_grok_sampling_types::CustomToolOutputContent::text("C"),
+                    xai_grok_sampling_types::CustomToolOutputContent::image(
+                        "data:image/png;base64,WAIT",
+                        xai_grok_sampling_types::CustomToolOutputImageDetail::Original,
+                    ),
+                ],
+            ),
         ]);
         let named_outputs = request.named_custom_tool_outputs();
-        let original_images = request.original_detail_custom_output_images();
+        let mut original_images = request.original_detail_custom_output_images();
+        original_images.extend(request.original_detail_function_output_images());
         let mut body = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
 
         assert!(body["input"][0].get("name").is_none());
         assert_eq!(body["input"][0]["output"][1]["detail"], "high");
+        assert_eq!(body["input"][1]["output"][1]["detail"], "high");
 
         patch_custom_tool_output_wire_fields(&mut body, &named_outputs, &original_images);
 
@@ -2887,6 +2905,7 @@ mod tests {
         assert_eq!(body["input"][0]["output"][1]["detail"], "original");
         assert_eq!(body["input"][0]["output"][0]["text"], "A");
         assert_eq!(body["input"][0]["output"][2]["text"], "B");
+        assert_eq!(body["input"][1]["output"][1]["detail"], "original");
     }
 
     /// `response.completed` carrying

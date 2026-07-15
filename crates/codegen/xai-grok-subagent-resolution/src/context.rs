@@ -325,6 +325,15 @@ fn render_item_to_background(out: &mut String, item: &ConversationItem) {
             };
             let _ = writeln!(out, "[Tool Result]: {preview}");
         }
+        ConversationItem::CustomToolOutput(output) => {
+            let content = output.text_content();
+            let preview = if content.len() > 200 {
+                format!("{}...", truncate_str(&content, 200))
+            } else {
+                content
+            };
+            let _ = writeln!(out, "[Tool Result]: {preview}");
+        }
         ConversationItem::System(_) => {}
         ConversationItem::BackendToolCall(b) => {
             let _ = writeln!(out, "[Backend Tool]: {}", b.text_summary());
@@ -411,6 +420,7 @@ mod tests {
             tool_call_id: "tc-1".to_string(),
             content: content.into(),
             images: Vec::new(),
+            ordered_content: Vec::new(),
         })
     }
 

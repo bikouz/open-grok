@@ -18,6 +18,7 @@ fn item_kind_str(item: &ConversationItem) -> &'static str {
         ConversationItem::User(_) => "user",
         ConversationItem::Assistant(_) => "assistant",
         ConversationItem::ToolResult(_) => "tool_result",
+        ConversationItem::CustomToolOutput(_) => "custom_tool_output",
         ConversationItem::BackendToolCall(_) => "backend_tool_call",
         ConversationItem::Reasoning(_) => "reasoning",
     }
@@ -249,17 +250,33 @@ impl ChatStateActor {
                 continue;
             }
 
-            let ConversationItem::ToolResult(tr) = &mut self.state.conversation[i] else {
-                continue;
-            };
-
             if turn_from_end < effective_threshold {
                 continue;
             }
 
-            if tr.content.as_ref() != HARD_CLEAR_PLACEHOLDER {
-                tr.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
-                cleared += 1;
+            match &mut self.state.conversation[i] {
+                ConversationItem::ToolResult(result) => {
+                    if result.content.as_ref() != HARD_CLEAR_PLACEHOLDER
+                        || !result.images.is_empty()
+                        || !result.ordered_content.is_empty()
+                    {
+                        result.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
+                        result.images.clear();
+                        result.ordered_content.clear();
+                        cleared += 1;
+                    }
+                }
+                ConversationItem::CustomToolOutput(output) => {
+                    if output.text_content() != HARD_CLEAR_PLACEHOLDER || output.content.len() != 1
+                    {
+                        output.content =
+                            vec![xai_grok_sampling_types::CustomToolOutputContent::text(
+                                HARD_CLEAR_PLACEHOLDER,
+                            )];
+                        cleared += 1;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -296,7 +313,36 @@ impl ChatStateActor {
                     })
                     .sum::<usize>(),
                 ConversationItem::Assistant(a) => a.content.len(),
-                ConversationItem::ToolResult(tr) => tr.content.len(),
+                ConversationItem::ToolResult(tr) => {
+                    if tr.ordered_content.is_empty() {
+                        tr.content.len()
+                    } else {
+                        tr.ordered_content
+                            .iter()
+                            .map(|part| match part {
+                                xai_grok_sampling_types::CustomToolOutputContent::Text { text } => {
+                                    text.len()
+                                }
+                                xai_grok_sampling_types::CustomToolOutputContent::Image {
+                                    url,
+                                    ..
+                                } => url.len(),
+                            })
+                            .sum()
+                    }
+                }
+                ConversationItem::CustomToolOutput(output) => output
+                    .content
+                    .iter()
+                    .map(|part| match part {
+                        xai_grok_sampling_types::CustomToolOutputContent::Text { text } => {
+                            text.len()
+                        }
+                        xai_grok_sampling_types::CustomToolOutputContent::Image { url, .. } => {
+                            url.len()
+                        }
+                    })
+                    .sum(),
                 ConversationItem::BackendToolCall(b) => b.text_summary().len(),
                 ConversationItem::Reasoning(r) => {
                     xai_grok_sampling_types::reasoning_item_text(r).len()

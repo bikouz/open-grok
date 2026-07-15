@@ -301,7 +301,10 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                             yield SamplingEvent::ToolCallDelta {
                                 request_id: request_id.clone(),
                                 tool_index,
-                                id: Some(call.id.to_string()),
+                                // ACP/UI consumers need the provider call ID;
+                                // the opaque ID envelope remains on the final
+                                // Conversation ToolCall for lossless replay.
+                                id: Some(call.call_id().to_string()),
                                 name: Some(ct.name),
                                 arguments_delta: has_initial_input.then_some(ct.input),
                             };
@@ -1059,6 +1062,7 @@ mod tests {
 
         let deltas = tool_call_deltas(&evs);
         assert_eq!(deltas.len(), 3);
+        assert_eq!(deltas[0].1.as_deref(), Some("call_code"));
         assert_eq!(deltas[0].2.as_deref(), Some("code"));
         assert_eq!(deltas[0].3, None);
         assert_eq!(deltas[1].3.as_deref(), Some("const answer = "));
