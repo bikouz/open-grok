@@ -88,6 +88,36 @@ struct TurnSpanTotals {
     cache_read_tokens: i64,
     has_tool_call: bool,
 }
+
+fn code_mode_content_to_acp(content: &CustomToolOutputContent) -> acp::ToolCallContent {
+    match content {
+        CustomToolOutputContent::Text { text } => acp::ToolCallContent::from(
+            acp::ContentBlock::Text(acp::TextContent::new(text.as_ref())),
+        ),
+        CustomToolOutputContent::Image { url, detail } => {
+            let image = if let Some(rest) = url.strip_prefix("data:")
+                && let Some((mime_type, data)) = rest.split_once(";base64,")
+            {
+                acp::ImageContent::new(data, mime_type).uri(Some(url.as_ref().to_owned()))
+            } else {
+                acp::ImageContent::new("", "application/octet-stream")
+                    .uri(Some(url.as_ref().to_owned()))
+            };
+            let detail = match detail {
+                CustomToolOutputImageDetail::Auto => "auto",
+                CustomToolOutputImageDetail::Low => "low",
+                CustomToolOutputImageDetail::High => "high",
+                CustomToolOutputImageDetail::Original => "original",
+            };
+            let meta = serde_json::Map::from_iter([(
+                "codex/imageDetail".to_owned(),
+                serde_json::Value::String(detail.to_owned()),
+            )]);
+            acp::ToolCallContent::from(acp::ContentBlock::Image(image.meta(Some(meta))))
+        }
+    }
+}
+
 impl TurnSpanTotals {
     /// Fold one model response into the totals (tokens sum — each call is billed
     /// its full prompt; has_tool_call OR-s — the final call has none) and update
@@ -1664,6 +1694,152 @@ impl SessionActor {
         }
         snapshot
     }
+
+    /// Execute the two model-visible Code Mode control tools without sending
+    /// them through the ordinary JSON function-call parser. The assistant call
+    /// item has already been recorded before this method runs, so nested
+    /// JavaScript tool dispatch can safely emit results and `notify()` outputs
+    /// against an existing custom call.
+    async fn execute_code_mode_control_call(
+        &self,
+        call: &xai_grok_sampling_types::ToolCall,
+        enabled_tools: &[ToolDefinition],
+    ) {
+        let ui_call_id = call.call_id().to_string();
+        let raw_input = if call.is_custom() {
+            serde_json::Value::String(call.arguments.as_ref().to_owned())
+        } else {
+            serde_json::from_str(call.arguments.as_ref())
+                .unwrap_or_else(|_| serde_json::Value::String(call.arguments.as_ref().to_owned()))
+        };
+        self.send_update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(
+                    acp::ToolCallId::new(Arc::from(ui_call_id.as_str())),
+                    call.name.clone(),
+                )
+                .kind(acp::ToolKind::Other)
+                .status(acp::ToolCallStatus::InProgress)
+                .raw_input(Some(raw_input)),
+            ),
+            None,
+        )
+        .await;
+        self.emit_event(crate::session::events::Event::ToolStarted {
+            tool_name: call.name.clone(),
+        });
+        self.observability_bridge
+            .emit(
+                xai_tool_protocol::session_event::SessionEvent::ToolCallStarted {
+                    tool_call_id: ui_call_id.clone(),
+                    tool_name: call.name.clone(),
+                    turn_number: self.current_turn_number.get(),
+                },
+            )
+            .await;
+        self.signals_handle().record_tool_call(&call.name);
+        let started_at = self.events.tool_started(call.name.clone());
+
+        let runtime = &self.rebuild_spec.code_mode_runtime;
+        let result = if call.is_custom()
+            && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
+        {
+            runtime
+                .exec(
+                    call.call_id(),
+                    call.custom_input().unwrap_or_default(),
+                    enabled_tools,
+                )
+                .await
+        } else if !call.is_custom() && call.name == xai_grok_code_mode_protocol::WAIT_TOOL_NAME {
+            runtime.wait(call.arguments.as_ref()).await
+        } else {
+            Err(format!(
+                "Code Mode only accepts the custom `{}` tool and function `{}` tool",
+                xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME,
+                xai_grok_code_mode_protocol::WAIT_TOOL_NAME,
+            ))
+        };
+
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        let (status, outcome, content, raw_output) = match result {
+            Ok(output) => {
+                let text = output.text();
+                let content = output.content;
+                let status = if output.success {
+                    acp::ToolCallStatus::Completed
+                } else {
+                    acp::ToolCallStatus::Failed
+                };
+                let outcome = if output.success {
+                    crate::session::events::ToolOutcome::Success
+                } else {
+                    crate::session::events::ToolOutcome::Error
+                };
+                let raw_output = serde_json::json!({
+                    "cell_id": output.cell_id,
+                    "success": output.success,
+                    "text": text,
+                    "content": &content,
+                });
+                (status, outcome, content, raw_output)
+            }
+            Err(error) => (
+                acp::ToolCallStatus::Failed,
+                crate::session::events::ToolOutcome::Error,
+                vec![CustomToolOutputContent::text(error.clone())],
+                serde_json::json!({ "error": error }),
+            ),
+        };
+
+        let conversation_output = if call.is_custom() {
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::new(call.call_id(), content.clone())
+                    .with_name(call.name.clone()),
+            )
+        } else {
+            ConversationItem::tool_result_with_ordered_content(
+                call.id.as_ref().to_owned(),
+                content.clone(),
+            )
+        };
+        self.chat_state_handle.push_tool_result(conversation_output);
+
+        let acp_content = content
+            .iter()
+            .map(code_mode_content_to_acp)
+            .collect::<Vec<_>>();
+        self.send_update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new(Arc::from(ui_call_id.as_str())),
+                acp::ToolCallUpdateFields::new()
+                    .status(Some(status))
+                    .content(Some(acp_content))
+                    .raw_output(Some(raw_output)),
+            )),
+            None,
+        )
+        .await;
+        self.events.tool_finished();
+        self.signals_handle()
+            .record_tool_duration(&call.name, duration_ms);
+        self.emit_event(crate::session::events::Event::ToolCompleted {
+            tool_name: call.name.clone(),
+            duration_ms,
+            outcome,
+        });
+        self.observability_bridge
+            .emit(
+                xai_tool_protocol::session_event::SessionEvent::ToolCallCompleted {
+                    tool_call_id: ui_call_id,
+                    tool_name: call.name.clone(),
+                    duration_ms,
+                    outcome: map_tool_outcome(outcome),
+                },
+            )
+            .await;
+    }
+
     #[tracing::instrument(
         name = "session.process_conversation_turn",
         skip_all,
@@ -1732,6 +1908,25 @@ impl SessionActor {
         let mut prompt_timing = Some(crate::session::prompt_timing::PromptTiming::start());
         let tool_prep_start = std::time::Instant::now();
         let (tool_definitions, mcp_wait_ms) = self.prepare_tool_definitions_timed().await;
+        let tool_mode = self.agent.borrow().tool_mode();
+        let code_mode_enabled = matches!(
+            tool_mode,
+            xai_grok_sampling_types::ToolMode::CodeMode
+                | xai_grok_sampling_types::ToolMode::CodeModeOnly
+        );
+        let code_mode_only = tool_mode == xai_grok_sampling_types::ToolMode::CodeModeOnly;
+        if code_mode_enabled {
+            let backend = self
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .map(|config| config.api_backend);
+            if backend != Some(xai_grok_sampling_types::ApiBackend::Responses) {
+                return Err(acp::Error::internal_error().data(format!(
+                    "Code Mode requires a Responses-backed model; active backend: {backend:?}"
+                )));
+            }
+        }
         let total_prep_ms = tool_prep_start.elapsed().as_millis() as u64;
         if let Some(ref mut pt) = prompt_timing {
             pt.record_tool_prep(mcp_wait_ms, total_prep_ms);
@@ -1788,7 +1983,7 @@ impl SessionActor {
             false
         };
         let structured_output_native = schema_ok && native_backend;
-        let structured_output_tool = schema_ok && !native_backend;
+        let structured_output_tool = schema_ok && !native_backend && !code_mode_only;
         if structured_output_tool {
             self.push_system_reminder(
                 "A response schema is required. After any tool use, call the \
@@ -1838,6 +2033,14 @@ impl SessionActor {
                 } else {
                     self.turn_base_tool_specs(&tool_definitions)
                 };
+            if code_mode_only {
+                effective_tools.retain(|tool| {
+                    crate::session::code_mode::is_code_mode_direct_only_tool(&tool.name)
+                });
+            }
+            if code_mode_enabled {
+                effective_tools.push(crate::session::code_mode::create_wait_tool());
+            }
             if structured_output_tool && let Some(schema) = json_schema.clone() {
                 effective_tools.push(ToolSpec {
                     name: STRUCTURED_OUTPUT_TOOL.to_string(),
@@ -1892,6 +2095,15 @@ impl SessionActor {
             }
             if use_backend_search {
                 request.hosted_tools = self.agent.borrow().hosted_tools().to_vec();
+            }
+            if code_mode_only {
+                request.hosted_tools.clear();
+            }
+            if code_mode_enabled {
+                request.add_client_tool(crate::session::code_mode::create_exec_tool(
+                    &tool_definitions,
+                    code_mode_only,
+                ));
             }
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
@@ -2236,17 +2448,6 @@ impl SessionActor {
                 }
                 turn_tools_called.push(tc.name.clone());
             }
-            let tool_call_responses: Vec<ToolCallResponse> = tool_calls
-                .into_iter()
-                .map(|tc| ToolCallResponse {
-                    id: tc.id.as_ref().to_owned(),
-                    kind: "function".to_string(),
-                    function: crate::sampling::types::ToolCallFunction {
-                        name: tc.name,
-                        arguments: tc.arguments.as_ref().to_owned(),
-                    },
-                })
-                .collect();
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::ToolExecution,
             });
@@ -2257,33 +2458,61 @@ impl SessionActor {
                     },
                 )
                 .await;
-            let execute_tool_calls_result = self.execute_tool_calls(tool_call_responses).await;
-            match execute_tool_calls_result {
-                Ok(ToolLoop::PermissionReject { tool_name, reason }) => {
-                    return Ok(TurnOutcome::Cancelled {
-                        category: Some(
-                            crate::session::events::CancellationCategory::PermissionRejected,
-                        ),
-                        context: Some(serde_json::json!(
-                            { "tool_name" : tool_name, "reason" : reason, }
-                        )),
-                    });
-                }
-                Ok(ToolLoop::HookDenied { .. }) => {}
-                Ok(ToolLoop::Cancelled) => {
-                    return Ok(TurnOutcome::Cancelled {
-                        category: Some(
-                            crate::session::events::CancellationCategory::PermissionCancelled,
-                        ),
-                        context: None,
-                    });
-                }
-                Ok(ToolLoop::FollowupMessage(followup_message)) => {
-                    self.add_followup_message_as_user_turn(&followup_message)
+            let mut direct_tool_calls = Vec::new();
+            for call in tool_calls {
+                let code_mode_control_call = code_mode_enabled
+                    && ((call.is_custom()
+                        && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME)
+                        || (!call.is_custom()
+                            && call.name == xai_grok_code_mode_protocol::WAIT_TOOL_NAME));
+                let direct_only_call = code_mode_only
+                    && crate::session::code_mode::is_code_mode_direct_only_tool(&call.name);
+                if code_mode_control_call
+                    || (code_mode_only && !direct_only_call)
+                    || call.is_custom()
+                {
+                    self.execute_code_mode_control_call(&call, &tool_definitions)
                         .await;
                     continue;
                 }
-                _ => {}
+                direct_tool_calls.push(ToolCallResponse {
+                    id: call.id.as_ref().to_owned(),
+                    kind: "function".to_string(),
+                    function: crate::sampling::types::ToolCallFunction {
+                        name: call.name,
+                        arguments: call.arguments.as_ref().to_owned(),
+                    },
+                });
+            }
+            if !direct_tool_calls.is_empty() {
+                let execute_tool_calls_result = self.execute_tool_calls(direct_tool_calls).await;
+                match execute_tool_calls_result {
+                    Ok(ToolLoop::PermissionReject { tool_name, reason }) => {
+                        return Ok(TurnOutcome::Cancelled {
+                            category: Some(
+                                crate::session::events::CancellationCategory::PermissionRejected,
+                            ),
+                            context: Some(serde_json::json!(
+                                { "tool_name" : tool_name, "reason" : reason, }
+                            )),
+                        });
+                    }
+                    Ok(ToolLoop::HookDenied { .. }) => {}
+                    Ok(ToolLoop::Cancelled) => {
+                        return Ok(TurnOutcome::Cancelled {
+                            category: Some(
+                                crate::session::events::CancellationCategory::PermissionCancelled,
+                            ),
+                            context: None,
+                        });
+                    }
+                    Ok(ToolLoop::FollowupMessage(followup_message)) => {
+                        self.add_followup_message_as_user_turn(&followup_message)
+                            .await;
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             let next_turn = tool_turn_count + 1;
             if let Some(limit) = self.max_turns

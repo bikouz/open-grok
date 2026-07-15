@@ -13958,6 +13958,8 @@ dependencies = [
  "xai-grok-agent",
  "xai-grok-announcements",
  "xai-grok-auth",
+ "xai-grok-code-mode",
+ "xai-grok-code-mode-protocol",
  "xai-grok-compaction",
  "xai-grok-config",
  "xai-grok-config-types",

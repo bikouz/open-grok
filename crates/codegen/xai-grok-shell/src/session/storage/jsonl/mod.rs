@@ -1,7 +1,8 @@
 use super::{PersistedData, SessionUpdateEnvelope, StorageAdapter, updates_truncate_for_prompt};
 use crate::sampling::types::ChatRequestMessage;
 use crate::sampling::{
-    ContentPart, ConversationItem, conversation_truncate_for_prompt, transform_conversation_cwd,
+    ContentPart, ConversationItem, CustomToolOutputContent, conversation_truncate_for_prompt,
+    decode_custom_tool_call_id, transform_conversation_cwd,
 };
 use crate::session::info::Info;
 use crate::session::persistence::{CHAT_FORMAT_VERSION, Summary};
@@ -624,16 +625,29 @@ pub(crate) fn fork_filter_chat(items: &mut Vec<ConversationItem>) {
             }
             ConversationItem::Assistant(asst) => {
                 let expected: std::collections::HashSet<&str> =
-                    asst.tool_calls.iter().map(|tc| tc.id.as_ref()).collect();
+                    asst.tool_calls.iter().map(|tc| tc.call_id()).collect();
                 let mut found = std::collections::HashSet::new();
                 let mut j = i + 1;
                 while j < items.len() {
                     match &items[j] {
                         ConversationItem::ToolResult(tr) => {
-                            if expected.contains(tr.tool_call_id.as_str()) {
-                                found.insert(tr.tool_call_id.as_str());
+                            let call_id = decode_custom_tool_call_id(&tr.tool_call_id)
+                                .map(|(call_id, _)| call_id)
+                                .unwrap_or(tr.tool_call_id.as_str());
+                            if expected.contains(call_id) {
+                                found.insert(call_id);
+                                j += 1;
+                            } else {
+                                break;
                             }
-                            j += 1;
+                        }
+                        ConversationItem::CustomToolOutput(output) => {
+                            if expected.contains(output.call_id.as_str()) {
+                                found.insert(output.call_id.as_str());
+                                j += 1;
+                            } else {
+                                break;
+                            }
                         }
                         ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_) => {
                             j += 1;
@@ -648,6 +662,7 @@ pub(crate) fn fork_filter_chat(items: &mut Vec<ConversationItem>) {
                     break;
                 }
             }
+            ConversationItem::ToolResult(_) | ConversationItem::CustomToolOutput(_) => break,
             _ => {
                 i += 1;
             }
@@ -1458,6 +1473,13 @@ pub(crate) fn strip_invalid_images(items: &mut [ConversationItem]) -> usize {
             _ => false,
         }
     }
+    fn invalid_ordered(part: &CustomToolOutputContent) -> bool {
+        matches!(
+            part,
+            CustomToolOutputContent::Image { url, .. }
+                if url.starts_with("data:") && !is_valid_data_uri_image(url)
+        )
+    }
     let mut stripped = 0usize;
     for item in items.iter_mut() {
         match item {
@@ -1477,6 +1499,20 @@ pub(crate) fn strip_invalid_images(items: &mut [ConversationItem]) -> usize {
                 let before = t.images.len();
                 t.images.retain(|part| !invalid(part));
                 stripped += before - t.images.len();
+                for part in &mut t.ordered_content {
+                    if invalid_ordered(part) {
+                        *part = CustomToolOutputContent::text("[image removed — invalid data]");
+                        stripped += 1;
+                    }
+                }
+            }
+            ConversationItem::CustomToolOutput(output) => {
+                for part in &mut output.content {
+                    if invalid_ordered(part) {
+                        *part = CustomToolOutputContent::text("[image removed — invalid data]");
+                        stripped += 1;
+                    }
+                }
             }
             _ => {}
         }

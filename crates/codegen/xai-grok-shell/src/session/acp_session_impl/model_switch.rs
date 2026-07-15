@@ -4,6 +4,7 @@ use xai_chat_state::conversation_util::replace_or_insert_system_head;
 impl SessionActor {
     pub(super) async fn handle_set_session_model(
         &self,
+        selected_model_id: acp::ModelId,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         apply_prompt_override: bool,
@@ -35,19 +36,15 @@ impl SessionActor {
             .set(sampling_config.compactions_remaining);
         self.compaction_at_tokens
             .set(sampling_config.compaction_at_tokens);
-        let model_tool_mode = self
-            .models_manager
-            .models()
-            .values()
-            .find(|entry| entry.info.model == sampling_config.model)
-            .and_then(|entry| entry.info.tool_mode);
+        let model_tool_mode = crate::agent::models::resolve_model_tool_mode(
+            &self.models_manager.models(),
+            &selected_model_id,
+        );
         let effective_tool_mode = crate::agent::config::effective_tool_mode(
             model_tool_mode,
             self.rebuild_spec.code_mode_enabled,
         );
-        self.agent
-            .borrow_mut()
-            .set_tool_mode(effective_tool_mode);
+        self.agent.borrow_mut().set_tool_mode(effective_tool_mode);
         xai_grok_telemetry::unified_log::info(
             "backend_search: model switch",
             Some(self.session_info.id.0.as_ref()),
@@ -162,7 +159,12 @@ impl SessionActor {
             session_id = % self.session_info.id.0, new_agent_type = % new_agent_name,
             "handle_rebuild_agent_for_definition: rebuilding harness"
         );
-        let new_agent = self
+        // The model switch resolves metadata-first tool mode before requesting
+        // a zero-turn harness rebuild. Preserve that resolved session mode;
+        // the rebuild spec only owns the Settings fallback and cannot infer
+        // which model is currently active.
+        let current_tool_mode = self.agent.borrow().tool_mode();
+        let mut new_agent = self
             .rebuild_spec
             .build_agent(definition)
             .await
@@ -176,6 +178,7 @@ impl SessionActor {
                     "rebuild_agent: build failed for agent_type={new_agent_name}: {e}"
                 ))
             })?;
+        new_agent.set_tool_mode(current_tool_mode);
         let new_system_prompt = new_agent.system_prompt().to_string();
         let mut new_prompt_context = new_agent.prompt_context().clone();
         new_prompt_context.normalize_for_persistence();

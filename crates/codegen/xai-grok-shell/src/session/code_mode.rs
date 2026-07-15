@@ -6,6 +6,7 @@
 //! [`CodeModeRuntime::start_dispatch_loop`].
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,16 @@ use xai_grok_tools::util::{ceil_char_boundary, truncate_str};
 
 use super::acp_session::SessionActor;
 use crate::sampling::rs::{CustomGrammarFormatParam, CustomToolParamFormat, GrammarSyntax};
-use crate::sampling::{ClientTool, ContentPart, ToolSpec};
+use crate::sampling::{ClientTool, CustomToolOutputContent, CustomToolOutputImageDetail, ToolSpec};
+
+pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
+
+/// Human-interaction tools must remain model-visible in Code Mode Only: a
+/// JavaScript callback cannot safely own an ACP question whose answer pauses
+/// the model turn. This mirrors Codex's `DirectModelOnly` exposure.
+pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
+    matches!(name, "ask_user_question" | "request_user_input")
+}
 
 const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
 start: pragma_source | plain_source
@@ -61,6 +71,7 @@ pub(crate) struct CodeModeRuntime {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     dispatch_tx: mpsc::UnboundedSender<DispatchMessage>,
     dispatch_rx: Mutex<Option<mpsc::UnboundedReceiver<DispatchMessage>>>,
+    shutting_down: AtomicBool,
 }
 
 impl CodeModeRuntime {
@@ -70,6 +81,7 @@ impl CodeModeRuntime {
             session: OnceCell::new(),
             dispatch_tx,
             dispatch_rx: Mutex::new(Some(dispatch_rx)),
+            shutting_down: AtomicBool::new(false),
         })
     }
 
@@ -157,22 +169,43 @@ impl CodeModeRuntime {
     }
 
     /// Shuts down an initialized runtime without creating an otherwise unused
-    /// session.
+    /// session. Initialization racing with shutdown is joined and cancelled,
+    /// matching Codex's session-lifecycle contract.
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
-        match self.session.get() {
-            Some(session) => session.shutdown().await,
-            None => Ok(()),
+        self.shutting_down.store(true, Ordering::Release);
+        match self
+            .session
+            .get_or_try_init(|| async {
+                Err::<Arc<dyn CodeModeSession>, String>(
+                    "code mode session is shutting down".to_string(),
+                )
+            })
+            .await
+        {
+            Ok(session) => session.shutdown().await,
+            Err(_) => Ok(()),
         }
     }
 
     async fn session(self: &Arc<Self>) -> Result<Arc<dyn CodeModeSession>, String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("code mode session is shutting down".to_string());
+        }
         self.session
             .get_or_try_init(|| {
                 let delegate: Arc<dyn CodeModeSessionDelegate> = self.clone();
                 async move {
-                    InProcessCodeModeSessionProvider
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        return Err("code mode session is shutting down".to_string());
+                    }
+                    let session = InProcessCodeModeSessionProvider
                         .create_session(delegate)
-                        .await
+                        .await?;
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        let _ = session.shutdown().await;
+                        return Err("code mode session is shutting down".to_string());
+                    }
+                    Ok(session)
                 }
             })
             .await
@@ -216,6 +249,9 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
         cancellation_token: CancellationToken,
     ) -> NotificationFuture<'a> {
         Box::pin(async move {
+            if text.trim().is_empty() {
+                return Ok(());
+            }
             if cancellation_token.is_cancelled() {
                 return Err("code mode notification cancelled".to_string());
             }
@@ -243,36 +279,29 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
 
 fn spawn_dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMessage) {
     tokio::task::spawn_local(async move {
-        let Some(session_actor) = session_actor.upgrade() else {
-            match message {
-                DispatchMessage::InvokeTool { response_tx, .. } => {
-                    let _ = response_tx.send(Err(
-                        "code mode nested tool dispatcher is unavailable".to_string(),
-                    ));
-                }
-                DispatchMessage::Notify { response_tx, .. } => {
-                    let _ = response_tx.send(Err(
-                        "code mode notification dispatcher is unavailable".to_string(),
-                    ));
-                }
-            }
-            return;
-        };
-
         match message {
             DispatchMessage::InvokeTool {
                 invocation,
                 cancellation_token,
                 response_tx,
             } => {
-                let response = tokio::select! {
-                    response = session_actor.dispatch_code_mode_nested_tool(
-                        invocation,
-                        cancellation_token.clone(),
-                    ) => response,
-                    _ = cancellation_token.cancelled() => {
-                        Err("code mode nested tool call cancelled".to_string())
-                    }
+                let response = match wait_for_active_code_mode_turn(
+                    &session_actor,
+                    &cancellation_token,
+                    "nested tool call",
+                )
+                .await
+                {
+                    Ok(session_actor) => tokio::select! {
+                        response = session_actor.dispatch_code_mode_nested_tool(
+                            invocation,
+                            cancellation_token.clone(),
+                        ) => response,
+                        _ = cancellation_token.cancelled() => {
+                            Err("code mode nested tool call cancelled".to_string())
+                        }
+                    },
+                    Err(error) => Err(error),
                 };
                 let _ = response_tx.send(response);
             }
@@ -282,11 +311,20 @@ fn spawn_dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMe
                 cancellation_token,
                 response_tx,
             } => {
-                let response = tokio::select! {
-                    _ = session_actor.record_code_mode_notification(call_id, text) => Ok(()),
-                    _ = cancellation_token.cancelled() => {
-                        Err("code mode notification cancelled".to_string())
-                    }
+                let response = match wait_for_active_code_mode_turn(
+                    &session_actor,
+                    &cancellation_token,
+                    "notification",
+                )
+                .await
+                {
+                    Ok(session_actor) => tokio::select! {
+                        _ = session_actor.record_code_mode_notification(call_id, text) => Ok(()),
+                        _ = cancellation_token.cancelled() => {
+                            Err("code mode notification cancelled".to_string())
+                        }
+                    },
+                    Err(error) => Err(error),
                 };
                 let _ = response_tx.send(response);
             }
@@ -294,17 +332,51 @@ fn spawn_dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMe
     });
 }
 
+/// Wait for the next Code Mode turn instead of rejecting callbacks that arrive
+/// after a yielded cell's originating turn has ended. Codex queues these
+/// callbacks while no turn-scoped receiver is installed; polling the actor's
+/// existing lifecycle flags gives the embedded adapter the same behavior
+/// without keeping a strong actor reference alive between turns.
+async fn wait_for_active_code_mode_turn(
+    session_actor: &Weak<SessionActor>,
+    cancellation_token: &CancellationToken,
+    operation: &str,
+) -> Result<Arc<SessionActor>, String> {
+    loop {
+        if cancellation_token.is_cancelled() {
+            return Err(format!("code mode {operation} cancelled"));
+        }
+
+        let Some(actor) = session_actor.upgrade() else {
+            return Err(format!("code mode {operation} dispatcher is unavailable"));
+        };
+        let turn_active = actor.session_turn_active.load(Ordering::Acquire);
+        let code_mode_active = matches!(
+            actor.agent.borrow().tool_mode(),
+            xai_grok_sampling_types::ToolMode::CodeMode
+                | xai_grok_sampling_types::ToolMode::CodeModeOnly
+        );
+        if turn_active && code_mode_active {
+            return Ok(actor);
+        }
+        drop(actor);
+
+        tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                return Err(format!("code mode {operation} cancelled"));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+}
+
 /// Model-facing result from `exec` or `wait`.
 ///
-/// `content` retains the runtime's text/image ordering. `image_details` has
-/// one entry for every image in `content`, in image order. The sidecar is
-/// necessary because the shell sampling [`ContentPart::Image`] currently only
-/// carries a URL; missing runtime details are resolved to Codex's `high`
-/// default before being stored here.
+/// `content` retains the runtime's text/image ordering and image fidelity.
+/// Missing runtime details are resolved to Codex's `high` default.
 #[derive(Clone, Debug)]
 pub(crate) struct CodeModeToolOutput {
-    pub(crate) content: Vec<ContentPart>,
-    pub(crate) image_details: Vec<ImageDetail>,
+    pub(crate) content: Vec<CustomToolOutputContent>,
     pub(crate) cell_id: Option<String>,
     pub(crate) success: bool,
 }
@@ -315,20 +387,11 @@ impl CodeModeToolOutput {
     pub(crate) fn text(&self) -> String {
         let mut text = String::new();
         for part in &self.content {
-            if let ContentPart::Text { text: part_text } = part {
+            if let CustomToolOutputContent::Text { text: part_text } = part {
                 text.push_str(part_text);
             }
         }
         text
-    }
-
-    /// Returns the sampling image parts in their original relative order.
-    pub(crate) fn images(&self) -> Vec<ContentPart> {
-        self.content
-            .iter()
-            .filter(|part| matches!(part, ContentPart::Image { .. }))
-            .cloned()
-            .collect()
     }
 }
 
@@ -340,12 +403,23 @@ pub(crate) fn to_code_mode_tool_definition(
     definition: &GrokToolDefinition,
 ) -> CodeModeToolDefinition {
     let raw_name = definition.function.name.clone();
+    let (kind, input_schema) = if raw_name == APPLY_PATCH_TOOL_NAME {
+        // GPT-5.6 Sol's pinned Codex profile exposes apply_patch as a
+        // free-form nested tool. The shell dispatcher adapts the raw patch
+        // string back into Grok Build's existing `{ patch }` function input.
+        (CodeModeToolKind::Freeform, None)
+    } else {
+        (
+            CodeModeToolKind::Function,
+            Some(definition.function.parameters.clone()),
+        )
+    };
     CodeModeToolDefinition {
         name: xai_grok_code_mode_protocol::normalize_code_mode_identifier(&raw_name),
         tool_name: ToolName::plain(raw_name),
         description: definition.function.description.clone().unwrap_or_default(),
-        kind: CodeModeToolKind::Function,
-        input_schema: Some(definition.function.parameters.clone()),
+        kind,
+        input_schema,
         output_schema: None,
     }
 }
@@ -357,7 +431,8 @@ pub(crate) fn collect_code_mode_tool_definitions(
         .iter()
         .map(to_code_mode_tool_definition)
         .filter(|definition| {
-            xai_grok_code_mode_protocol::is_code_mode_nested_tool(&definition.name)
+            !is_code_mode_direct_only_tool(&definition.tool_name.name)
+                && xai_grok_code_mode_protocol::is_code_mode_nested_tool(&definition.name)
         })
         .collect::<Vec<_>>();
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
@@ -497,25 +572,26 @@ fn format_runtime_response(
     );
 
     let mut content = Vec::with_capacity(items.len());
-    let mut image_details = Vec::new();
     for item in items {
         match item {
             FunctionCallOutputContentItem::InputText { text } => {
-                content.push(ContentPart::Text { text: text.into() });
+                content.push(CustomToolOutputContent::text(text));
             }
             FunctionCallOutputContentItem::InputImage { image_url, detail } => {
-                content.push(ContentPart::Image {
-                    url: image_url.into(),
-                });
-                image_details
-                    .push(detail.unwrap_or(xai_grok_code_mode_protocol::DEFAULT_IMAGE_DETAIL));
+                let detail =
+                    match detail.unwrap_or(xai_grok_code_mode_protocol::DEFAULT_IMAGE_DETAIL) {
+                        ImageDetail::Auto => CustomToolOutputImageDetail::Auto,
+                        ImageDetail::Low => CustomToolOutputImageDetail::Low,
+                        ImageDetail::High => CustomToolOutputImageDetail::High,
+                        ImageDetail::Original => CustomToolOutputImageDetail::Original,
+                    };
+                content.push(CustomToolOutputContent::image(image_url, detail));
             }
         }
     }
 
     CodeModeToolOutput {
         content,
-        image_details,
         cell_id: Some(cell_id.to_string()),
         success,
     }
@@ -734,6 +810,49 @@ mod tests {
     }
 
     #[test]
+    fn direct_model_only_question_tool_is_not_nested_in_exec() {
+        let tools = vec![
+            GrokToolDefinition::function(
+                "ask_user_question",
+                Some("Ask the user"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "read_file",
+                Some("Read a file"),
+                json!({"type": "object"}),
+            ),
+        ];
+        let nested = collect_code_mode_tool_definitions(&tools);
+        assert_eq!(
+            nested
+                .iter()
+                .map(|definition| definition.tool_name.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file"]
+        );
+        assert!(is_code_mode_direct_only_tool("ask_user_question"));
+        assert!(!is_code_mode_direct_only_tool("read_file"));
+    }
+
+    #[test]
+    fn apply_patch_uses_codex_freeform_nested_contract() {
+        let tool = GrokToolDefinition::function(
+            APPLY_PATCH_TOOL_NAME,
+            Some("Apply a patch"),
+            json!({
+                "type": "object",
+                "properties": {"patch": {"type": "string"}},
+                "required": ["patch"]
+            }),
+        );
+        let converted = to_code_mode_tool_definition(&tool);
+        assert_eq!(converted.tool_name, ToolName::plain(APPLY_PATCH_TOOL_NAME));
+        assert_eq!(converted.kind, CodeModeToolKind::Freeform);
+        assert_eq!(converted.input_schema, None);
+    }
+
+    #[test]
     fn wait_arguments_apply_codex_defaults() {
         assert_eq!(
             parse_wait_arguments(r#"{"cell_id":"7"}"#).unwrap(),
@@ -780,10 +899,16 @@ mod tests {
         );
         assert_eq!(output.cell_id.as_deref(), Some("12"));
         assert!(output.success);
-        assert_eq!(output.image_details, vec![ImageDetail::Original]);
         assert!(matches!(
-            output.images().as_slice(),
-            [ContentPart::Image { url }] if url.as_ref() == "data:image/png;base64,AA=="
+            output.content.as_slice(),
+            [
+                CustomToolOutputContent::Text { .. },
+                CustomToolOutputContent::Text { text },
+                CustomToolOutputContent::Image {
+                    url,
+                    detail: CustomToolOutputImageDetail::Original,
+                },
+            ] if text.as_ref() == "hello" && url.as_ref() == "data:image/png;base64,AA=="
         ));
     }
 

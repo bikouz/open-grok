@@ -205,7 +205,9 @@ pub(super) async fn run_session(
             tx.send(()); } } } } } maybe_completion = completion_rx.recv() => { let
             Some((prompt_id, result)) = maybe_completion else { if let Some(cancel) = &
             session.sync_loop_cancel { cancel.cancel(); } cleanup_session_scratch(&
-            session); return; }; if let Some(notification) = replay_buffer.flush() {
+            session); if let Err(error) = session.rebuild_spec.code_mode_runtime.shutdown().await {
+            tracing::warn!(%error, "failed to shut down Code Mode runtime"); }
+            return; }; if let Some(notification) = replay_buffer.flush() {
             session.emit_buffered(notification). await; } let (turn_succeeded,
             infra_pause_message) = SessionActor::post_turn_goal_degradation_plan(&
             result); session.handle_completion(prompt_id, result). await; session
@@ -269,7 +271,9 @@ pub(super) async fn run_session(
             Some(cancel) = & session.sync_loop_cancel { cancel.cancel(); } session
             .feedback_manager.shutdown(session.upload_queue.get()). await; if ! session
             .startup_hints.is_subagent { session.persist_background_task_manifest().
-            await; } cleanup_session_scratch(& session); return; }; match cmd {
+            await; } if let Err(error) = session.rebuild_spec.code_mode_runtime.shutdown().await {
+            tracing::warn!(%error, "failed to shut down Code Mode runtime"); }
+            cleanup_session_scratch(& session); return; }; match cmd {
             SessionCommand::Initialize { system_prompt } => { session
             .initialize(system_prompt). await; let s = session.clone(); let handle =
             tokio::task::spawn_local(async move { s.build_prefix_background(). await });
@@ -303,10 +307,10 @@ pub(super) async fn run_session(
             SessionActor::maybe_start_running_task(session.clone(), completion_tx
             .clone()). await; } SessionCommand::SessionMode { session_mode, responds_to }
             => { session.handle_session_mode(session_mode). await; let _ = responds_to
-            .send(()); } SessionCommand::SetSessionModel { sampling_config, use_concise,
+            .send(()); } SessionCommand::SetSessionModel { model_id, sampling_config, use_concise,
             apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent,
             responds_to } => { let updated_model_id = session
-            .handle_set_session_model(sampling_config, use_concise,
+            .handle_set_session_model(model_id, sampling_config, use_concise,
             apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).
             await; let _ = responds_to.send(updated_model_id); }
             SessionCommand::RebuildAgentForDefinition { definition, responds_to } => {
@@ -814,6 +818,8 @@ pub(super) async fn run_session(
             .sync_loop_cancel { cancel.cancel(); } session.feedback_manager
             .shutdown(session.upload_queue.get()). await; if ! session.startup_hints
             .is_subagent { session.persist_background_task_manifest(). await; }
+            if let Err(error) = session.rebuild_spec.code_mode_runtime.shutdown().await {
+            tracing::warn!(%error, "failed to shut down Code Mode runtime"); }
             cleanup_session_scratch(& session); return; } } }
         }
     }

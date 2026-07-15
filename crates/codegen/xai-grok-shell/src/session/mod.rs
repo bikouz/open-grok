@@ -297,6 +297,7 @@ pub mod acp_mcp;
 pub(crate) mod acp_session;
 pub(crate) mod agent_rebuild;
 pub mod chat_persistence;
+pub(crate) mod code_mode;
 pub(crate) mod events;
 pub mod export;
 pub mod feedback;

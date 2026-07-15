@@ -191,6 +191,7 @@ pub(crate) async fn apply(
     };
     let (tx, rx) = oneshot::channel();
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
+        model_id: model_id.clone(),
         sampling_config: model_sampling,
         use_concise,
         apply_prompt_override,

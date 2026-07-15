@@ -1577,11 +1577,13 @@ mod tests {
                 tool_call_id: "s1".into(),
                 content: "done".into(),
                 images: vec![],
+                ordered_content: vec![],
             }),
             ConversationItem::ToolResult(ToolResultItem {
                 tool_call_id: "b1".into(),
                 content: "done".into(),
                 images: vec![],
+                ordered_content: vec![],
             }),
         ];
         let counts = count_outstanding_dispatches(&items);
@@ -1601,6 +1603,7 @@ mod tests {
                 tool_call_id: "later".into(),
                 content: "preemptive".into(),
                 images: vec![],
+                ordered_content: vec![],
             }),
             assistant_with_tool_calls(vec![tc("later", "spawn_subagent", "{}")]),
         ];

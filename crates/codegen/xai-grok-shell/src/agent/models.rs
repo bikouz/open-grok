@@ -14,7 +14,7 @@ use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::sampling::SamplerConfig as SamplingConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption, ToolMode};
 
 // ── Auth method for model fetching ──────────────────────────────────────────
 
@@ -1626,6 +1626,20 @@ pub(crate) fn resolve_catalog_key(
         .rev()
         .find(|(_, entry)| entry.info.model == id_str)
         .map(|(key, _)| acp::ModelId::new(key.clone()))
+}
+
+/// Resolve tool-mode metadata for a selected catalog id or persisted routing
+/// slug using the same identity semantics as the rest of model selection.
+/// Exact catalog keys win; otherwise the last matching slug wins so user
+/// overrides cannot be shadowed by bundled defaults.
+pub(crate) fn resolve_model_tool_mode(
+    models: &IndexMap<String, ModelEntry>,
+    id: &acp::ModelId,
+) -> Option<ToolMode> {
+    let key = resolve_catalog_key(models, id)?;
+    models
+        .get(key.0.as_ref())
+        .and_then(|entry| entry.info.tool_mode)
 }
 
 /// Catalog key for a persisted session model id, restricted to **selectable**
@@ -3516,6 +3530,28 @@ mod tests {
         let persisted = acp::ModelId::new("grok-4.5");
         let key = resolve_catalog_key(&models, &persisted).expect("slug must resolve");
         assert_eq!(key.0.as_ref(), "user-grok-build");
+    }
+
+    #[test]
+    fn resolve_model_tool_mode_honors_selected_key_and_last_slug_override() {
+        let mut bundled = make_model_entry("grok-4.5");
+        bundled.info.tool_mode = Some(ToolMode::Direct);
+        let mut user = make_model_entry("grok-4.5");
+        user.info.tool_mode = Some(ToolMode::CodeModeOnly);
+        let mut models = IndexMap::new();
+        models.insert("default-grok-build".to_string(), bundled);
+        models.insert("user-grok-build".to_string(), user);
+
+        assert_eq!(
+            resolve_model_tool_mode(&models, &acp::ModelId::new("default-grok-build")),
+            Some(ToolMode::Direct),
+            "an explicit catalog selection must retain its own metadata"
+        );
+        assert_eq!(
+            resolve_model_tool_mode(&models, &acp::ModelId::new("grok-4.5")),
+            Some(ToolMode::CodeModeOnly),
+            "a persisted routing slug must use the last override"
+        );
     }
 
     #[test]

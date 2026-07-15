@@ -159,6 +159,10 @@ pub enum SessionCommand {
         responds_to: oneshot::Sender<()>,
     },
     SetSessionModel {
+        /// Catalog key selected by the user. This remains distinct from
+        /// `sampling_config.model`, which is the provider routing slug and may
+        /// be shared by multiple catalog entries with different metadata.
+        model_id: acp::ModelId,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
         /// When `false`, skip the system prompt rewrite (concise/default swap).

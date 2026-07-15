@@ -60,7 +60,14 @@ fn snap_split_idx_to_tool_boundaries(
     }
     split_idx = split_idx.min(n);
 
-    while split_idx < n && matches!(conversation[split_idx], ConversationItem::ToolResult(_)) {
+    let is_tool_output = |item: &ConversationItem| {
+        matches!(
+            item,
+            ConversationItem::ToolResult(_) | ConversationItem::CustomToolOutput(_)
+        )
+    };
+
+    while split_idx < n && is_tool_output(&conversation[split_idx]) {
         split_idx += 1;
     }
     if split_idx < n
@@ -68,7 +75,7 @@ fn snap_split_idx_to_tool_boundaries(
         && !a.tool_calls.is_empty()
     {
         split_idx += 1;
-        while split_idx < n && matches!(conversation[split_idx], ConversationItem::ToolResult(_)) {
+        while split_idx < n && is_tool_output(&conversation[split_idx]) {
             split_idx += 1;
         }
     }
@@ -79,20 +86,17 @@ fn snap_split_idx_to_tool_boundaries(
         if a.tool_calls.is_empty() {
             break;
         }
-        if !matches!(
-            conversation.get(split_idx),
-            Some(ConversationItem::ToolResult(_))
-        ) {
+        if !conversation.get(split_idx).is_some_and(&is_tool_output) {
             break;
         }
-        while split_idx < n && matches!(conversation[split_idx], ConversationItem::ToolResult(_)) {
+        while split_idx < n && is_tool_output(&conversation[split_idx]) {
             split_idx += 1;
         }
     }
 
     if split_idx >= n && n > 1 {
         let mut candidate = n - 1;
-        while candidate > 1 && matches!(conversation[candidate], ConversationItem::ToolResult(_)) {
+        while candidate > 1 && is_tool_output(&conversation[candidate]) {
             candidate -= 1;
         }
         if candidate > 0
@@ -100,11 +104,9 @@ fn snap_split_idx_to_tool_boundaries(
             && !a.tool_calls.is_empty()
         {
             // candidate at assistant — good for tail start.
-        } else if candidate > 0
-            && matches!(conversation[candidate], ConversationItem::ToolResult(_))
-        {
+        } else if candidate > 0 && is_tool_output(&conversation[candidate]) {
             let mut i = candidate;
-            while i > 0 && matches!(conversation[i], ConversationItem::ToolResult(_)) {
+            while i > 0 && is_tool_output(&conversation[i]) {
                 i -= 1;
             }
             if matches!(
@@ -338,6 +340,65 @@ mod tests {
             .any(|i| matches!(i, ConversationItem::ToolResult(t) if t.tool_call_id == "tc1"));
         assert_eq!(prefix_has_call, prefix_has_result);
         assert_eq!(tail_has_call, tail_has_result);
+    }
+
+    #[test]
+    fn split_keeps_repeated_native_outputs_with_their_call() {
+        use xai_grok_sampling_types::{CustomToolOutputItem, ToolCall};
+
+        let mut assistant = ConversationItem::assistant("call");
+        if let ConversationItem::Assistant(a) = &mut assistant {
+            a.tool_calls.push(ToolCall {
+                id: "exec1".into(),
+                name: "exec".into(),
+                arguments: "tools.notify('working')".into(),
+            });
+        }
+        let conv = vec![
+            ConversationItem::user("a".repeat(400)),
+            ConversationItem::assistant("b".repeat(400)),
+            assistant,
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text("exec1", "working")),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text("exec1", "done")),
+            ConversationItem::user("tail"),
+        ];
+
+        let split = split_conversation_for_two_pass(&conv, 0.9);
+        let call_count = |items: &[ConversationItem]| {
+            items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        ConversationItem::Assistant(a)
+                            if a.tool_calls.iter().any(|call| call.id.as_ref() == "exec1")
+                    )
+                })
+                .count()
+        };
+        let output_count = |items: &[ConversationItem]| {
+            items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        ConversationItem::CustomToolOutput(output)
+                            if output.call_id == "exec1"
+                    )
+                })
+                .count()
+        };
+
+        assert_eq!(
+            call_count(split.prefix),
+            usize::from(output_count(split.prefix) > 0)
+        );
+        assert_eq!(
+            call_count(split.tail),
+            usize::from(output_count(split.tail) > 0)
+        );
+        assert!(matches!(output_count(split.prefix), 0 | 2));
+        assert!(matches!(output_count(split.tail), 0 | 2));
     }
 
     #[test]

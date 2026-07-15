@@ -56,6 +56,7 @@ fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
             ConversationItem::ToolResult(_) => 3,
             ConversationItem::BackendToolCall(_) => 4,
             ConversationItem::Reasoning(_) => 5,
+            ConversationItem::CustomToolOutput(_) => 6,
         };
         tag.hash(&mut h);
         it.text_content().hash(&mut h);

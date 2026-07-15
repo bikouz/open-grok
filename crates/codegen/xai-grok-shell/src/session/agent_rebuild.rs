@@ -92,6 +92,9 @@ pub(crate) struct AgentRebuildSpec {
     /// Restart-scoped Settings fallback. Model catalog metadata remains
     /// authoritative when the effective mode is resolved.
     pub code_mode_enabled: bool,
+    /// Session-owned embedded runtime. It lives on the rebuild spec so Agent
+    /// harness rebuilds and model switches cannot discard persistent JS state.
+    pub code_mode_runtime: Arc<crate::session::code_mode::CodeModeRuntime>,
     pub memory_enabled: bool,
     pub memory_global_path: Option<String>,
     pub memory_workspace_path: Option<String>,
@@ -189,6 +192,7 @@ impl AgentRebuildSpec {
             compaction_policy,
             reminder_policy,
             code_mode_enabled,
+            code_mode_runtime,
             memory_enabled,
             memory_global_path,
             memory_workspace_path,
@@ -231,6 +235,7 @@ impl AgentRebuildSpec {
             parent_scheduler_handle,
         } = self.as_ref();
         let _ = mcp_state;
+        let _ = code_mode_runtime;
         #[allow(unused_variables)]
         let is_cursor_template =
             crate::session::is_cursor_system_template(&definition.system_prompt);
@@ -397,6 +402,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         compaction_policy: CompactionPolicy::default(),
         reminder_policy: ReminderPolicy::default(),
         code_mode_enabled: false,
+        code_mode_runtime: crate::session::code_mode::CodeModeRuntime::new(),
         memory_enabled: false,
         memory_global_path: None,
         memory_workspace_path: None,

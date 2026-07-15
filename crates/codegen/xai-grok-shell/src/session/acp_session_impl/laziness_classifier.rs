@@ -384,6 +384,14 @@ pub(crate) fn flatten_transcript_for_classifier(
                     truncate(&tr.content),
                 );
             }
+            ConversationItem::CustomToolOutput(output) => {
+                let _ = writeln!(
+                    out,
+                    "[tool_result for {}] {}",
+                    output.call_id,
+                    truncate(&output.text_content()),
+                );
+            }
             ConversationItem::BackendToolCall(btc) => {
                 let _ = writeln!(out, "[backend_tool_call] {}", btc.text_summary());
             }

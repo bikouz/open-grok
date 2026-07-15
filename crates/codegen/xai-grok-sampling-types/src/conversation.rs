@@ -4522,6 +4522,40 @@ mod tests {
     }
 
     #[test]
+    fn locally_generated_custom_outputs_omit_provider_owned_item_ids() {
+        let call = ToolCall::custom("call-exec", "ctc-exec", "exec", "do work");
+        let mut items = vec![
+            ConversationItem::assistant_tool_calls(vec![call]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-exec", "progress").with_name("exec"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-exec", "done").with_name("exec"),
+            ),
+        ];
+
+        assert_eq!(dedup_duplicate_tool_results(&mut items), 0);
+        let request = ConversationRequest::from_items(items);
+        let wire = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        let outputs = wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "custom_tool_call_output")
+            .collect::<Vec<_>>();
+
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().all(|output| output.get("id").is_none()));
+        assert!(
+            outputs
+                .iter()
+                .all(|output| output["call_id"] == "call-exec")
+        );
+        assert_eq!(outputs[0]["output"], "progress");
+        assert_eq!(outputs[1]["output"], "done");
+    }
+
+    #[test]
     fn custom_output_replay_preserves_a_image_b_order_and_detail() {
         let item = ConversationItem::custom_tool_output(
             CustomToolOutputItem::new(

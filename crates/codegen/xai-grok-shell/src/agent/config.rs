@@ -46,7 +46,7 @@ pub fn default_agent_type() -> String {
 /// precedence. The Settings switch only supplies a fallback for models that do
 /// not declare their own mode.
 pub fn effective_tool_mode(model_mode: Option<ToolMode>, code_mode_enabled: bool) -> ToolMode {
-    model_mode.unwrap_or_else(|| {
+    model_mode.unwrap_or({
         if code_mode_enabled {
             ToolMode::CodeModeOnly
         } else {

@@ -7,6 +7,22 @@
 //! the parent module's private helpers.
 use super::*;
 use futures::StreamExt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelToolResultSink {
+    Conversation,
+    CodeMode,
+}
+
+tokio::task_local! {
+    static MODEL_TOOL_RESULT_SINK: ModelToolResultSink;
+}
+
+fn records_model_tool_results() -> bool {
+    MODEL_TOOL_RESULT_SINK
+        .try_with(|sink| *sink == ModelToolResultSink::Conversation)
+        .unwrap_or(true)
+}
 /// Whether a tool name is an MCP `create_pull_request` (qualified
 /// `server__create_pull_request` or bare).
 fn is_mcp_create_pull_request(tool_name: &str) -> bool {
@@ -316,8 +332,10 @@ impl SessionActor {
                         format!("Tool execution cancelled for tool `{}`", call.function.name)
                     }
                 };
-                self.chat_state_handle
-                    .push_tool_result(ConversationItem::tool_result(call.id.clone(), message));
+                if records_model_tool_results() {
+                    self.chat_state_handle
+                        .push_tool_result(ConversationItem::tool_result(call.id.clone(), message));
+                }
                 continue;
             }
             self.emit_event(crate::session::events::Event::ToolStarted {
@@ -738,6 +756,278 @@ impl SessionActor {
         }
         Ok(ToolLoop::Continue)
     }
+
+    /// Dispatch a tool invoked from an embedded Code Mode cell through the
+    /// same parsing, plan-mode, hook, permission, auth-retry, and workspace
+    /// path as a model-emitted function call. The result is returned to the
+    /// JavaScript runtime and is deliberately not appended as a top-level
+    /// function-call output in the model conversation.
+    pub(crate) async fn dispatch_code_mode_nested_tool(
+        &self,
+        invocation: xai_grok_code_mode_protocol::CodeModeNestedToolCall,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<serde_json::Value, String> {
+        MODEL_TOOL_RESULT_SINK
+            .scope(ModelToolResultSink::CodeMode, async move {
+                self.dispatch_code_mode_nested_tool_inner(invocation, cancellation_token)
+                    .await
+            })
+            .await
+    }
+
+    /// `notify()` emits an additional custom-tool output for the active exec
+    /// call immediately, matching Codex's multi-output custom-call contract.
+    pub(crate) async fn record_code_mode_notification(&self, call_id: String, text: String) {
+        self.chat_state_handle
+            .push_tool_result(ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text(call_id, text)
+                    .with_name(xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME),
+            ));
+    }
+
+    async fn dispatch_code_mode_nested_tool_inner(
+        &self,
+        invocation: xai_grok_code_mode_protocol::CodeModeNestedToolCall,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<serde_json::Value, String> {
+        use xai_grok_code_mode_protocol::{CodeModeToolKind, PUBLIC_TOOL_NAME, WAIT_TOOL_NAME};
+
+        let tool_name = invocation.tool_name.name;
+        if matches!(tool_name.as_str(), PUBLIC_TOOL_NAME | WAIT_TOOL_NAME) {
+            return Err(format!("`{tool_name}` cannot invoke itself from Code Mode"));
+        }
+        let arguments = match (invocation.tool_kind, invocation.input) {
+            (CodeModeToolKind::Function, None) => "{}".to_string(),
+            (CodeModeToolKind::Function, Some(serde_json::Value::Object(map))) => {
+                serde_json::to_string(&serde_json::Value::Object(map))
+                    .map_err(|error| format!("failed to serialize `{tool_name}` input: {error}"))?
+            }
+            (CodeModeToolKind::Function, Some(_)) => {
+                return Err(format!(
+                    "tool `{tool_name}` expects a JSON object for arguments"
+                ));
+            }
+            (CodeModeToolKind::Freeform, Some(serde_json::Value::String(input)))
+                if tool_name == crate::session::code_mode::APPLY_PATCH_TOOL_NAME =>
+            {
+                serde_json::to_string(&serde_json::json!({ "patch": input })).map_err(|error| {
+                    format!("failed to serialize `{tool_name}` free-form input: {error}")
+                })?
+            }
+            (CodeModeToolKind::Freeform, Some(serde_json::Value::String(input))) => input,
+            (CodeModeToolKind::Freeform, _) => {
+                return Err(format!("tool `{tool_name}` expects a string input"));
+            }
+        };
+        let model_call_id = format!("exec-{}", uuid::Uuid::now_v7());
+        let call = crate::sampling::types::ToolCallResponse {
+            id: model_call_id.clone(),
+            kind: "function".to_string(),
+            function: crate::sampling::types::ToolCallFunction {
+                name: tool_name.clone(),
+                arguments,
+            },
+        };
+
+        let mut deferred_followups = Vec::new();
+        let prepared = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                return Err(format!("Code Mode tool `{tool_name}` was cancelled"));
+            }
+            result = self.prepare_tool_call(call, &mut deferred_followups) => {
+                match result.map_err(|error| error.to_string())? {
+                    Ok(prepared) => prepared,
+                    Err(ToolLoop::PermissionReject { reason, .. }) => {
+                        return Err(format!("permission rejected for `{tool_name}`: {reason}"));
+                    }
+                    Err(ToolLoop::HookDenied { hook_name }) => {
+                        return Err(format!("hook `{hook_name}` denied `{tool_name}`"));
+                    }
+                    Err(ToolLoop::Cancelled) => {
+                        return Err(format!("Code Mode tool `{tool_name}` was cancelled"));
+                    }
+                    Err(ToolLoop::FollowupMessage(message)) => return Err(message),
+                    Err(ToolLoop::NonExistingTool) => {
+                        return Err(format!("tool `{tool_name}` is not available"));
+                    }
+                    Err(ToolLoop::ToolParsingError) => {
+                        return Err(format!("tool `{tool_name}` rejected its arguments"));
+                    }
+                    Err(ToolLoop::Continue) => {
+                        return Err(format!("tool `{tool_name}` was not executed"));
+                    }
+                }
+            }
+        };
+
+        // Start lifecycle tracking only after preflight succeeds. Permission,
+        // hook, parsing, and availability failures are already represented by
+        // `prepare_tool_call`; opening an execution lifecycle before that point
+        // would leave the tracker dangling on every early return above.
+        self.emit_event(crate::session::events::Event::ToolStarted {
+            tool_name: prepared.tool_name.clone(),
+        });
+        self.observability_bridge
+            .emit(
+                xai_tool_protocol::session_event::SessionEvent::ToolCallStarted {
+                    tool_call_id: prepared.call_id.clone(),
+                    tool_name: prepared.tool_name.clone(),
+                    turn_number: self.current_turn_number.get(),
+                },
+            )
+            .await;
+        self.signals_handle().record_tool_call(&prepared.tool_name);
+        let tool_started_at = self.events.tool_started(prepared.tool_name.clone());
+        let dispatch = || {
+            dispatch_tool(
+                &self.workspace_ops,
+                &prepared,
+                self.session_info.id.0.as_ref(),
+            )
+        };
+        let (result, was_cancelled) = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                (
+                    Err(xai_tool_runtime::ToolError::new(
+                        xai_tool_runtime::ToolErrorKind::Cancelled,
+                        format!("Code Mode tool `{tool_name}` was cancelled"),
+                    )),
+                    true,
+                )
+            }
+            result = call_with_auth_retry(
+                self.auth_manager.as_ref(),
+                None,
+                &prepared.tool_name,
+                dispatch,
+            ) => (result, false),
+        };
+
+        let duration_ms = tool_started_at.elapsed().as_millis() as u64;
+        let response = match result {
+            Ok(tool_result) => {
+                async {
+                    let structured = tool_result.output.code_mode_result().map_err(|error| {
+                        format!("failed to encode `{tool_name}` output: {error}")
+                    })?;
+                    let post_tool_use_result = self
+                        .hook_event_active(xai_grok_hooks::event::HookEventName::PostToolUse)
+                        .then(|| structured.clone());
+                    let effective_tool_name = tool_result
+                        .effective_tool_name
+                        .clone()
+                        .or_else(|| prepared.dispatch_target_name.clone())
+                        .unwrap_or_else(|| prepared.tool_name.clone());
+                    self.handle_bridge_tool_success(
+                        &prepared.tool_call_id,
+                        &prepared.call_id,
+                        &prepared.tool_name,
+                        &effective_tool_name,
+                        tool_result,
+                        prepared.concatenated_json_count,
+                        &prepared.model_id,
+                        &prepared.parsed_args,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    if let Some(tool_result_value) = post_tool_use_result {
+                        let raw_input = serde_json::from_str(&prepared.raw_arguments)
+                            .unwrap_or(serde_json::Value::Null);
+                        let (tool_input, tool_input_truncated) =
+                            xai_grok_hooks::event::truncate_payload(raw_input);
+                        let (tool_result, tool_result_truncated) =
+                            xai_grok_hooks::event::truncate_payload(tool_result_value);
+                        let hook_tool_name = prepared.hook_tool_name();
+                        self.dispatch_hook(
+                            xai_grok_hooks::event::HookEventName::PostToolUse,
+                            xai_grok_hooks::event::HookPayload::PostToolUse {
+                                tool_name: hook_tool_name.to_owned(),
+                                tool_use_id: prepared.call_id.clone(),
+                                tool_input,
+                                tool_result,
+                                tool_input_truncated,
+                                tool_result_truncated,
+                                duration_ms: Some(duration_ms),
+                                is_backgrounded: false,
+                                subagent_type: self.subagent_type_label(),
+                            },
+                            None,
+                            Some(hook_tool_name),
+                        )
+                        .await;
+                    }
+                    Ok(structured)
+                }
+                .await
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let anyhow_error = anyhow::anyhow!(message.clone());
+                self.handle_tool_error(
+                    &prepared.tool_call_id,
+                    &prepared.call_id,
+                    &prepared.tool_name,
+                    prepared.dispatch_target_name.as_deref(),
+                    &anyhow_error,
+                    &prepared.model_id,
+                )
+                .await;
+                if self.hook_event_active(xai_grok_hooks::event::HookEventName::PostToolUseFailure)
+                {
+                    let raw_input = serde_json::from_str(&prepared.raw_arguments)
+                        .unwrap_or(serde_json::Value::Null);
+                    let (tool_input, tool_input_truncated) =
+                        xai_grok_hooks::event::truncate_payload(raw_input);
+                    let hook_tool_name = prepared.hook_tool_name();
+                    self.dispatch_hook(
+                        xai_grok_hooks::event::HookEventName::PostToolUseFailure,
+                        xai_grok_hooks::event::HookPayload::PostToolUseFailure {
+                            tool_name: hook_tool_name.to_owned(),
+                            tool_use_id: prepared.call_id.clone(),
+                            tool_input,
+                            tool_input_truncated,
+                            error: message.clone(),
+                            subagent_type: self.subagent_type_label(),
+                        },
+                        None,
+                        Some(hook_tool_name),
+                    )
+                    .await;
+                }
+                Err(message)
+            }
+        };
+
+        let outcome = if response.is_ok() {
+            crate::session::events::ToolOutcome::Success
+        } else if was_cancelled {
+            crate::session::events::ToolOutcome::Cancelled
+        } else {
+            crate::session::events::ToolOutcome::Error
+        };
+        self.events.tool_finished();
+        self.signals_handle()
+            .record_tool_duration(&prepared.tool_name, duration_ms);
+        self.emit_event(crate::session::events::Event::ToolCompleted {
+            tool_name: prepared.tool_name.clone(),
+            duration_ms,
+            outcome,
+        });
+        self.observability_bridge
+            .emit(
+                xai_tool_protocol::session_event::SessionEvent::ToolCallCompleted {
+                    tool_call_id: prepared.call_id.clone(),
+                    tool_name: prepared.tool_name.clone(),
+                    duration_ms,
+                    outcome: map_tool_outcome(outcome),
+                },
+            )
+            .await;
+        response
+    }
+
     /// Phase 1: pre-flight (MCP, args, hooks, permission, ExitPlanMode).
     pub(crate) async fn prepare_tool_call(
         &self,
@@ -1260,7 +1550,9 @@ impl SessionActor {
                         self.send_update(acp::SessionUpdate::ToolCallUpdate(tool_update), None)
                             .await;
                         let tool_chat = ConversationItem::tool_result(call.id.clone(), message);
-                        self.chat_state_handle.push_tool_result(tool_chat);
+                        if records_model_tool_results() {
+                            self.chat_state_handle.push_tool_result(tool_chat);
+                        }
                         return Ok(Err(ToolLoop::Continue));
                     }
                     PlanApprovalOutcome::Cancelled => {
@@ -1282,7 +1574,9 @@ impl SessionActor {
                         self.send_update(acp::SessionUpdate::ToolCallUpdate(tool_update), None)
                             .await;
                         let tool_chat = ConversationItem::tool_result(call.id.clone(), message);
-                        self.chat_state_handle.push_tool_result(tool_chat);
+                        if records_model_tool_results() {
+                            self.chat_state_handle.push_tool_result(tool_chat);
+                        }
                         return Ok(Err(ToolLoop::Continue));
                     }
                     PlanApprovalOutcome::Approved => {
@@ -1874,7 +2168,9 @@ impl SessionActor {
         )
         .await;
         let tool_chat = ConversationItem::tool_result(call_id.to_string(), message);
-        self.chat_state_handle.push_tool_result(tool_chat);
+        if records_model_tool_results() {
+            self.chat_state_handle.push_tool_result(tool_chat);
+        }
         Ok(())
     }
     /// Sweep `pending_inputs` and `pending_notifications` for entries
@@ -2187,7 +2483,9 @@ impl SessionActor {
                 inline_images,
             )
         };
-        self.chat_state_handle.push_tool_result(tool_chat);
+        if records_model_tool_results() {
+            self.chat_state_handle.push_tool_result(tool_chat);
+        }
         let mut deferred_followups = Vec::new();
         if !extracted_images.is_empty() {
             let count = extracted_images.len();
@@ -2279,7 +2577,9 @@ impl SessionActor {
         )
         .await;
         let tool_chat = ConversationItem::tool_result(call_id.to_string(), message);
-        self.chat_state_handle.push_tool_result(tool_chat);
+        if records_model_tool_results() {
+            self.chat_state_handle.push_tool_result(tool_chat);
+        }
         vec![]
     }
     async fn send_thought_chunk(&self, text: String, chunk_index: u64) {
@@ -2583,7 +2883,9 @@ impl SessionActor {
         self.send_update(acp::SessionUpdate::ToolCallUpdate(tool_update), None)
             .await;
         let tool_chat = ConversationItem::tool_result(model_call_id.to_owned(), reason);
-        self.chat_state_handle.push_tool_result(tool_chat);
+        if records_model_tool_results() {
+            self.chat_state_handle.push_tool_result(tool_chat);
+        }
         Ok(())
     }
 }

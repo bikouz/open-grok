@@ -1570,6 +1570,53 @@ fn fork_filter_preserves_complete_tool_turn() {
     assert_eq!(items.len(), 3, "complete tool turn should be preserved");
 }
 #[test]
+fn fork_filter_preserves_repeated_native_outputs_for_expected_call() {
+    use xai_grok_sampling_types::conversation::*;
+    let mut items = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("q"),
+        ConversationItem::Assistant(AssistantItem {
+            content: String::new().into(),
+            tool_calls: vec![ToolCall {
+                id: "exec1".into(),
+                name: "exec".into(),
+                arguments: "tools.notify('working')".into(),
+            }],
+            model_id: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+        ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+            "exec1", "working",
+        )),
+        ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+            "exec1", "done",
+        )),
+        ConversationItem::assistant("final"),
+    ];
+    super::fork_filter_chat(&mut items);
+    assert_eq!(
+        items.len(),
+        6,
+        "all outputs for the expected native call should remain paired"
+    );
+}
+#[test]
+fn fork_filter_stops_before_orphan_native_output() {
+    use xai_grok_sampling_types::conversation::*;
+    let mut items = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("q"),
+        ConversationItem::assistant("a"),
+        ConversationItem::custom_tool_output(CustomToolOutputItem::text("orphan", "bad")),
+        ConversationItem::user("later"),
+        ConversationItem::assistant("must not cross orphan"),
+    ];
+    super::fork_filter_chat(&mut items);
+    assert_eq!(items.len(), 3, "orphan output and later history must be dropped");
+    assert!(matches!(items.last(), Some(ConversationItem::Assistant(_))));
+}
+#[test]
 fn fork_filter_strips_incomplete_tool_turn() {
     use xai_grok_sampling_types::conversation::*;
     let mut items = vec![
@@ -2165,6 +2212,57 @@ fn strip_invalid_images_heals_tool_result_images() {
     );
 }
 #[test]
+fn strip_invalid_images_heals_ordered_and_native_tool_outputs() {
+    use xai_grok_sampling_types::{
+        CustomToolOutputContent, CustomToolOutputImageDetail, CustomToolOutputItem,
+    };
+    let good_url = image_data_uri("image/png", &test_png_bytes());
+    let bad_url = "data:image/png;base64,!!!corrupt!!!";
+    let mut items = vec![
+        ConversationItem::tool_result_with_ordered_content(
+            "wait_1",
+            vec![
+                CustomToolOutputContent::Image {
+                    url: good_url.clone().into(),
+                    detail: CustomToolOutputImageDetail::High,
+                },
+                CustomToolOutputContent::Image {
+                    url: bad_url.into(),
+                    detail: CustomToolOutputImageDetail::Original,
+                },
+            ],
+        ),
+        ConversationItem::custom_tool_output(CustomToolOutputItem::new(
+            "exec_1",
+            [CustomToolOutputContent::Image {
+                url: bad_url.into(),
+                detail: CustomToolOutputImageDetail::Original,
+            }],
+        )),
+    ];
+
+    assert_eq!(strip_invalid_images(&mut items), 2);
+    assert!(matches!(
+        &items[0],
+        ConversationItem::ToolResult(result)
+            if matches!(
+                result.ordered_content.as_slice(),
+                [
+                    CustomToolOutputContent::Image { url, .. },
+                    CustomToolOutputContent::Text { text },
+                ] if url.as_ref() == good_url.as_str() && text.contains("invalid data")
+            )
+    ));
+    assert!(matches!(
+        &items[1],
+        ConversationItem::CustomToolOutput(output)
+            if matches!(
+                output.content.as_slice(),
+                [CustomToolOutputContent::Text { text }] if text.contains("invalid data")
+            )
+    ));
+}
+#[test]
 fn strip_invalid_images_empty_conversation() {
     let mut items: Vec<ConversationItem> = vec![];
     assert_eq!(strip_invalid_images(& mut items), 0);
@@ -2309,6 +2407,7 @@ fn read_chat_history_upgrades_raw_output_parallel_tco_reasoning() {
             ConversationItem::User(_) => "user",
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
+            ConversationItem::CustomToolOutput(_) => "custom_tool_output",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
         })
@@ -2361,6 +2460,7 @@ fn read_chat_history_handles_hybrid_legacy_and_post_pr_lines() {
             ConversationItem::User(_) => "user",
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
+            ConversationItem::CustomToolOutput(_) => "custom_tool_output",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
         })
@@ -2423,6 +2523,7 @@ fn read_chat_history_is_idempotent_on_post_pr_sessions() {
             ConversationItem::User(_) => "user",
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
+            ConversationItem::CustomToolOutput(_) => "custom_tool_output",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
         })

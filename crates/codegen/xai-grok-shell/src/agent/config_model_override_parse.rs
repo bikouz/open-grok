@@ -269,7 +269,7 @@ mod tests {
     use super::*;
     use crate::sampling::ApiBackend;
     use xai_grok_sampling_types::{
-        CompactionAtTokens, CompactionsRemaining, ReasoningEffort, ReasoningEffortOption,
+        CompactionAtTokens, CompactionsRemaining, ReasoningEffort, ReasoningEffortOption, ToolMode,
     };
 
     fn parse_cfg(toml_str: &str) -> crate::agent::config::Config {
@@ -518,6 +518,7 @@ mod tests {
             system_prompt_label: Some("label".into()),
             use_concise: Some(true),
             agent_type: Some("agent".into()),
+            tool_mode: Some(ToolMode::CodeModeOnly),
             inference_idle_timeout_secs: Some(60),
             max_retries: Some(3),
             hidden: Some(false),

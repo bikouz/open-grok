@@ -766,11 +766,8 @@ pub(crate) async fn spawn_session_actor(
     let context_window_tokens = context_window_override
         .map(|c| c.get())
         .unwrap_or(sampling_config.context_window);
-    let model_tool_mode = models_manager
-        .models()
-        .values()
-        .find(|entry| entry.info.model == sampling_config.model)
-        .and_then(|entry| entry.info.tool_mode);
+    let model_tool_mode =
+        crate::agent::models::resolve_model_tool_mode(&models_manager.models(), &session_model_id);
     let effective_tool_mode =
         crate::agent::config::effective_tool_mode(model_tool_mode, code_mode_enabled);
     let managed_gateway_tool_client = auth_manager.as_ref().map(|am| {
@@ -814,6 +811,7 @@ pub(crate) async fn spawn_session_actor(
         compaction_policy,
         reminder_policy,
         code_mode_enabled,
+        code_mode_runtime: crate::session::code_mode::CodeModeRuntime::new(),
         memory_enabled: memory_config.as_ref().is_some_and(|mc| mc.enabled),
         memory_global_path: memory_storage_for_session
             .as_ref()
@@ -1323,6 +1321,14 @@ pub(crate) async fn spawn_session_actor(
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),
     });
+    if let Err(error) = session
+        .rebuild_spec
+        .code_mode_runtime
+        .start_dispatch_loop(Arc::downgrade(&session))
+        .await
+    {
+        tracing::error!(%error, "failed to start Code Mode nested-tool dispatcher");
+    }
     {
         let drainer_session = session.clone();
         let mut sampler_event_rx = sampler_event_rx;

@@ -22,7 +22,8 @@ use crate::extensions::notification::{
 use crate::sampling::error::map_sampling_err_to_acp;
 use crate::sampling::types::{ChatRequestMessage, ToolCallResponse, ToolDefinition};
 use crate::sampling::{
-    ContentPart, ConversationItem, ConversationRequest, ConversationResponse, SamplingError,
+    ContentPart, ConversationItem, ConversationRequest, ConversationResponse,
+    CustomToolOutputContent, CustomToolOutputImageDetail, CustomToolOutputItem, SamplingError,
     SyntheticReason, ToolSpec, conversation_truncate_for_prompt,
 };
 use crate::session::ClientFsConfig;
