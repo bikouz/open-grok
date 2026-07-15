@@ -459,6 +459,88 @@ pub struct ToolCall {
     pub arguments: Arc<str>,
 }
 
+/// The transport shape of a client-executed tool call.
+///
+/// Function calls carry JSON-encoded arguments. Custom calls carry the raw
+/// free-form input produced by the Responses API. [`ToolCall`] keeps its
+/// long-standing three-field representation for compatibility; custom-call
+/// identity is encoded in its otherwise-opaque `id` and exposed through the
+/// helpers below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallKind {
+    #[default]
+    Function,
+    Custom,
+}
+
+const CUSTOM_TOOL_CALL_ID_PREFIX: &str = "__xai_custom_tool_call__";
+
+fn encode_custom_tool_call_id(call_id: &str, item_id: &str) -> Arc<str> {
+    Arc::<str>::from(format!(
+        "{CUSTOM_TOOL_CALL_ID_PREFIX}{}:{call_id}{item_id}",
+        call_id.len()
+    ))
+}
+
+fn decode_custom_tool_call_id(value: &str) -> Option<(&str, &str)> {
+    let encoded = value.strip_prefix(CUSTOM_TOOL_CALL_ID_PREFIX)?;
+    let (call_id_len, payload) = encoded.split_once(':')?;
+    let call_id_len = call_id_len.parse::<usize>().ok()?;
+    if payload.len() < call_id_len || !payload.is_char_boundary(call_id_len) {
+        return None;
+    }
+    Some(payload.split_at(call_id_len))
+}
+
+impl ToolCall {
+    /// Construct a native Responses custom-tool call while preserving both the
+    /// API `call_id` and output-item `id` for byte-stable replay.
+    pub fn custom(
+        call_id: impl AsRef<str>,
+        item_id: impl AsRef<str>,
+        name: impl Into<String>,
+        input: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            id: encode_custom_tool_call_id(call_id.as_ref(), item_id.as_ref()),
+            name: name.into(),
+            arguments: input.into(),
+        }
+    }
+
+    pub fn kind(&self) -> ToolCallKind {
+        if decode_custom_tool_call_id(&self.id).is_some() {
+            ToolCallKind::Custom
+        } else {
+            ToolCallKind::Function
+        }
+    }
+
+    pub fn is_custom(&self) -> bool {
+        self.kind() == ToolCallKind::Custom
+    }
+
+    /// The provider call ID. For ordinary function calls this is the stored ID;
+    /// for custom calls it is decoded from the compatibility envelope.
+    pub fn call_id(&self) -> &str {
+        decode_custom_tool_call_id(&self.id)
+            .map(|(call_id, _)| call_id)
+            .unwrap_or(&self.id)
+    }
+
+    /// The Responses output-item ID for a custom call.
+    pub fn custom_item_id(&self) -> Option<&str> {
+        decode_custom_tool_call_id(&self.id).map(|(_, item_id)| item_id)
+    }
+
+    /// Raw custom-tool input. Function calls return `None` because their
+    /// `arguments` field is JSON rather than free-form text.
+    pub fn custom_input(&self) -> Option<&str> {
+        self.is_custom().then_some(self.arguments.as_ref())
+    }
+}
+
 /// Tool/function definition for the model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -469,6 +551,67 @@ pub struct ToolSpec {
     pub description: Option<String>,
     /// JSON Schema for the parameters
     pub parameters: serde_json::Value,
+}
+
+/// A native Responses custom tool. Unlike [`ToolSpec`], its input is
+/// free-form text optionally constrained by a grammar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CustomToolSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub format: rs::CustomToolParamFormat,
+}
+
+/// A client-executed tool declaration. Existing callers can continue using
+/// [`ToolSpec`] and `ConversationRequest::tools`; code-mode callers use this
+/// enum to add native Responses custom tools without changing function-tool
+/// behavior on Chat Completions or Messages backends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientTool {
+    Function {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        parameters: serde_json::Value,
+    },
+    Custom {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default)]
+        format: rs::CustomToolParamFormat,
+    },
+}
+
+impl ClientTool {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Function { name, .. } | Self::Custom { name, .. } => name,
+        }
+    }
+}
+
+impl From<ToolSpec> for ClientTool {
+    fn from(tool: ToolSpec) -> Self {
+        Self::Function {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+        }
+    }
+}
+
+impl From<CustomToolSpec> for ClientTool {
+    fn from(tool: CustomToolSpec) -> Self {
+        Self::Custom {
+            name: tool.name,
+            description: tool.description,
+            format: tool.format,
+        }
+    }
 }
 
 /// A tool that the backend executes server-side during inference.
@@ -485,14 +628,21 @@ pub enum HostedTool {
     /// This is xAI-specific — not part of the OpenAI Responses API, so it's
     /// injected as raw JSON into the request body by the sampler client.
     XSearch,
+    /// Compatibility storage for a client-executed native Responses custom
+    /// tool. Use [`ConversationRequest::add_client_tool`] rather than pushing
+    /// this variant directly. It lives here so adding custom tools does not
+    /// break the public `ConversationRequest` struct layout used throughout
+    /// downstream crates.
+    ClientCustom(CustomToolSpec),
 }
 
 impl HostedTool {
     /// The name the backend registers this tool under server-side.
-    pub fn wire_name(&self) -> &'static str {
+    pub fn wire_name(&self) -> &str {
         match self {
             HostedTool::WebSearch { .. } => "web_search",
             HostedTool::XSearch => "x_search",
+            HostedTool::ClientCustom(tool) => &tool.name,
         }
     }
 }
@@ -549,6 +699,53 @@ pub struct ConversationRequest {
 }
 
 impl ConversationRequest {
+    /// Add a client-executed tool while preserving the existing function-tool
+    /// storage and backend behavior.
+    pub fn add_client_tool(&mut self, tool: ClientTool) {
+        match tool {
+            ClientTool::Function {
+                name,
+                description,
+                parameters,
+            } => self.tools.push(ToolSpec {
+                name,
+                description,
+                parameters,
+            }),
+            ClientTool::Custom {
+                name,
+                description,
+                format,
+            } => self
+                .hosted_tools
+                .push(HostedTool::ClientCustom(CustomToolSpec {
+                    name,
+                    description,
+                    format,
+                })),
+        }
+    }
+
+    pub fn with_client_tools(mut self, tools: impl IntoIterator<Item = ClientTool>) -> Self {
+        for tool in tools {
+            self.add_client_tool(tool);
+        }
+        self
+    }
+
+    /// Names of native custom tools declared on this request. The Responses
+    /// stream transformer uses this set to distinguish client-executable
+    /// custom calls from xAI's backend-executed x_search custom calls.
+    pub fn client_custom_tool_names(&self) -> Vec<String> {
+        self.hosted_tools
+            .iter()
+            .filter_map(|tool| match tool {
+                HostedTool::ClientCustom(tool) => Some(tool.name.clone()),
+                HostedTool::WebSearch { .. } | HostedTool::XSearch => None,
+            })
+            .collect()
+    }
+
     /// Strip all inline image data from the conversation to reduce payload size.
     ///
     /// Replaces `ContentPart::Image` entries with a text placeholder so the
@@ -594,6 +791,8 @@ pub enum ConversationToolChoice {
     Required,
     /// Model must use a specific tool
     Function(String),
+    /// Model must use a specific native Responses custom tool.
+    Custom(String),
 }
 
 // ============================================================================
@@ -1095,6 +1294,19 @@ impl ConversationItem {
             content: Arc::<str>::from(content.into()),
             images: Vec::new(),
         })
+    }
+
+    /// Create a result for a native Responses custom-tool call when the caller
+    /// has provider IDs rather than the opaque [`ToolCall::id`] envelope.
+    pub fn custom_tool_result(
+        call_id: impl AsRef<str>,
+        item_id: impl AsRef<str>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self::tool_result(
+            encode_custom_tool_call_id(call_id.as_ref(), item_id.as_ref()).to_string(),
+            content,
+        )
     }
 
     /// Create a tool result message with inline images.
@@ -1925,6 +2137,18 @@ impl From<ChatResponseMessage> for ConversationItem {
 /// losslessly as N sibling `Reasoning` items — there is no longer a
 /// last-write-wins `Option<ReasoningContent>` collapse on the assistant.
 pub fn response_to_conversation_items(response: rs::Response) -> Vec<ConversationItem> {
+    response_to_conversation_items_with_client_custom_tools(response, &[])
+}
+
+/// Responses conversion with request-scoped knowledge of client-executed
+/// custom tools. xAI backend search also arrives as `CustomToolCall`, so the
+/// declaration names are the authoritative discriminator: matching calls join
+/// the trailing assistant's executable tool calls; all others retain the
+/// historical backend x_search representation.
+pub fn response_to_conversation_items_with_client_custom_tools(
+    response: rs::Response,
+    client_custom_tool_names: &[String],
+) -> Vec<ConversationItem> {
     let model_id = response.model.clone();
     let model_fingerprint = response
         .metadata
@@ -1987,10 +2211,14 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
                 }));
             }
             rs::OutputItem::CustomToolCall(ct) => {
-                backend_tool_count += 1;
-                items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
-                    kind: BackendToolKind::XSearch(ct),
-                }));
+                if client_custom_tool_names.iter().any(|name| name == &ct.name) {
+                    tool_calls.push(ToolCall::custom(ct.call_id, ct.id, ct.name, ct.input));
+                } else {
+                    backend_tool_count += 1;
+                    items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+                        kind: BackendToolKind::XSearch(ct),
+                    }));
+                }
             }
             rs::OutputItem::CodeInterpreterCall(ci) => {
                 backend_tool_count += 1;
@@ -2053,11 +2281,14 @@ impl From<ConversationRequest> for ChatCompletionRequest {
         let tool_choice = req
             .tool_choice
             .filter(|_| !tools_is_empty)
-            .map(|tc| match tc {
-                ConversationToolChoice::Auto => ToolChoice::auto(),
-                ConversationToolChoice::None => ToolChoice::none(),
-                ConversationToolChoice::Required => ToolChoice::required(),
-                ConversationToolChoice::Function(name) => ToolChoice::function(name),
+            .and_then(|tc| match tc {
+                ConversationToolChoice::Auto => Some(ToolChoice::auto()),
+                ConversationToolChoice::None => Some(ToolChoice::none()),
+                ConversationToolChoice::Required => Some(ToolChoice::required()),
+                ConversationToolChoice::Function(name) => Some(ToolChoice::function(name)),
+                // Native custom tools are Responses-only. Never misrepresent
+                // one as a JSON function on Chat Completions.
+                ConversationToolChoice::Custom(_) => None,
             });
 
         let response_format = req
@@ -2114,6 +2345,9 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             }
             ConversationToolChoice::Function(name) => {
                 rs::ToolChoiceParam::Function(rs::ToolChoiceFunction { name: name.clone() })
+            }
+            ConversationToolChoice::Custom(name) => {
+                rs::ToolChoiceParam::Custom(rs::ToolChoiceCustom { name: name.clone() })
             }
         });
 
@@ -2261,23 +2495,66 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 }));
             }
 
-            // Add each tool call as a FunctionCall item
+            // Add each client-executable tool call in its native Responses
+            // shape. Custom inputs are raw text and must never pass through
+            // JSON argument sanitization.
             for tc in &a.tool_calls {
-                let arguments = sanitize_tool_arguments(&tc.id, &tc.name, tc.arguments.clone());
-                items.push(rs::InputItem::Item(rs::Item::FunctionCall(
-                    rs::FunctionToolCall {
-                        call_id: tc.id.as_ref().to_owned(),
-                        name: tc.name.clone(),
-                        arguments: arguments.as_ref().to_owned(),
-                        id: None,
-                        status: None,
-                    },
-                )));
+                if tc.is_custom() {
+                    // `async_openai::CustomToolCall` is non-exhaustive, so
+                    // construct it through its stable serde wire contract.
+                    let custom_call: rs::CustomToolCall =
+                        serde_json::from_value(serde_json::json!({
+                            "call_id": tc.call_id(),
+                            "input": tc.arguments.as_ref(),
+                            "name": tc.name,
+                            "id": tc.custom_item_id().unwrap_or(tc.call_id()),
+                        }))
+                        .expect("native custom tool call fields must satisfy the Responses schema");
+                    items.push(rs::InputItem::Item(rs::Item::CustomToolCall(custom_call)));
+                } else {
+                    let arguments = sanitize_tool_arguments(&tc.id, &tc.name, tc.arguments.clone());
+                    items.push(rs::InputItem::Item(rs::Item::FunctionCall(
+                        rs::FunctionToolCall {
+                            call_id: tc.id.as_ref().to_owned(),
+                            name: tc.name.clone(),
+                            arguments: arguments.as_ref().to_owned(),
+                            id: None,
+                            status: None,
+                        },
+                    )));
+                }
             }
 
             items
         }
         ConversationItem::ToolResult(t) => {
+            if let Some((call_id, _)) = decode_custom_tool_call_id(&t.tool_call_id) {
+                let output = if t.images.is_empty() {
+                    rs::CustomToolCallOutputOutput::Text(t.content.as_ref().to_owned())
+                } else {
+                    let mut parts: Vec<rs::InputContent> =
+                        vec![rs::InputContent::InputText(rs::InputTextContent {
+                            text: t.content.as_ref().to_owned(),
+                        })];
+                    for img in &t.images {
+                        if let ContentPart::Image { url } = img {
+                            parts.push(rs::InputContent::InputImage(rs::InputImageContent {
+                                detail: rs::ImageDetail::Auto,
+                                file_id: None,
+                                image_url: Some(url.as_ref().to_owned()),
+                            }));
+                        }
+                    }
+                    rs::CustomToolCallOutputOutput::List(parts)
+                };
+                return vec![rs::InputItem::Item(rs::Item::CustomToolCallOutput(
+                    rs::CustomToolCallOutput {
+                        call_id: call_id.to_owned(),
+                        output,
+                        id: None,
+                    },
+                ))];
+            }
             // Tool results are sent as FunctionCallOutput items.
             // When images are present, use Content variant with text + image blocks.
             let output = if t.images.is_empty() {
@@ -2352,10 +2629,10 @@ fn content_parts_to_easy_input_content(parts: &[ContentPart]) -> rs::EasyInputCo
 
 /// Build tools for Responses API.
 ///
-/// Combines client-side function tools (`req.tools`) with backend-hosted
+/// Combines client-side function tools (`req.tools`) with native Responses
 /// tools (`req.hosted_tools`). Function tools are sent as `rs::Tool::Function`;
-/// hosted tools are sent as their native Responses API types (e.g.,
-/// `rs::Tool::WebSearch`), which tells the backend to execute them server-side.
+/// custom tools are sent as `rs::Tool::Custom`; hosted tools use their native
+/// server-executed Responses types.
 ///
 /// Function tools whose name collides with a hosted tool are dropped (the
 /// backend rejects the request with `Duplicate tool names: <name>` otherwise);
@@ -2400,6 +2677,13 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
             // XSearch is xAI-specific — not in async_openai's rs::Tool enum.
             // Injected as raw JSON by the sampler client after serialization.
             HostedTool::XSearch => {}
+            HostedTool::ClientCustom(tool) => {
+                tools.push(rs::Tool::Custom(rs::CustomToolParam {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    format: tool.format.clone(),
+                }));
+            }
         }
     }
 
@@ -2421,6 +2705,7 @@ pub fn extra_raw_tools(hosted_tools: &[HostedTool]) -> Vec<serde_json::Value> {
             HostedTool::XSearch => {
                 raw.push(serde_json::json!({"type": "x_search"}));
             }
+            HostedTool::ClientCustom(_) => {}
         }
     }
     raw
@@ -3222,11 +3507,15 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
     };
 
     // Build tool_choice
-    let tool_choice: Option<ToolChoiceParam> = req.tool_choice.as_ref().map(|tc| match tc {
-        ConversationToolChoice::Auto => ToolChoiceParam::Auto,
-        ConversationToolChoice::Required => ToolChoiceParam::Any,
-        ConversationToolChoice::Function(name) => ToolChoiceParam::Tool { name: name.clone() },
-        ConversationToolChoice::None => ToolChoiceParam::Auto, // default
+    let tool_choice: Option<ToolChoiceParam> = req.tool_choice.as_ref().and_then(|tc| match tc {
+        ConversationToolChoice::Auto => Some(ToolChoiceParam::Auto),
+        ConversationToolChoice::Required => Some(ToolChoiceParam::Any),
+        ConversationToolChoice::Function(name) => {
+            Some(ToolChoiceParam::Tool { name: name.clone() })
+        }
+        ConversationToolChoice::None => Some(ToolChoiceParam::Auto), // default
+        // Anthropic Messages has no native custom/free-form tool shape.
+        ConversationToolChoice::Custom(_) => None,
     });
 
     let effort = req
@@ -3450,6 +3739,152 @@ mod compaction_item_bridge_tests {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+
+    fn response_with_output(output: Vec<rs::OutputItem>) -> rs::Response {
+        rs::Response {
+            background: None,
+            billing: None,
+            conversation: None,
+            created_at: 0,
+            completed_at: None,
+            error: None,
+            id: "resp_custom".into(),
+            incomplete_details: None,
+            instructions: None,
+            max_output_tokens: None,
+            metadata: None,
+            model: "test-model".into(),
+            object: "response".into(),
+            output,
+            parallel_tool_calls: None,
+            previous_response_id: None,
+            prompt: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: None,
+            status: rs::Status::Completed,
+            temperature: None,
+            text: None,
+            tool_choice: None,
+            tools: None,
+            top_logprobs: None,
+            top_p: None,
+            truncation: None,
+            usage: None,
+        }
+    }
+
+    fn custom_tool_call(
+        call_id: &str,
+        item_id: &str,
+        name: &str,
+        input: &str,
+    ) -> rs::CustomToolCall {
+        serde_json::from_value(serde_json::json!({
+            "call_id": call_id,
+            "id": item_id,
+            "name": name,
+            "input": input,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn client_custom_tool_serializes_natively_without_changing_function_tools() {
+        let request = ConversationRequest::from_items(vec![ConversationItem::user("run it")])
+            .with_tools(vec![ToolSpec {
+                name: "read_file".into(),
+                description: Some("Read a file".into()),
+                parameters: serde_json::json!({"type": "object"}),
+            }])
+            .with_client_tools([ClientTool::Custom {
+                name: "code".into(),
+                description: Some("Execute code".into()),
+                format: rs::CustomToolParamFormat::Text,
+            }])
+            .with_tool_choice(ConversationToolChoice::Custom("code".into()));
+
+        let responses: rs::CreateResponse = (&request).into();
+        let wire = serde_json::to_value(&responses).unwrap();
+        let tools = wire["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "read_file");
+        assert_eq!(tools[1]["type"], "custom");
+        assert_eq!(tools[1]["name"], "code");
+        assert_eq!(tools[1]["description"], "Execute code");
+        assert_eq!(tools[1]["format"], serde_json::json!({"type": "text"}));
+        assert_eq!(
+            wire["tool_choice"],
+            serde_json::json!({"type": "custom", "name": "code"})
+        );
+
+        let chat: ChatCompletionRequest = request.into();
+        let chat_tools = chat.tools.expect("function tool remains available");
+        assert_eq!(chat_tools.len(), 1);
+        assert_eq!(chat_tools[0].function.name, "read_file");
+        assert!(
+            chat.tool_choice.is_none(),
+            "custom choice is Responses-only"
+        );
+    }
+
+    #[test]
+    fn client_custom_call_and_output_round_trip_without_reclassifying_xsearch() {
+        let response = response_with_output(vec![
+            rs::OutputItem::CustomToolCall(custom_tool_call(
+                "call_code",
+                "ctc_code",
+                "code",
+                "const answer = 40 + 2;",
+            )),
+            rs::OutputItem::CustomToolCall(custom_tool_call(
+                "call_search",
+                "ctc_search",
+                "x_keyword_search",
+                "rust custom tools",
+            )),
+        ]);
+        let custom_names = vec!["code".to_string()];
+        let mut items =
+            response_to_conversation_items_with_client_custom_tools(response, &custom_names);
+
+        assert_matches!(
+            &items[0],
+            ConversationItem::BackendToolCall(BackendToolCallItem {
+                kind: BackendToolKind::XSearch(call),
+            }) if call.name == "x_keyword_search"
+        );
+        let ConversationItem::Assistant(assistant) = items.last().unwrap() else {
+            panic!("expected trailing assistant");
+        };
+        let call = assistant.tool_calls.first().expect("client custom call");
+        assert_eq!(call.kind(), ToolCallKind::Custom);
+        assert_eq!(call.call_id(), "call_code");
+        assert_eq!(call.custom_item_id(), Some("ctc_code"));
+        assert_eq!(call.custom_input(), Some("const answer = 40 + 2;"));
+
+        items.push(ConversationItem::tool_result(call.id.to_string(), "42"));
+        let request = ConversationRequest::from_items(items);
+        let responses: rs::CreateResponse = (&request).into();
+        let wire = serde_json::to_value(responses).unwrap();
+        let input = wire["input"].as_array().unwrap();
+        let custom_call = input
+            .iter()
+            .find(|item| item["type"] == "custom_tool_call" && item["name"] == "code")
+            .expect("custom call replayed");
+        assert_eq!(custom_call["call_id"], "call_code");
+        assert_eq!(custom_call["id"], "ctc_code");
+        assert_eq!(custom_call["input"], "const answer = 40 + 2;");
+        let custom_output = input
+            .iter()
+            .find(|item| item["type"] == "custom_tool_call_output")
+            .expect("custom output replayed");
+        assert_eq!(custom_output["call_id"], "call_code");
+        assert_eq!(custom_output["output"], "42");
+    }
 
     #[test]
     fn prior_turn_interrupt_serde_round_trip_and_unknown_fallback() {

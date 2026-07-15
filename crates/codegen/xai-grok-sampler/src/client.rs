@@ -1981,9 +1981,16 @@ impl SamplingClient {
                 crate::stream::collect_response(events).await
             }
             ApiBackend::Responses => {
+                let client_custom_tool_names = request.client_custom_tool_names();
                 let (raw, meta, doom_loop) = self.conversation_stream_responses(request).await?;
-                let events =
-                    crate::stream::stream_responses(raw, meta, request_id, idle_timeout, doom_loop);
+                let events = crate::stream::stream_responses_with_client_custom_tools(
+                    raw,
+                    meta,
+                    request_id,
+                    idle_timeout,
+                    doom_loop,
+                    client_custom_tool_names,
+                );
                 crate::stream::collect_response(events).await
             }
             ApiBackend::Messages => {

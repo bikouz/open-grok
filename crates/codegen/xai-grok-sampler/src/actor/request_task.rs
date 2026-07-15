@@ -26,7 +26,9 @@ use crate::metrics::InferenceLatencyStats;
 use crate::retry::{
     self as retry_mod, RetryDecision, classify_error, clone_error, resolve_max_retries,
 };
-use crate::stream::{stream_chat_completions, stream_messages, stream_responses};
+use crate::stream::{
+    stream_chat_completions, stream_messages, stream_responses_with_client_custom_tools,
+};
 use crate::types::RequestId;
 
 /// Default per-chunk idle timeout when neither config nor caller
@@ -436,6 +438,7 @@ async fn run_one_attempt(
             drive_l2(l2, request_id, event_tx, cancel_token, captured, None).await
         }
         ApiBackend::Responses => {
+            let client_custom_tool_names = request.client_custom_tool_names();
             let (raw, metadata, doom_loop) =
                 match client.conversation_stream_responses(request).await {
                     Ok(parts) => parts,
@@ -447,7 +450,14 @@ async fn run_one_attempt(
                 collector.disarm_abort();
             }
             let (teed, captured) = tee_errors(raw);
-            let l2 = stream_responses(teed, metadata, request_id.clone(), idle_timeout, doom_loop);
+            let l2 = stream_responses_with_client_custom_tools(
+                teed,
+                metadata,
+                request_id.clone(),
+                idle_timeout,
+                doom_loop,
+                client_custom_tool_names,
+            );
             drive_l2(l2, request_id, event_tx, cancel_token, captured, doom_check).await
         }
         ApiBackend::Messages => {

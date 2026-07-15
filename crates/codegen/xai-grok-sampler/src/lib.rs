@@ -50,5 +50,8 @@ pub use retry::{
     format_sampling_error, resolve_max_retries, retry_backoff_with_jitter,
 };
 pub use sampling_log::AuthInfo;
-pub use stream::{collect_response, stream_chat_completions, stream_messages, stream_responses};
+pub use stream::{
+    collect_response, stream_chat_completions, stream_messages, stream_responses,
+    stream_responses_with_client_custom_tools,
+};
 pub use types::RequestId;

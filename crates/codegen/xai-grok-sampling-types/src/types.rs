@@ -1020,6 +1020,20 @@ pub enum ApiBackend {
     Messages,
 }
 
+/// How client-executed tools are exposed to the model.
+///
+/// This selector is shared by model metadata, session resolution, and the
+/// sampling transport. `Direct` preserves the existing JSON function-calling
+/// behavior; code-mode variants opt into the native Responses custom-tool lane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolMode {
+    #[default]
+    Direct,
+    CodeMode,
+    CodeModeOnly,
+}
+
 impl ApiBackend {
     /// Whether the backend enforces a response JSON schema natively alongside
     /// tool calls. The Messages API does not (a schema there blocks tool use),
@@ -1517,5 +1531,18 @@ mod tests {
         let inner: &dyn TraceContext = &*cloned_trace;
         let downcast = inner.as_any().downcast_ref::<TestTrace>().unwrap();
         assert_eq!(downcast.0, "trace-data");
+    }
+
+    #[test]
+    fn tool_mode_serde_and_default_are_stable() {
+        assert_eq!(ToolMode::default(), ToolMode::Direct);
+        for (mode, wire) in [
+            (ToolMode::Direct, r#""direct""#),
+            (ToolMode::CodeMode, r#""code_mode""#),
+            (ToolMode::CodeModeOnly, r#""code_mode_only""#),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<ToolMode>(wire).unwrap(), mode);
+        }
     }
 }

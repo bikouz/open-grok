@@ -3,7 +3,7 @@
 //! Consumes a raw `rs::ResponseStreamEvent` stream and produces
 //! [`SamplingEvent`]s. Pure: no I/O, no shell coupling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -98,6 +98,27 @@ pub fn stream_responses<'a>(
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
 ) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+    stream_responses_with_client_custom_tools(
+        raw_stream,
+        model_metadata,
+        request_id,
+        idle_timeout,
+        doom_loop,
+        Vec::new(),
+    )
+}
+
+/// Responses stream transform with request-scoped custom-tool declarations.
+/// The names distinguish client-executed custom calls from backend x_search,
+/// which uses the same Responses `CustomToolCall` wire item.
+pub fn stream_responses_with_client_custom_tools<'a>(
+    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+    model_metadata: Option<ResponseModelMetadata>,
+    request_id: RequestId,
+    idle_timeout: Duration,
+    doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
+    client_custom_tool_names: Vec<String>,
+) -> impl Stream<Item = SamplingEvent> + Send + 'a {
     async_stream::stream! {
         use rs::{ResponseStreamEvent, Status};
 
@@ -128,6 +149,7 @@ pub fn stream_responses<'a>(
         // later `ResponseFunctionCallArgumentsDelta` events
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut custom_input_started: BTreeSet<u32> = BTreeSet::new();
         let mut next_tool_index: u32 = 0;
 
         let mut stream = raw_stream;
@@ -242,21 +264,49 @@ pub fn stream_responses<'a>(
                     }
                 }
 
-                // Start of a Responses FunctionCall — emit initial id+name
-                // and remember the output_index → tool_index mapping.
+                // Start of a client-executable Responses tool call — emit
+                // initial id+name and remember output_index → tool_index.
                 ResponseStreamEvent::ResponseOutputItemAdded(added_event) => {
-                    if let rs::OutputItem::FunctionCall(fc) = added_event.item {
-                        let tool_index = next_tool_index;
-                        next_tool_index += 1;
-                        output_to_tool_index.insert(added_event.output_index, tool_index);
+                    match added_event.item {
+                        rs::OutputItem::FunctionCall(fc) => {
+                            let tool_index = next_tool_index;
+                            next_tool_index += 1;
+                            output_to_tool_index.insert(added_event.output_index, tool_index);
 
-                        yield SamplingEvent::ToolCallDelta {
-                            request_id: request_id.clone(),
-                            tool_index,
-                            id: Some(fc.call_id),
-                            name: Some(fc.name),
-                            arguments_delta: None,
-                        };
+                            yield SamplingEvent::ToolCallDelta {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                id: Some(fc.call_id),
+                                name: Some(fc.name),
+                                arguments_delta: None,
+                            };
+                        }
+                        rs::OutputItem::CustomToolCall(ct)
+                            if client_custom_tool_names.iter().any(|name| name == &ct.name) =>
+                        {
+                            let tool_index = next_tool_index;
+                            next_tool_index += 1;
+                            output_to_tool_index.insert(added_event.output_index, tool_index);
+                            let has_initial_input = !ct.input.is_empty();
+                            if has_initial_input {
+                                custom_input_started.insert(added_event.output_index);
+                            }
+                            let call = xai_grok_sampling_types::ToolCall::custom(
+                                &ct.call_id,
+                                &ct.id,
+                                &ct.name,
+                                ct.input.clone(),
+                            );
+
+                            yield SamplingEvent::ToolCallDelta {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                id: Some(call.id.to_string()),
+                                name: Some(ct.name),
+                                arguments_delta: has_initial_input.then_some(ct.input),
+                            };
+                        }
+                        _ => {}
                     }
                 }
 
@@ -268,6 +318,24 @@ pub fn stream_responses<'a>(
                         && let Some(&tool_index) =
                             output_to_tool_index.get(&args_event.output_index)
                     {
+                        yield SamplingEvent::ToolCallDelta {
+                            request_id: request_id.clone(),
+                            tool_index,
+                            id: None,
+                            name: None,
+                            arguments_delta: Some(delta),
+                        };
+                    }
+                }
+
+                // Native custom tools stream raw text rather than JSON args.
+                ResponseStreamEvent::ResponseCustomToolCallInputDelta(input_event) => {
+                    let delta = input_event.delta;
+                    if !delta.is_empty()
+                        && let Some(&tool_index) =
+                            output_to_tool_index.get(&input_event.output_index)
+                    {
+                        custom_input_started.insert(input_event.output_index);
                         yield SamplingEvent::ToolCallDelta {
                             request_id: request_id.clone(),
                             tool_index,
@@ -362,7 +430,9 @@ pub fn stream_responses<'a>(
                         // Use "x_search" consistently (matching the Started event);
                         // the specific sub-type is in the serialized result payload
                         // and extracted by the pager from raw_output.name.
-                        rs::OutputItem::CustomToolCall(ct) => {
+                        rs::OutputItem::CustomToolCall(ct)
+                            if !client_custom_tool_names.iter().any(|name| name == &ct.name) =>
+                        {
                             let result = serde_json::to_value(ct).ok();
                             yield SamplingEvent::BackendToolCallCompleted {
                                 request_id: request_id.clone(),
@@ -375,14 +445,27 @@ pub fn stream_responses<'a>(
                     }
                 }
 
-                // CustomToolCallInputDelta is x_search in-progress streaming.
-                // Emit a started event on first delta per item_id.
+                // A done event without a preceding delta still carries the
+                // complete custom input. For backend custom calls it remains
+                // the x_search lifecycle start signal.
                 ResponseStreamEvent::ResponseCustomToolCallInputDone(ev) => {
-                    yield SamplingEvent::BackendToolCallStarted {
-                        request_id: request_id.clone(),
-                        call_id: ev.item_id.clone(),
-                        name: "x_search".to_string(),
-                    };
+                    if let Some(&tool_index) = output_to_tool_index.get(&ev.output_index) {
+                        if !custom_input_started.contains(&ev.output_index) && !ev.input.is_empty() {
+                            yield SamplingEvent::ToolCallDelta {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                id: None,
+                                name: None,
+                                arguments_delta: Some(ev.input),
+                            };
+                        }
+                    } else {
+                        yield SamplingEvent::BackendToolCallStarted {
+                            request_id: request_id.clone(),
+                            call_id: ev.item_id.clone(),
+                            name: "x_search".to_string(),
+                        };
+                    }
                 }
 
                 // All other events (intermediate progress, annotations,
@@ -461,7 +544,11 @@ pub fn stream_responses<'a>(
         // text as a fallback when the final response lacks `content` /
         // `summary` (the streaming deltas may have arrived out of band).
         // Splice policy lives in `inject_streaming_reasoning_fallback`.
-        let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
+        let mut items =
+            xai_grok_sampling_types::response_to_conversation_items_with_client_custom_tools(
+                response,
+                &client_custom_tool_names,
+            );
         xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
 
         let has_tool_calls = items.iter().any(|i| match i {
@@ -795,6 +882,83 @@ mod tests {
         )
     }
 
+    fn custom_tool_call(
+        call_id: &str,
+        item_id: &str,
+        name: &str,
+        input: &str,
+    ) -> rs_types::CustomToolCall {
+        serde_json::from_value(serde_json::json!({
+            "call_id": call_id,
+            "id": item_id,
+            "name": name,
+            "input": input,
+        }))
+        .unwrap()
+    }
+
+    fn custom_call_added_event(
+        output_index: u32,
+        call_id: &str,
+        item_id: &str,
+        name: &str,
+    ) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemAdded(rs_types::ResponseOutputItemAddedEvent {
+            sequence_number: 0,
+            output_index,
+            item: rs_types::OutputItem::CustomToolCall(custom_tool_call(
+                call_id, item_id, name, "",
+            )),
+        })
+    }
+
+    fn custom_call_added_event_with_input(
+        output_index: u32,
+        call_id: &str,
+        item_id: &str,
+        name: &str,
+        input: &str,
+    ) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemAdded(rs_types::ResponseOutputItemAddedEvent {
+            sequence_number: 0,
+            output_index,
+            item: rs_types::OutputItem::CustomToolCall(custom_tool_call(
+                call_id, item_id, name, input,
+            )),
+        })
+    }
+
+    fn custom_call_input_delta_event(output_index: u32, delta: &str) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseCustomToolCallInputDelta(
+            rs_types::ResponseCustomToolCallInputDeltaEvent {
+                sequence_number: 0,
+                output_index,
+                item_id: format!("ctc_{output_index}"),
+                delta: delta.into(),
+            },
+        )
+    }
+
+    fn custom_call_input_done_event(output_index: u32, input: &str) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseCustomToolCallInputDone(
+            rs_types::ResponseCustomToolCallInputDoneEvent {
+                sequence_number: 0,
+                output_index,
+                item_id: format!("ctc_{output_index}"),
+                input: input.into(),
+            },
+        )
+    }
+
+    fn completed_event_with_output(output: Vec<rs_types::OutputItem>) -> rs::ResponseStreamEvent {
+        let mut response = empty_completed_response();
+        response.output = output;
+        rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+            response,
+            sequence_number: 0,
+        })
+    }
+
     type Delta = (u32, Option<String>, Option<String>, Option<String>);
 
     /// Extract all ToolCallDelta events as (tool_index, id, name, arguments_delta).
@@ -867,6 +1031,145 @@ mod tests {
         ))
         .await;
         assert_eq!(tool_call_deltas(&evs).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn client_custom_call_streams_raw_input_and_completes_as_tool_call() {
+        let final_call =
+            custom_tool_call("call_code", "ctc_code", "code", "const answer = 40 + 2;");
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(custom_call_added_event(0, "call_code", "ctc_code", "code")),
+            Ok(custom_call_input_delta_event(0, "const answer = ")),
+            Ok(custom_call_input_delta_event(0, "40 + 2;")),
+            Ok(custom_call_input_done_event(0, "const answer = 40 + 2;")),
+            Ok(completed_event_with_output(vec![
+                rs_types::OutputItem::CustomToolCall(final_call),
+            ])),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["code".into()],
+        ))
+        .await;
+
+        let deltas = tool_call_deltas(&evs);
+        assert_eq!(deltas.len(), 3);
+        assert_eq!(deltas[0].2.as_deref(), Some("code"));
+        assert_eq!(deltas[0].3, None);
+        assert_eq!(deltas[1].3.as_deref(), Some("const answer = "));
+        assert_eq!(deltas[2].3.as_deref(), Some("40 + 2;"));
+        assert!(!evs.iter().any(|event| matches!(
+            event,
+            SamplingEvent::BackendToolCallStarted { .. }
+                | SamplingEvent::BackendToolCallCompleted { .. }
+        )));
+
+        let SamplingEvent::Completed { response, .. } = evs.last().unwrap() else {
+            panic!("expected completed response");
+        };
+        assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+        let ConversationItem::Assistant(assistant) = response.items.last().unwrap() else {
+            panic!("expected trailing assistant");
+        };
+        let call = assistant.tool_calls.first().expect("custom tool call");
+        assert!(call.is_custom());
+        assert_eq!(call.call_id(), "call_code");
+        assert_eq!(call.custom_item_id(), Some("ctc_code"));
+        assert_eq!(call.custom_input(), Some("const answer = 40 + 2;"));
+    }
+
+    #[tokio::test]
+    async fn client_custom_input_is_not_duplicated_after_added_and_delta_events() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(custom_call_added_event_with_input(
+                0,
+                "call_code",
+                "ctc_code",
+                "code",
+                "const answer = ",
+            )),
+            Ok(custom_call_input_delta_event(0, "40 + 2;")),
+            Ok(custom_call_input_done_event(0, "const answer = 40 + 2;")),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["code".into()],
+        ))
+        .await;
+
+        let streamed_input: String = tool_call_deltas(&evs)
+            .into_iter()
+            .filter_map(|(_, _, _, delta)| delta)
+            .collect();
+        assert_eq!(streamed_input, "const answer = 40 + 2;");
+    }
+
+    #[tokio::test]
+    async fn undeclared_custom_call_remains_backend_xsearch() {
+        let final_call = custom_tool_call(
+            "call_search",
+            "ctc_search",
+            "x_keyword_search",
+            "custom tools",
+        );
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(custom_call_added_event(
+                0,
+                "call_search",
+                "ctc_search",
+                "x_keyword_search",
+            )),
+            Ok(custom_call_input_done_event(0, "custom tools")),
+            Ok(rs::ResponseStreamEvent::ResponseOutputItemDone(
+                rs_types::ResponseOutputItemDoneEvent {
+                    sequence_number: 0,
+                    output_index: 0,
+                    item: rs_types::OutputItem::CustomToolCall(final_call.clone()),
+                },
+            )),
+            Ok(completed_event_with_output(vec![
+                rs_types::OutputItem::CustomToolCall(final_call),
+            ])),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["code".into()],
+        ))
+        .await;
+
+        assert!(tool_call_deltas(&evs).is_empty());
+        assert!(evs.iter().any(|event| matches!(
+            event,
+            SamplingEvent::BackendToolCallStarted { name, .. } if name == "x_search"
+        )));
+        assert!(evs.iter().any(|event| matches!(
+            event,
+            SamplingEvent::BackendToolCallCompleted { name, .. } if name == "x_search"
+        )));
+        let SamplingEvent::Completed { response, .. } = evs.last().unwrap() else {
+            panic!("expected completed response");
+        };
+        assert_eq!(response.stop_reason, Some(StopReason::Stop));
+        assert!(matches!(
+            &response.items[0],
+            ConversationItem::BackendToolCall(_)
+        ));
     }
 
     #[tokio::test]
