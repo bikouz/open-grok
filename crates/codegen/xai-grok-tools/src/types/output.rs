@@ -663,6 +663,39 @@ pub enum ToolOutput {
     ImageEdit(MediaGenOutput),
 }
 impl ToolOutput {
+    /// Stable value returned to JavaScript when a tool is invoked through
+    /// Code Mode.
+    ///
+    /// The aggregate enum uses an internal `type` tag for persistence and
+    /// protocol translation. That tag is an implementation detail and must
+    /// not leak into the nested-tool API. Codex also deliberately returns an
+    /// empty object for `apply_patch`, because the filesystem mutation is the
+    /// result and the model does not need the patcher's verbose transcript.
+    pub fn code_mode_result(&self) -> Result<serde_json::Value, serde_json::Error> {
+        match self {
+            ToolOutput::ApplyPatch(_) => Ok(serde_json::json!({})),
+            ToolOutput::Dynamic(output) => Ok(output.value.clone()),
+            ToolOutput::Text(output) => Ok(serde_json::Value::String(output.text.clone())),
+            ToolOutput::Bash(output) => Ok(serde_json::json!({
+                "output": String::from_utf8_lossy(&output.output),
+                "exit_code": output.exit_code,
+                "signal": output.signal,
+                "timed_out": output.timed_out,
+                "truncated": output.truncated,
+                "current_dir": output.current_dir,
+                "output_file": output.output_file,
+                "total_bytes": output.total_bytes,
+            })),
+            _ => {
+                let mut value = serde_json::to_value(self)?;
+                if let serde_json::Value::Object(object) = &mut value {
+                    object.remove("type");
+                }
+                Ok(value)
+            }
+        }
+    }
+
     /// Whether this output is a logical tool failure, for `tool.execution`'s
     /// `success`/`outcome`. Conservative: only known error variants count, so we
     /// never report a *false failure*.
@@ -2408,6 +2441,44 @@ mod tests {
             .is_none()
         );
     }
+
+    #[test]
+    fn code_mode_result_hides_aggregate_tags_and_projects_special_outputs() {
+        let bash = ToolOutput::Bash(sample_bash(7, b"hello\n", false));
+        assert_eq!(
+            bash.code_mode_result().unwrap(),
+            serde_json::json!({
+                "output": "hello\n",
+                "exit_code": 7,
+                "signal": null,
+                "timed_out": false,
+                "truncated": false,
+                "current_dir": "/tmp",
+                "output_file": "",
+                "total_bytes": 6,
+            })
+        );
+
+        assert_eq!(
+            ToolOutput::Text(TextOutput::from("plain"))
+                .code_mode_result()
+                .unwrap(),
+            serde_json::Value::String("plain".into())
+        );
+        assert_eq!(
+            ToolOutput::Dynamic(DynamicOutput::from(serde_json::json!({ "answer": 42 })))
+                .code_mode_result()
+                .unwrap(),
+            serde_json::json!({ "answer": 42 })
+        );
+        assert_eq!(
+            ToolOutput::ApplyPatch(ApplyPatchOutput::EmptyPatch("unused".into()))
+                .code_mode_result()
+                .unwrap(),
+            serde_json::json!({})
+        );
+    }
+
     fn sample_run_result(output: ToolOutput) -> ToolRunResult {
         ToolRunResult {
             prompt_text: "prompt".into(),
