@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use xai_grok_sampling_types::HostedTool;
+use xai_grok_sampling_types::{HostedTool, ToolMode};
 use xai_grok_tools::bridge::ToolBridge;
 use xai_grok_tools::types::definition::ToolDefinition;
 
@@ -48,6 +48,11 @@ pub struct Agent {
     /// Build-time toggle for server-side search tools. ANDed at request
     /// time with the per-model `SessionActor::supports_backend_search`.
     backend_search_enabled: bool,
+
+    /// Effective model-facing tool presentation for this session. The shell
+    /// resolves model metadata and the restart-scoped user preference before
+    /// the first turn, and may update it on a compatible model switch.
+    tool_mode: ToolMode,
 }
 
 impl Agent {
@@ -74,6 +79,7 @@ impl Agent {
             compaction_policy,
             hosted_tools,
             backend_search_enabled,
+            tool_mode: ToolMode::Direct,
         }
     }
 
@@ -188,6 +194,17 @@ impl Agent {
     /// on web-search config.
     pub fn backend_search_enabled(&self) -> bool {
         self.backend_search_enabled
+    }
+
+    /// Effective model-facing tool presentation for this session.
+    pub fn tool_mode(&self) -> ToolMode {
+        self.tool_mode
+    }
+
+    /// Update the effective presentation after startup resolution or a model
+    /// switch. This does not mutate the underlying registered toolset.
+    pub fn set_tool_mode(&mut self, tool_mode: ToolMode) {
+        self.tool_mode = tool_mode;
     }
 
     /// Built-in tool definitions only (excludes MCP tools).

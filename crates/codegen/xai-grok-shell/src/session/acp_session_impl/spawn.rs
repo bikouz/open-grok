@@ -132,6 +132,7 @@ pub(crate) async fn spawn_session_actor(
     client_fs_capable: bool,
     gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     agent_definition: AgentDefinition,
+    code_mode_enabled: bool,
     session_default_agent_profile: Option<String>,
     skills_config: SkillsConfig,
     preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
@@ -765,6 +766,13 @@ pub(crate) async fn spawn_session_actor(
     let context_window_tokens = context_window_override
         .map(|c| c.get())
         .unwrap_or(sampling_config.context_window);
+    let model_tool_mode = models_manager
+        .models()
+        .values()
+        .find(|entry| entry.info.model == sampling_config.model)
+        .and_then(|entry| entry.info.tool_mode);
+    let effective_tool_mode =
+        crate::agent::config::effective_tool_mode(model_tool_mode, code_mode_enabled);
     let managed_gateway_tool_client = auth_manager.as_ref().map(|am| {
         xai_grok_tools::types::resources::ManagedGatewayToolClient(Arc::new(
             ShellManagedGatewayToolClient {
@@ -805,6 +813,7 @@ pub(crate) async fn spawn_session_actor(
         models_manager: models_manager.clone(),
         compaction_policy,
         reminder_policy,
+        code_mode_enabled,
         memory_enabled: memory_config.as_ref().is_some_and(|mc| mc.enabled),
         memory_global_path: memory_storage_for_session
             .as_ref()
@@ -854,7 +863,7 @@ pub(crate) async fn spawn_session_actor(
             None
         },
     });
-    let agent = rebuild_spec
+    let mut agent = rebuild_spec
         .build_agent_with_initial_overrides(
             agent_definition,
             persisted_announcement_state
@@ -871,6 +880,7 @@ pub(crate) async fn spawn_session_actor(
             );
             e
         })?;
+    agent.set_tool_mode(effective_tool_mode);
     let resolved_task_output =
         xai_grok_tools::reminders::task_completion::resolve_task_output_tool_name(
             agent.tool_bridge(),
@@ -1705,6 +1715,7 @@ pub(crate) async fn spawn_session_on_thread(
     client_fs_capable: bool,
     gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     agent_definition: AgentDefinition,
+    code_mode_enabled: bool,
     session_default_agent_profile: Option<String>,
     skills_config: SkillsConfig,
     preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
@@ -1867,6 +1878,7 @@ pub(crate) async fn spawn_session_on_thread(
                         client_fs_capable,
                         gateway_enabled,
                         agent_definition,
+                        code_mode_enabled,
                         session_default_agent_profile,
                         skills_config,
                         preloaded_skills,

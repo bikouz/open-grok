@@ -3336,6 +3336,7 @@ impl MvpAgent {
         let write_file_enabled = self.cfg.borrow().resolve_write_file().value;
         let goal_enabled = self.cfg.borrow().resolve_goal().value;
         let subagents_enabled = self.cfg.borrow().subagents_enabled;
+        let code_mode_enabled = self.cfg.borrow().ui.code_mode.unwrap_or(false);
         let ask_user_question_enabled = crate::upload::turn::parse_ask_user_question_from_meta(
                 session_meta,
             )
@@ -3538,6 +3539,7 @@ impl MvpAgent {
                     client_fs_read && client_fs_write,
                     gateway_enabled,
                     agent_definition,
+                    code_mode_enabled,
                     session_default_agent_profile,
                     skills,
                     None,

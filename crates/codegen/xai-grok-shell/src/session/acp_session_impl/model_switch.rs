@@ -35,12 +35,26 @@ impl SessionActor {
             .set(sampling_config.compactions_remaining);
         self.compaction_at_tokens
             .set(sampling_config.compaction_at_tokens);
+        let model_tool_mode = self
+            .models_manager
+            .models()
+            .values()
+            .find(|entry| entry.info.model == sampling_config.model)
+            .and_then(|entry| entry.info.tool_mode);
+        let effective_tool_mode = crate::agent::config::effective_tool_mode(
+            model_tool_mode,
+            self.rebuild_spec.code_mode_enabled,
+        );
+        self.agent
+            .borrow_mut()
+            .set_tool_mode(effective_tool_mode);
         xai_grok_telemetry::unified_log::info(
             "backend_search: model switch",
             Some(self.session_info.id.0.as_ref()),
             Some(serde_json::json!(
                 { "new_model" : & sampling_config.model, "api_backend" :
                 format!("{:?}", sampling_config.api_backend),
+                "tool_mode" : format!("{:?}", effective_tool_mode),
                 "supports_backend_search" : sampling_config.supports_backend_search,
                 }
             )),

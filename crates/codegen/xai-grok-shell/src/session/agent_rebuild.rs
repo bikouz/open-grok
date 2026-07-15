@@ -47,6 +47,7 @@ use xai_grok_agent::error::AgentBuildError;
 use xai_grok_agent::prompt::context::PromptAudience;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_agent::{Agent, AgentBuilder, CompactionPolicy, ReminderPolicy};
+use xai_grok_sampling_types::ToolMode;
 use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
 use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest;
 use xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig;
@@ -88,6 +89,9 @@ pub(crate) struct AgentRebuildSpec {
     pub models_manager: crate::agent::models::ModelsManager,
     pub compaction_policy: CompactionPolicy,
     pub reminder_policy: ReminderPolicy,
+    /// Restart-scoped Settings fallback. Model catalog metadata remains
+    /// authoritative when the effective mode is resolved.
+    pub code_mode_enabled: bool,
     pub memory_enabled: bool,
     pub memory_global_path: Option<String>,
     pub memory_workspace_path: Option<String>,
@@ -184,6 +188,7 @@ impl AgentRebuildSpec {
             models_manager,
             compaction_policy,
             reminder_policy,
+            code_mode_enabled,
             memory_enabled,
             memory_global_path,
             memory_workspace_path,
@@ -307,7 +312,12 @@ impl AgentRebuildSpec {
         if let Some(skills) = preloaded_skills {
             builder = builder.with_preloaded_skills(skills);
         }
-        let agent = builder.build().await?;
+        let mut agent = builder.build().await?;
+        agent.set_tool_mode(if *code_mode_enabled {
+            ToolMode::CodeModeOnly
+        } else {
+            ToolMode::Direct
+        });
         let model_validator = models_manager.clone();
         agent
             .tool_bridge()
@@ -386,6 +396,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         models_manager: crate::agent::models::ModelsManager::default(),
         compaction_policy: CompactionPolicy::default(),
         reminder_policy: ReminderPolicy::default(),
+        code_mode_enabled: false,
         memory_enabled: false,
         memory_global_path: None,
         memory_workspace_path: None,

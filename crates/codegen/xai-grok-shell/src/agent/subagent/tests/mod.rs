@@ -3093,6 +3093,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            tool_mode: None,
             auth_scheme: Default::default(),
             extra_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(256_000).unwrap(),

@@ -1046,6 +1046,11 @@ pub(crate) async fn handle_subagent_request(
     } else {
         None
     };
+    let code_mode_enabled = ctx
+        .agent_config
+        .as_ref()
+        .and_then(|config| config.ui.code_mode)
+        .unwrap_or(false);
     let spawn_result = session::spawn_session_on_thread(
             child_session_info,
             gateway.clone(),
@@ -1101,6 +1106,7 @@ pub(crate) async fn handle_subagent_request(
             false,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             definition,
+            code_mode_enabled,
             subagent_session_default_agent_profile,
             if inherit_skills {
                 ctx.parent_skills_config.clone()

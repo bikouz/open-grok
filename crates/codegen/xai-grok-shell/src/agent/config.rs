@@ -12,7 +12,7 @@ use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_sampler::{AuthScheme, SamplerConfig};
 use xai_grok_sampling_types::{
     CompactionAtTokens, CompactionsRemaining, REASONING_EFFORT_META_KEY,
-    REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption,
+    REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption, ToolMode,
     reasoning_effort_meta_value, reasoning_efforts_meta_value,
 };
 use xai_grok_tools::types::compat::{
@@ -41,6 +41,18 @@ pub const DEFAULT_AGENT_TYPE: &str = "grok-build-plan";
 /// Serde default for `ModelInfo.agent_type` and `ModelEntryConfig.agent_type`.
 pub fn default_agent_type() -> String {
     DEFAULT_AGENT_TYPE.to_owned()
+}
+/// Resolve the session's tool presentation using Codex's model-first
+/// precedence. The Settings switch only supplies a fallback for models that do
+/// not declare their own mode.
+pub fn effective_tool_mode(model_mode: Option<ToolMode>, code_mode_enabled: bool) -> ToolMode {
+    model_mode.unwrap_or_else(|| {
+        if code_mode_enabled {
+            ToolMode::CodeModeOnly
+        } else {
+            ToolMode::Direct
+        }
+    })
 }
 /// Default base URL for the cli chat proxy.
 pub const CLI_CHAT_PROXY_BASE_URL_DEFAULT: &str = "https://cli-chat-proxy.grok.com/v1";
@@ -3143,6 +3155,9 @@ pub fn resolve_model_list(
                 if entry.info.api_backend == ApiBackend::default() {
                     entry.info.api_backend.clone_from(&donor.info.api_backend);
                 }
+                if entry.info.tool_mode.is_none() {
+                    entry.info.tool_mode = donor.info.tool_mode;
+                }
             }
             if resolved.contains_key(key) {
                 tracing::debug!(
@@ -3178,19 +3193,27 @@ pub fn resolve_model_list(
     }
     {
         let default_cw = DEFAULT_CONTEXT_WINDOW;
-        let donors: std::collections::HashMap<String, (std::num::NonZeroU64, ApiBackend)> =
-            resolved
-                .values()
-                .filter(|e| e.info.context_window.get() != default_cw)
-                .map(|e| {
+        let donors: std::collections::HashMap<
+            String,
+            (std::num::NonZeroU64, ApiBackend, Option<ToolMode>),
+        > = resolved
+            .values()
+            .filter(|e| e.info.context_window.get() != default_cw)
+            .map(|e| {
+                (
+                    e.info.model.clone(),
                     (
-                        e.info.model.clone(),
-                        (e.info.context_window, e.info.api_backend.clone()),
-                    )
-                })
-                .collect();
+                        e.info.context_window,
+                        e.info.api_backend.clone(),
+                        e.info.tool_mode,
+                    ),
+                )
+            })
+            .collect();
         for entry in resolved.values_mut() {
-            if let Some((donor_cw, donor_backend)) = donors.get(&entry.info.model) {
+            if let Some((donor_cw, donor_backend, donor_tool_mode)) =
+                donors.get(&entry.info.model)
+            {
                 if entry.info.context_window.get() == default_cw {
                     tracing::debug!(
                         model = % entry.info.model, from = default_cw, to = donor_cw
@@ -3203,6 +3226,9 @@ pub fn resolve_model_list(
                     && *donor_backend != ApiBackend::default()
                 {
                     entry.info.api_backend.clone_from(donor_backend);
+                }
+                if entry.info.tool_mode.is_none() {
+                    entry.info.tool_mode = *donor_tool_mode;
                 }
             }
         }
@@ -3325,6 +3351,8 @@ struct DefaultModelJson {
     top_p: Option<f32>,
     max_completion_tokens: Option<u32>,
     api_backend: ApiBackend,
+    /// Model-selected tool presentation. `None` keeps the direct-tool default.
+    tool_mode: Option<ToolMode>,
     #[serde(default = "default_agent_type")]
     agent_type: String,
     inference_idle_timeout_secs: Option<u64>,
@@ -3385,6 +3413,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 top_p: m.top_p,
                 max_completion_tokens: m.max_completion_tokens,
                 api_backend: m.api_backend,
+                tool_mode: m.tool_mode,
                 auth_scheme: None,
                 agent_type: m.agent_type,
                 inference_idle_timeout_secs: m.inference_idle_timeout_secs,
@@ -3443,6 +3472,10 @@ pub struct ModelEntryConfig {
     /// Values: "chat_completions" (default), "responses"
     #[serde(default)]
     pub api_backend: ApiBackend,
+    /// Model-selected tool presentation. Model metadata takes precedence over
+    /// the user Code Mode preference, matching the Codex model catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_mode: Option<ToolMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scheme: Option<AuthScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3558,6 +3591,7 @@ pub struct ConfigModelOverride {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: Option<ApiBackend>,
+    pub tool_mode: Option<ToolMode>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
     pub context_window: Option<u64>,
@@ -3620,6 +3654,9 @@ impl ConfigModelOverride {
         }
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = v.clone();
+        }
+        if let Some(v) = self.tool_mode {
+            entry.info.tool_mode = Some(v);
         }
         if !self.extra_headers.is_empty() {
             entry.info.extra_headers = self.extra_headers.clone();
@@ -3708,6 +3745,10 @@ pub struct ModelInfo {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: ApiBackend,
+    /// Model-selected tool presentation. `None` lets the session preference
+    /// decide; `Some` is authoritative for compatibility-sensitive models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_mode: Option<ToolMode>,
     pub auth_scheme: AuthScheme,
     pub extra_headers: IndexMap<String, String>,
     pub context_window: NonZeroU64,
@@ -3773,6 +3814,7 @@ impl ModelInfo {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            tool_mode: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -3808,6 +3850,7 @@ impl ModelInfo {
             temperature: entry.temperature,
             top_p: entry.top_p,
             api_backend: entry.api_backend.clone(),
+            tool_mode: entry.tool_mode,
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
             context_window: entry.context_window,
@@ -4488,6 +4531,7 @@ pub fn resolve_aux_model_sampling_config(
                 temperature: None,
                 top_p: None,
                 api_backend: ApiBackend::Responses,
+                tool_mode: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(200_000).unwrap(),
@@ -4710,6 +4754,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::Responses,
+            tool_mode: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -4804,6 +4849,17 @@ pub fn to_acp_model_info(
                     "agentType".to_string(),
                     serde_json::Value::String(info.agent_type.clone()),
                 );
+                if let Some(tool_mode) = info.tool_mode {
+                    let value = match tool_mode {
+                        ToolMode::Direct => "direct",
+                        ToolMode::CodeMode => "code_mode",
+                        ToolMode::CodeModeOnly => "code_mode_only",
+                    };
+                    map.insert(
+                        "toolMode".to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    );
+                }
                 if info.supports_reasoning_effort {
                     map.insert(
                         "supportsReasoningEffort".to_string(),
@@ -5366,6 +5422,7 @@ reasoning_effort = "low"
                 temperature: None,
                 top_p: None,
                 api_backend: ApiBackend::default(),
+                tool_mode: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(200_000).unwrap(),
@@ -6238,6 +6295,53 @@ reasoning_effort = "low"
         let model = resolved.get("my-chat-model").expect("model should exist");
         assert_eq!(model.info.api_backend, ApiBackend::ChatCompletions);
     }
+    #[test]
+    fn parses_model_tool_mode_code_mode_only() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.gpt-5-6-sol]
+            model = "gpt-5.6-sol"
+            base_url = "https://api.openai.com/v1"
+            context_window = 372000
+            api_backend = "responses"
+            agent_type = "codex"
+            tool_mode = "code_mode_only"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("gpt-5-6-sol").expect("model should exist");
+        assert_eq!(model.info.tool_mode, Some(ToolMode::CodeModeOnly));
+    }
+    #[test]
+    fn model_tool_mode_defaults_to_unspecified() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.direct]
+            model = "direct"
+            base_url = "https://api.example.com/v1"
+            context_window = 200000
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        assert_eq!(resolved["direct"].info.tool_mode, None);
+    }
+    #[test]
+    fn effective_tool_mode_is_model_first() {
+        assert_eq!(
+            effective_tool_mode(Some(ToolMode::Direct), true),
+            ToolMode::Direct
+        );
+        assert_eq!(
+            effective_tool_mode(Some(ToolMode::CodeModeOnly), false),
+            ToolMode::CodeModeOnly
+        );
+        assert_eq!(effective_tool_mode(None, true), ToolMode::CodeModeOnly);
+        assert_eq!(effective_tool_mode(None, false), ToolMode::Direct);
+    }
     /// Messages backend (Anthropic) auto-defaults supports_reasoning_effort=true.
     /// Without this, `--reasoning-effort` is silently dropped in
     /// xai-grok-shell/src/agent/models.rs:857 for any BYOK Claude config.
@@ -6386,6 +6490,7 @@ reasoning_effort = "low"
             api_key: None,
             env_key: None,
             api_backend: ApiBackend::default(),
+            tool_mode: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -6545,6 +6650,7 @@ reasoning_effort = "low"
             api_key: None,
             env_key: None,
             api_backend: ApiBackend::default(),
+            tool_mode: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -6996,6 +7102,7 @@ reasoning_effort = "low"
             api_key: None,
             env_key: None,
             api_backend: ApiBackend::default(),
+            tool_mode: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -10560,6 +10667,7 @@ default = "grok-4.5"
                 temperature: None,
                 top_p: None,
                 api_backend,
+                tool_mode: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(context_window).unwrap(),

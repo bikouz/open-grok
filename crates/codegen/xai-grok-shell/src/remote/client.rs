@@ -826,6 +826,16 @@ pub fn parse_remote_model_value(
             _ => None,
         })
         .unwrap_or_default();
+    let tool_mode = get_string(obj, "toolMode")
+        .or_else(|| get_string(obj, "tool_mode"))
+        .or_else(|| meta.and_then(|m| get_string(m, "toolMode")))
+        .or_else(|| meta.and_then(|m| get_string(m, "tool_mode")))
+        .and_then(|value| match value.as_str() {
+            "direct" => Some(xai_grok_sampling_types::ToolMode::Direct),
+            "code_mode" => Some(xai_grok_sampling_types::ToolMode::CodeMode),
+            "code_mode_only" => Some(xai_grok_sampling_types::ToolMode::CodeModeOnly),
+            _ => None,
+        });
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
@@ -840,6 +850,7 @@ pub fn parse_remote_model_value(
         api_key: get_string(obj, "apiKey").or_else(|| get_string(obj, "api_key")),
         env_key: get_env_keys(obj, "envKey").or_else(|| get_env_keys(obj, "env_key")),
         api_backend,
+        tool_mode,
         context_window,
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
             .or_else(|| get_u64(obj, "auto_compact_threshold_percent"))
@@ -1415,6 +1426,20 @@ mod tests {
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(result.model, "actual-model-id");
         assert_eq!(result.name.as_deref(), Some("Display Name"));
+    }
+    #[test]
+    fn parse_reads_code_mode_only_from_remote_catalog() {
+        let value = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "contextWindow": 372_000,
+            "apiBackend": "responses",
+            "toolMode": "code_mode_only"
+        });
+        let result = parse_remote_model_value(&value, "https://api.openai.com/v1").unwrap();
+        assert_eq!(
+            result.tool_mode,
+            Some(xai_grok_sampling_types::ToolMode::CodeModeOnly)
+        );
     }
     #[test]
     fn parse_reads_reasoning_effort_fields() {
