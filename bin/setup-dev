@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+for command_name in rustup cargo dotslash; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "error: required command '$command_name' is not installed" >&2
+        if [[ "$command_name" == "dotslash" ]]; then
+            echo "install it with: cargo install dotslash" >&2
+        fi
+        exit 1
+    fi
+done
+
+echo "Using Rust toolchain: $(rustup show active-toolchain)"
+echo "Using $(./bin/protoc --version)"
+
+cargo fetch --locked
+cargo check --locked -p xai-grok-pager-bin
+
+echo
+echo "Local development setup is ready."
+echo "Run this checkout with: ./bin/grok-dev --version"

@@ -100,6 +100,24 @@ MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
 
 ## Development
 
+For a first-time local checkout, validate the required tools, fetch the locked
+dependencies, and compile the main package:
+
+```sh
+./bin/setup-dev
+```
+
+Use the repo-local runner while changing the source. It builds and launches
+this checkout without replacing an installed `grok` release:
+
+```sh
+./bin/grok-dev --version
+./bin/grok-dev inspect
+./bin/grok-dev "explain this repository"
+```
+
+The usual focused Cargo commands remain available for development:
+
 ```sh
 cargo check -p <crate>        # always target specific crates; full-workspace builds are slow
 cargo test -p xai-grok-config # per-crate tests
