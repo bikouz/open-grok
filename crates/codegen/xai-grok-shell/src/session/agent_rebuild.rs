@@ -498,7 +498,7 @@ mod tests {
                 let first_description = task_description(&first);
                 assert!(
                     first_description
-                    .contains("If the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n\
+                    .contains("You may choose a different model or provider for a subagent when it materially fits the delegated task better (for example, speed, cost, depth, or provider capabilities). You MUST use only model slugs from this list:\n\
                          - alpha-public\n\
                          - zeta-public")
                 );
@@ -523,7 +523,7 @@ mod tests {
                 let rebuilt_description = task_description(&rebuilt);
                 assert!(
                     rebuilt_description
-                    .contains("If the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n\
+                    .contains("You may choose a different model or provider for a subagent when it materially fits the delegated task better (for example, speed, cost, depth, or provider capabilities). You MUST use only model slugs from this list:\n\
                          - alpha-public\n\
                          - beta-public\n\
                          - zeta-public")

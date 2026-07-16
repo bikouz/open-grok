@@ -3155,12 +3155,12 @@ fn fresh_tool_model_accepts_visible_key_and_internal_id() {
     models.insert("grok-3".to_string(), test_model_entry("grok-3-2025-02-15"));
     assert!(
         super::handle_request::task_model_override_error(Some("grok-3"),
-        ModelOverrideProvenance::Tool, false, & models, false,).is_none(),
+        ModelOverrideProvenance::Tool, false, & models, false, false,).is_none(),
         "key lookup should succeed"
     );
     assert!(
         super::handle_request::task_model_override_error(Some("grok-3-2025-02-15"),
-        ModelOverrideProvenance::Tool, false, & models, false,).is_none(),
+        ModelOverrideProvenance::Tool, false, & models, false, false,).is_none(),
         "info().model lookup should succeed"
     );
 }
@@ -3173,7 +3173,7 @@ fn fresh_tool_model_rejects_unavailable_exact_key_over_visible_slug_collision() 
     models.insert("collision".to_string(), unavailable_exact);
     assert_eq!(
         super::handle_request::task_model_override_error(Some("collision"),
-        ModelOverrideProvenance::Tool, false, & models, false,).as_deref(),
+        ModelOverrideProvenance::Tool, false, & models, false, false,).as_deref(),
         Some("Unknown Task.model slug 'collision'. Valid model slugs: visible-alias. \
                  Omit `model` to inherit the parent model."),
         "validation must inspect the unavailable exact-key entry selected by execution"
@@ -3188,7 +3188,7 @@ fn fresh_tool_model_rejects_unavailable_first_slug_collision() {
     models.insert("visible-second".to_string(), test_model_entry("shared-routing-slug"));
     assert_eq!(
         super::handle_request::task_model_override_error(Some("shared-routing-slug"),
-        ModelOverrideProvenance::Tool, false, & models, false,).as_deref(),
+        ModelOverrideProvenance::Tool, false, & models, false, false,).as_deref(),
         Some("Unknown Task.model slug 'shared-routing-slug'. Valid model slugs: \
                  visible-second. Omit `model` to inherit the parent model."),
         "validation must inspect the first routing-slug entry selected by execution"
@@ -3223,6 +3223,7 @@ fn fresh_tool_model_rejects_unknown_and_nonavailable_entries() {
                 false,
                 &models,
                 false,
+                false,
             )
             .unwrap();
         assert_eq!(
@@ -3234,8 +3235,41 @@ fn fresh_tool_model_rejects_unknown_and_nonavailable_entries() {
     }
     assert!(
         super::handle_request::task_model_override_error(Some("oauth-only"),
-        ModelOverrideProvenance::Tool, false, & models, true,).is_none(),
+        ModelOverrideProvenance::Tool, false, & models, true, false,).is_none(),
         "OAuth-only model should resolve for session auth"
+    );
+}
+#[test]
+fn fresh_tool_model_uses_each_providers_own_oauth_state() {
+    let mut xai_oauth = test_model_entry("xai-oauth-internal");
+    xai_oauth.info.supported_in_api = false;
+    let mut codex_oauth = test_model_entry("codex-oauth-internal");
+    codex_oauth.info.provider = xai_grok_sampling_types::ModelProvider::Codex;
+    codex_oauth.info.supported_in_api = false;
+    let models = indexmap::IndexMap::from([
+        ("xai-oauth".to_string(), xai_oauth),
+        ("codex-oauth".to_string(), codex_oauth),
+    ]);
+
+    assert!(
+        super::handle_request::task_model_override_error(Some("xai-oauth"),
+        ModelOverrideProvenance::Tool, false, & models, true, false,).is_none(),
+        "xAI OAuth must make only the xAI model available"
+    );
+    assert!(
+        super::handle_request::task_model_override_error(Some("codex-oauth"),
+        ModelOverrideProvenance::Tool, false, & models, true, false,).is_some(),
+        "xAI OAuth must not unlock Codex models"
+    );
+    assert!(
+        super::handle_request::task_model_override_error(Some("xai-oauth"),
+        ModelOverrideProvenance::Tool, false, & models, false, true,).is_some(),
+        "Codex OAuth must not unlock xAI models"
+    );
+    assert!(
+        super::handle_request::task_model_override_error(Some("codex-oauth"),
+        ModelOverrideProvenance::Tool, false, & models, false, true,).is_none(),
+        "Codex OAuth must make only the Codex model available"
     );
 }
 #[test]
@@ -3243,7 +3277,7 @@ fn fresh_tool_model_reports_empty_valid_list() {
     let empty = indexmap::IndexMap::new();
     assert_eq!(
         super::handle_request::task_model_override_error(Some("anything"),
-        ModelOverrideProvenance::Tool, false, & empty, false,).as_deref(),
+        ModelOverrideProvenance::Tool, false, & empty, false, false,).as_deref(),
         Some("Unknown Task.model slug 'anything'. No valid model slugs are currently \
                  available. Omit `model` to inherit the parent model.")
     );
@@ -3253,7 +3287,7 @@ fn resumed_tool_model_override_is_ignored() {
     let empty = indexmap::IndexMap::new();
     assert!(
         super::handle_request::task_model_override_error(Some("stale-model"),
-        ModelOverrideProvenance::Tool, true, & empty, false,).is_none(),
+        ModelOverrideProvenance::Tool, true, & empty, false, false,).is_none(),
         "resume must preserve source-model pinning"
     );
 }
@@ -3262,7 +3296,7 @@ fn harness_model_override_keeps_internal_fallback_behavior() {
     let empty = indexmap::IndexMap::new();
     assert!(
         super::handle_request::task_model_override_error(Some("internal-model"),
-        ModelOverrideProvenance::Harness, false, & empty, false,).is_none(),
+        ModelOverrideProvenance::Harness, false, & empty, false, false,).is_none(),
         "internal role/config pins must retain downstream soft fallback"
     );
 }

@@ -30,16 +30,18 @@ pub(super) fn task_model_override_error(
     provenance: ModelOverrideProvenance,
     is_resume: bool,
     available: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
-    is_session_auth: bool,
+    has_xai_session: bool,
+    has_codex_session: bool,
 ) -> Option<String> {
     if provenance != ModelOverrideProvenance::Tool || is_resume {
         return None;
     }
     let requested = requested?;
-    crate::agent::models::task_model_error_for_catalog(
+    crate::agent::models::task_model_error_for_catalog_with_provider_auth(
         requested,
         available,
-        is_session_auth,
+        has_xai_session,
+        has_codex_session,
     )
 }
 /// This is a free async function, NOT a method on MvpAgent. It receives
@@ -237,6 +239,7 @@ pub(crate) async fn handle_subagent_request(
         resume_source.is_some(),
         &ctx.available_models,
         ctx.auth_manager.auth_mode().is_some_and(|mode| mode.is_session_auth()),
+        crate::codex_auth::is_logged_in(),
     ) {
         pending_guard.set_error(error.clone());
         send_failure(request, &error);

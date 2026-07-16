@@ -1264,9 +1264,9 @@ fn task_model_guidance(model_slugs: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "\n\nIf the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n\
+        "\n\nYou may choose a different model or provider for a subagent when it materially fits the delegated task better (for example, speed, cost, depth, or provider capabilities). You MUST use only model slugs from this list:\n\
          {model_list}\n\n\
-         If the user does not explicitly request a model, omit `{TASK_MODEL_PARAM}` to inherit the parent model."
+         Omit `{TASK_MODEL_PARAM}` to inherit the parent model when no listed model is a better fit."
     )
 }
 /// Build the Task tool description with the effective subagent list.
@@ -1465,13 +1465,13 @@ mod tests {
         );
         assert!(
             desc
-            .contains("If the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n\
+            .contains("You may choose a different model or provider for a subagent when it materially fits the delegated task better (for example, speed, cost, depth, or provider capabilities). You MUST use only model slugs from this list:\n\
              - alpha\n\
              - zeta")
         );
         assert!(
             desc
-            .contains("If the user does not explicitly request a model, omit `${{ params.task.model }}` to inherit the parent model.")
+            .contains("Omit `${{ params.task.model }}` to inherit the parent model when no listed model is a better fit.")
         );
         assert!(!desc.contains("Available model slugs:"));
         assert!(!desc.contains(concat!("grok", " models")));

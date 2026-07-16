@@ -1172,8 +1172,10 @@ mod tests {
             schema["properties"]["model"]["description"],
             "Optional model slug for this agent. If provided, it must resolve to one of the \
              available model slugs. If omitted, the subagent uses the same model as the parent \
-             agent. Do not pass if resume_from is set (prior model will be used). Only choose \
-             an explicit model when the user directly requests it."
+             agent. The selected model may use a different provider than the parent. Choose an \
+             explicit model when it materially fits the delegated task better (for example, \
+             speed, cost, depth, or provider capabilities); otherwise omit it. Do not pass if \
+             resume_from is set (the prior model will be used)."
         );
     }
 

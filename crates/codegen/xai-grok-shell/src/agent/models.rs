@@ -65,20 +65,7 @@ enum CacheAuthMethod {
     Deployment,
 }
 
-pub(crate) fn task_model_error_for_catalog(
-    requested: &str,
-    available: &IndexMap<String, ModelEntry>,
-    is_session_auth: bool,
-) -> Option<String> {
-    task_model_error_for_catalog_with_provider_auth(
-        requested,
-        available,
-        is_session_auth,
-        is_session_auth,
-    )
-}
-
-fn task_model_error_for_catalog_with_provider_auth(
+pub(crate) fn task_model_error_for_catalog_with_provider_auth(
     requested: &str,
     available: &IndexMap<String, ModelEntry>,
     has_xai_session: bool,
