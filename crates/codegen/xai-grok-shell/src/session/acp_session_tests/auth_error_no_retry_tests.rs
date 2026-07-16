@@ -196,7 +196,10 @@ async fn sampler_401_recovery_returns_refresh_and_retry() {
             let (actor, _rx) = make_actor_with_auth_manager(Some(am)).await;
             let result = actor.handle_sampling_failure(auth_error()).await;
             assert!(
-                matches!(result, Ok(SamplerFailureRecovery::RefreshAuthAndResubmit)),
+                matches!(
+                    result,
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
+                ),
                 "session-based auth with a working refresher must return RefreshAuthAndResubmit"
             );
             assert!(called.load(Ordering::SeqCst), "refresher must be invoked");
@@ -616,7 +619,10 @@ async fn sampler_401_session_method_with_stale_api_key_auth_type_still_recovers(
             let result = actor.handle_sampling_failure(auth_error()).await;
 
             assert!(
-                matches!(result, Ok(SamplerFailureRecovery::RefreshAuthAndResubmit)),
+                matches!(
+                    result,
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
+                ),
                 "session-based method must recover even when auth_type transiently reads ApiKey"
             );
             assert!(
@@ -650,7 +656,10 @@ async fn sampler_401_oidc_method_with_stale_api_key_auth_type_still_recovers() {
             let result = actor.handle_sampling_failure(auth_error()).await;
 
             assert!(
-                matches!(result, Ok(SamplerFailureRecovery::RefreshAuthAndResubmit)),
+                matches!(
+                    result,
+                    Ok(SamplerFailureRecovery::RefreshAuthAndResubmit { .. })
+                ),
                 "oidc method must recover even when auth_type transiently reads ApiKey"
             );
             assert!(
@@ -746,7 +755,7 @@ async fn reconstruct_full_config_uses_chat_state_provider_for_remote_only_codex_
                 model,
                 ModelAuthFacts {
                     byok: ModelByok::NotByok,
-                    auth_scheme: Default::default(),
+                    auth_scheme: xai_grok_sampler::AuthScheme::XApiKey,
                     // Simulate a disk resolver that cannot see the remote
                     // catalog entry and therefore falls back to xAI.
                     provider: xai_grok_sampling_types::ModelProvider::Xai,
@@ -758,6 +767,11 @@ async fn reconstruct_full_config_uses_chat_state_provider_for_remote_only_codex_
                 reconstructed.provider,
                 xai_grok_sampling_types::ModelProvider::Codex
             );
+            assert_eq!(
+                reconstructed.auth_scheme,
+                xai_grok_sampler::AuthScheme::Bearer,
+                "live Codex provider must override stale xAI auth-scheme facts"
+            );
             assert!(
                 reconstructed.bearer_resolver.is_some(),
                 "Codex session-token auth must retain its live OAuth resolver"
@@ -768,6 +782,166 @@ async fn reconstruct_full_config_uses_chat_state_provider_for_remote_only_codex_
                 reconstructed.attribution_callback.is_none(),
                 "OpenAI tokens must not flow into xAI auth attribution"
             );
+        })
+        .await;
+}
+
+#[test]
+fn turn_auth_refresh_route_is_provider_and_provenance_aware() {
+    assert_eq!(
+        turn_auth_refresh_route(
+            xai_grok_sampling_types::ModelProvider::Codex,
+            xai_chat_state::AuthType::SessionToken,
+        ),
+        TurnAuthRefreshRoute::CodexOAuth,
+    );
+    assert_eq!(
+        turn_auth_refresh_route(
+            xai_grok_sampling_types::ModelProvider::Xai,
+            xai_chat_state::AuthType::SessionToken,
+        ),
+        TurnAuthRefreshRoute::XaiSession,
+    );
+    assert_eq!(
+        turn_auth_refresh_route(
+            xai_grok_sampling_types::ModelProvider::Codex,
+            xai_chat_state::AuthType::ApiKey,
+        ),
+        TurnAuthRefreshRoute::ConfigApiKey,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_codex_oauth_clears_any_static_authorization_fallback() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                None,
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "must-not-reach-openai".to_string(),
+            )
+            .await;
+
+            actor.update_codex_chat_credentials(None).await;
+
+            let credentials = actor.chat_state_handle.get_credentials().await;
+            assert_eq!(
+                credentials.auth_type,
+                xai_chat_state::AuthType::SessionToken
+            );
+            assert!(
+                credentials.api_key.is_none(),
+                "missing isolated Codex auth must leave no static bearer fallback"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_codex_session_rejects_account_identity_drift() {
+    fn credentials(account: &str, user: &str, token: &str) -> crate::codex_auth::CodexCredentials {
+        crate::codex_auth::CodexCredentials {
+            access_token: token.to_string(),
+            account_id: Some(account.to_string()),
+            chatgpt_user_id: Some(user.to_string()),
+            email: None,
+            plan_type: Some("enterprise".to_string()),
+            is_workspace_account: true,
+            account_is_fedramp: false,
+        }
+    }
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                None,
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "token-a".to_string(),
+            )
+            .await;
+            let account_a = credentials("account-a", "user-a", "token-a");
+            let mut config = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has sampling config");
+            config.provider = xai_grok_sampling_types::ModelProvider::Codex;
+            crate::codex_auth::set_oauth_identity_anchor(
+                &mut config.extra_headers,
+                Some(&account_a),
+            );
+            actor.chat_state_handle.update_sampling_config(config);
+
+            let accepted = actor
+                .update_codex_chat_credentials(Some(credentials("account-b", "user-b", "token-b")))
+                .await;
+
+            assert!(!accepted, "a running Codex session is account-bound");
+            assert!(
+                actor
+                    .chat_state_handle
+                    .get_credentials()
+                    .await
+                    .api_key
+                    .is_none(),
+                "identity drift must clear the sampler's static bearer fallback"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn remote_only_codex_byok_never_inherits_xai_session_resolver() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("xai-session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::ApiKey,
+                "codex-byok-key".to_string(),
+            )
+            .await;
+
+            let mut chat_config = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has sampling config");
+            chat_config.provider = xai_grok_sampling_types::ModelProvider::Codex;
+            let model = chat_config.model.clone();
+            actor.chat_state_handle.update_sampling_config(chat_config);
+            actor.model_auth_facts.replace(Some((
+                model,
+                ModelAuthFacts {
+                    byok: ModelByok::NotByok,
+                    auth_scheme: Default::default(),
+                    provider: xai_grok_sampling_types::ModelProvider::Xai,
+                },
+            )));
+
+            let reconstructed = actor.reconstruct_full_config().await;
+            assert_eq!(
+                reconstructed.provider,
+                xai_grok_sampling_types::ModelProvider::Codex
+            );
+            assert_eq!(reconstructed.api_key.as_deref(), Some("codex-byok-key"));
+            assert!(
+                reconstructed.bearer_resolver.is_none(),
+                "xAI's live session resolver must never overwrite a Codex BYOK key"
+            );
+            assert!(reconstructed.client_identifier.is_none());
+            assert!(reconstructed.deployment_id.is_none());
+            assert!(reconstructed.user_id.is_none());
+            assert!(reconstructed.attribution_callback.is_none());
         })
         .await;
 }
@@ -1017,14 +1191,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 header_injector: None,
             };
             let _ = actor
-                .handle_set_session_model(
-                    acp::ModelId::new(model),
-                    cfg,
-                    false,
-                    false,
-                    true,
-                    85,
-                )
+                .handle_set_session_model(acp::ModelId::new(model), cfg, false, false, true, 85)
                 .await;
 
             assert!(

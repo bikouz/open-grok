@@ -2768,6 +2768,7 @@ async fn cancel_pending_subagent_at_promote_emits_exactly_one_cancelled_finish()
         parent_prompt_id: None,
         depth: 0,
         auth_manager: ctx.auth_manager.clone(),
+        provider_boundary: ctx.provider_boundary.clone(),
     };
     cancel_pending_subagent_at_promote(
             request,
@@ -2868,6 +2869,7 @@ async fn run_promote_cancel_with_worktree(
         parent_prompt_id: None,
         depth: 0,
         auth_manager: ctx.auth_manager.clone(),
+        provider_boundary: ctx.provider_boundary.clone(),
     };
     cancel_pending_subagent_at_promote(
             request,

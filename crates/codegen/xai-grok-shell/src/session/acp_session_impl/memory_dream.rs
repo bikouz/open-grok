@@ -363,6 +363,10 @@ impl SessionActor {
     ) -> bool {
         use crate::session::helpers::memory_flush::*;
 
+        if !self.memory.is_enabled() {
+            return false;
+        }
+
         // Atomically acquire the flushing lock. If another flush is already
         // running (idle timer, pre-compaction, or user-requested), skip.
         if !self.memory.try_acquire_flush_lock() {

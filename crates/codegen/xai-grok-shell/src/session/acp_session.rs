@@ -1765,10 +1765,11 @@ impl Drop for TurnMetrics {
         self.span.record("turn_model_calls", self.turn_model_calls);
     }
 }
-/// Token rotation on the sampler/inference path is owned by the
-/// proactive refresh loop and the per-turn pre-request refresh
-/// (`refresh_token_if_expired`). `handle_sampling_failure` surfaces
-/// auth errors to the caller and never invokes the refresher itself.
+/// Token rotation on the sampler/inference path is provider-scoped. The
+/// proactive loop and per-turn preflight refresh expiring credentials;
+/// `handle_sampling_failure` gives Codex OAuth one immediate forced refresh
+/// while xAI retains its existing auth-manager retry schedule. Neither path
+/// may consult or mutate the other provider's credentials.
 #[cfg(test)]
 #[path = "acp_session_tests/auth_error_no_retry_tests.rs"]
 mod auth_error_no_retry_tests;

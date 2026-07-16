@@ -212,7 +212,11 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             // Point to the per-turn unified log already uploaded by
             // complete_prompt_trace. Only set the URL when trace uploads
             // are active — otherwise the cloud storage object won't exist.
-            if agent.trace_upload_config().await.is_some()
+            let allows_xai_export = session_handle
+                .as_ref()
+                .is_some_and(|handle| handle.feedback_manager.allows_xai_export());
+            if allows_xai_export
+                && agent.trace_upload_config().await.is_some()
                 && let Some(tn) = turn_number
             {
                 let bucket_url = {
@@ -229,12 +233,15 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             let telemetry_enabled = {
                 let cfg = agent.cfg.borrow();
                 cfg.is_telemetry_enabled()
+                    && allows_xai_export
                     && !agent
                         .auth_manager
                         .current_or_expired()
                         .is_some_and(|a| a.is_zdr_team())
             };
-            let client = agent.feedback_client();
+            let client = session_handle
+                .as_ref()
+                .and_then(|handle| handle.feedback_manager.feedback_client().cloned());
             if client.is_none() {
                 tracing::warn!(
                     "no feedback client available (missing proxy credentials); feedback saved locally only"
@@ -271,6 +278,11 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
         }
         "x.ai/feedback/dismiss" => {
             let dismiss_input: FeedbackRequestDismiss = parse_params(args)?;
+            let session_id = acp::SessionId::new(dismiss_input.session_id.clone());
+            let session_handle = agent.sessions.borrow().get(&session_id).cloned();
+            let allows_xai_export = session_handle
+                .as_ref()
+                .is_some_and(|handle| handle.feedback_manager.allows_xai_export());
 
             tracing::info!(
                 session_id = %dismiss_input.session_id,
@@ -284,6 +296,7 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             let telemetry_enabled = {
                 let cfg = agent.cfg.borrow();
                 cfg.is_telemetry_enabled()
+                    && allows_xai_export
                     && !agent
                         .auth_manager
                         .current_or_expired()
@@ -302,26 +315,24 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             }
 
             // Persist dismiss locally; flushed before storage CopyFile by the persistence actor.
-            {
-                let session_id = acp::SessionId::new(dismiss_input.session_id.clone());
-                if let Some(session_handle) = agent.sessions.borrow().get(&session_id) {
-                    session_handle.persist_feedback(LocalFeedbackEntry::UserFeedback(
-                        UserFeedbackEntry {
-                            submitted_at: chrono::Utc::now(),
-                            session_id: dismiss_input.session_id.clone(),
-                            turn_number: None,
-                            solicited: true,
-                            request_id: Some(dismiss_input.request_id.clone()),
-                            dismissed: true,
-                            submission: None,
-                        },
-                    ));
-                }
+            if let Some(session_handle) = &session_handle {
+                session_handle.persist_feedback(LocalFeedbackEntry::UserFeedback(
+                    UserFeedbackEntry {
+                        submitted_at: chrono::Utc::now(),
+                        session_id: dismiss_input.session_id.clone(),
+                        turn_number: None,
+                        solicited: true,
+                        request_id: Some(dismiss_input.request_id.clone()),
+                        dismissed: true,
+                        submission: None,
+                    },
+                ));
             }
 
             let request_id = dismiss_input.request_id.clone();
-            let client = agent
-                .feedback_client()
+            let client = session_handle
+                .as_ref()
+                .and_then(|handle| handle.feedback_manager.feedback_client().cloned())
                 .ok_or_else(|| acp::Error::internal_error().data("No credentials for feedback"))?;
             let feedback_base_url = agent.cfg.borrow().endpoints.resolve_feedback_base_url();
             match client.dismiss_request(&request_id).await {
@@ -363,6 +374,14 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
         "x.ai/review/comment" => {
             let request: CommentRequest = parse_params(args)?;
+            let session_handle = agent
+                .sessions
+                .borrow()
+                .get(&acp::SessionId::new(request.session_id.clone()))
+                .cloned();
+            let provider_boundary = session_handle
+                .as_ref()
+                .map(|handle| handle.feedback_manager.provider_boundary());
 
             let comment_id = uuid::Uuid::now_v7().to_string();
 
@@ -387,9 +406,12 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             });
 
-            if let Some(gcs_config) = agent
-                .build_gcs_config(format!("{}/comments", request.session_id))
-                .await
+            if provider_boundary
+                .as_ref()
+                .is_some_and(|boundary| boundary.allows_xai_export())
+                && let Some(gcs_config) = agent
+                    .build_gcs_config(format!("{}/comments", request.session_id))
+                    .await
             {
                 let json_bytes = serde_json::to_vec_pretty(&record)
                     .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
@@ -400,7 +422,11 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 );
 
                 let auth_manager = Some(agent.auth_manager.clone());
+                let provider_boundary = provider_boundary.expect("checked above");
                 tokio::spawn(async move {
+                    if !provider_boundary.allows_xai_export() {
+                        return;
+                    }
                     match upload_bytes(
                         &gcs_config.with_auth(auth_manager),
                         &gcs_path,
@@ -430,6 +456,14 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         }
         "x.ai/review/comment/delete" => {
             let request: CommentDeleteRequest = parse_params(args)?;
+            let session_handle = agent
+                .sessions
+                .borrow()
+                .get(&acp::SessionId::new(request.session_id.clone()))
+                .cloned();
+            let provider_boundary = session_handle
+                .as_ref()
+                .map(|handle| handle.feedback_manager.provider_boundary());
 
             tracing::info!(
                 comment_id = %request.comment_id,
@@ -446,9 +480,12 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             });
 
-            if let Some(gcs_config) = agent
-                .build_gcs_config(format!("{}/comments", request.session_id))
-                .await
+            if provider_boundary
+                .as_ref()
+                .is_some_and(|boundary| boundary.allows_xai_export())
+                && let Some(gcs_config) = agent
+                    .build_gcs_config(format!("{}/comments", request.session_id))
+                    .await
             {
                 let json_bytes = serde_json::to_vec_pretty(&record)
                     .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
@@ -460,7 +497,11 @@ async fn handle_review(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 );
 
                 let auth_manager = Some(agent.auth_manager.clone());
+                let provider_boundary = provider_boundary.expect("checked above");
                 tokio::spawn(async move {
+                    if !provider_boundary.allows_xai_export() {
+                        return;
+                    }
                     match upload_bytes(
                         &gcs_config.with_auth(auth_manager),
                         &gcs_path,

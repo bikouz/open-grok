@@ -116,6 +116,8 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         agent_config: None,
         gcs_bucket_url: None,
         gcs_upload_method: None,
+        provider_boundary: crate::session::persistence::ProviderBoundary::default(),
+        parent_persistence_tx: None,
         hook_registry: None,
         hook_workspace_root: String::new(),
         parent_depth: 0,

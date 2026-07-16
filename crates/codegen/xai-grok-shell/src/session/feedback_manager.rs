@@ -49,7 +49,9 @@ use prod_mc_cli_chat_proxy_types::feedback_types::{
     FeedbackSubmission, FeedbackToolOutcome,
 };
 
-use crate::session::persistence::{LocalFeedbackEntry, PersistenceMsg, UserFeedbackEntry};
+use crate::session::persistence::{
+    LocalFeedbackEntry, PersistenceMsg, ProviderBoundary, UserFeedbackEntry,
+};
 
 pub(crate) enum SubmitOutcome {
     Submitted,
@@ -230,6 +232,9 @@ pub struct FeedbackManager {
     heuristics: Arc<RwLock<FeedbackHeuristics>>,
     /// REST client for the feedback/analytics backend
     feedback_client: Option<FeedbackClient>,
+    /// Sticky guard shared with persistence and trace export. Once a Codex
+    /// model is observed, all xAI-only feedback/analytics calls stay off.
+    provider_boundary: ProviderBoundary,
     /// Configuration
     config: FeedbackManagerConfig,
     /// Whether config has been loaded from server
@@ -250,13 +255,30 @@ impl FeedbackManager {
         feedback_client: Option<FeedbackClient>,
         config: FeedbackManagerConfig,
     ) -> Self {
+        Self::new_with_provider_boundary(
+            session_id,
+            feedback_client,
+            config,
+            ProviderBoundary::default(),
+        )
+    }
+
+    pub(crate) fn new_with_provider_boundary(
+        session_id: impl Into<String>,
+        feedback_client: Option<FeedbackClient>,
+        config: FeedbackManagerConfig,
+        provider_boundary: ProviderBoundary,
+    ) -> Self {
         let (signals_handle, actor) = SessionSignalsActor::with_sync_interval(config.sync_interval);
 
         // Spawn the signals actor
         tokio::spawn(actor.run());
 
         let session_id = session_id.into();
-        let feedback_client = feedback_client.map(|c| c.with_session_id(session_id.clone()));
+        let feedback_client = feedback_client.map(|c| {
+            c.with_provider_boundary(provider_boundary.clone())
+                .with_session_id(session_id.clone())
+        });
         tracing::info!(
             session_id = %session_id,
             feedback_enabled = config.feedback_enabled,
@@ -270,6 +292,7 @@ impl FeedbackManager {
             signals_handle,
             heuristics: Arc::new(RwLock::new(FeedbackHeuristics::new())),
             feedback_client,
+            provider_boundary,
             config,
             config_loaded: Arc::new(AtomicBool::new(false)),
             upload_queue_stats: std::sync::OnceLock::new(),
@@ -302,12 +325,27 @@ impl FeedbackManager {
 
     /// Check if feedback collection is enabled.
     pub fn is_enabled(&self) -> bool {
-        self.config.feedback_enabled
+        self.config.feedback_enabled && self.provider_boundary.allows_xai_export()
     }
 
     /// REST client for the feedback/analytics backend, if configured.
     pub fn feedback_client(&self) -> Option<&FeedbackClient> {
-        self.feedback_client.as_ref()
+        self.provider_boundary
+            .allows_xai_export()
+            .then_some(self.feedback_client.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn observe_provider(&self, provider: xai_grok_sampling_types::ModelProvider) {
+        self.provider_boundary.observe(provider);
+    }
+
+    pub(crate) fn allows_xai_export(&self) -> bool {
+        self.provider_boundary.allows_xai_export()
+    }
+
+    pub(crate) fn provider_boundary(&self) -> ProviderBoundary {
+        self.provider_boundary.clone()
     }
 
     /// Client type for this session (Agent, Tui, Web, etc.).
@@ -372,10 +410,10 @@ impl FeedbackManager {
 
         submit_feedback_workflow(
             &mut submission,
-            self.feedback_client.as_ref(),
+            self.feedback_client(),
             persistence_tx,
             false, // solicited: slash command isn't responding to a request
-            telemetry_enabled,
+            telemetry_enabled && self.allows_xai_export(),
         )
         .await
     }
@@ -392,7 +430,7 @@ impl FeedbackManager {
         session_id = %self.session_id,
     ))]
     pub async fn load_config(&self) {
-        let Some(client) = &self.feedback_client else {
+        let Some(client) = self.feedback_client() else {
             return; // No client, use defaults
         };
 
@@ -438,7 +476,7 @@ impl FeedbackManager {
         &self,
         prompt_id: Option<String>,
     ) -> Option<FeedbackRequest> {
-        if !self.config.feedback_enabled {
+        if !self.is_enabled() {
             return None;
         }
 
@@ -559,7 +597,7 @@ impl FeedbackManager {
         feedback_mode: FeedbackMode,
         prompt_id: Option<String>,
     ) {
-        let Some(client) = &self.feedback_client else {
+        let Some(client) = self.feedback_client() else {
             return;
         };
 
@@ -623,14 +661,14 @@ impl FeedbackManager {
         turn_outcome: Option<String>,
         model_fingerprint: Option<String>,
     ) {
-        if !self.config.telemetry_enabled {
+        if !self.config.telemetry_enabled || !self.allows_xai_export() {
             tracing::debug!("Turn delta skipped: telemetry is disabled");
             return;
         }
 
         tracing::debug!("Turn delta: sending pre-captured snapshot");
 
-        let Some(client) = &self.feedback_client else {
+        let Some(client) = self.feedback_client() else {
             tracing::debug!("Turn delta skipped: no feedback client configured");
             return;
         };
@@ -658,8 +696,12 @@ impl FeedbackManager {
 
         let session_id = self.session_id.clone();
         let client = client.clone();
+        let provider_boundary = self.provider_boundary.clone();
         // Fire-and-forget: send in background so we never block the turn.
         tokio::spawn(async move {
+            if !provider_boundary.allows_xai_export() {
+                return;
+            }
             let result =
                 with_one_shot_auth_retry(&client, || client.send_turn_delta(&session_id, &delta))
                     .await;
@@ -697,11 +739,11 @@ impl FeedbackManager {
 
     /// Inner sync implementation with optional cooldown bypass.
     async fn sync_signals_inner(&self, force: bool) -> anyhow::Result<()> {
-        if !self.config.telemetry_enabled {
+        if !self.config.telemetry_enabled || !self.allows_xai_export() {
             return Ok(());
         }
 
-        let Some(client) = &self.feedback_client else {
+        let Some(client) = self.feedback_client() else {
             return Ok(()); // No client, skip sync
         };
 
@@ -722,6 +764,9 @@ impl FeedbackManager {
 
         let update = signals_to_update(&signals, self.config.client_type);
 
+        if !self.allows_xai_export() {
+            return Ok(());
+        }
         match client.update_signals(&self.session_id, &update).await {
             Ok(_) => {
                 tracing::debug!(
@@ -750,7 +795,7 @@ impl FeedbackManager {
     /// prevents the signals loop from amplifying 401 bursts at the API
     /// during token-expiry windows.
     async fn try_refresh_and_retry_sync(&self) -> SyncAuthOutcome {
-        let Some(client) = &self.feedback_client else {
+        let Some(client) = self.feedback_client() else {
             return SyncAuthOutcome::Unrecoverable;
         };
         if !client.has_token_refresher() {

@@ -21,7 +21,9 @@ pub(crate) enum SamplerFailureRecovery {
     CompactAndResubmit,
     /// Auth 401 recovery succeeded (devbox re-mint or OIDC refresh).
     /// The turn loop should resubmit once with the fresh token.
-    RefreshAuthAndResubmit,
+    RefreshAuthAndResubmit {
+        provider: xai_grok_sampling_types::ModelProvider,
+    },
 }
 
 /// Outcome of a single turn attempt via the sampler-based path.
@@ -36,7 +38,9 @@ pub(crate) enum SamplerTurnOutcome {
     ),
     CompactAndResubmit,
     /// Auth recovery succeeded; the outer loop should retry once.
-    RefreshAuthAndResubmit,
+    RefreshAuthAndResubmit {
+        provider: xai_grok_sampling_types::ModelProvider,
+    },
 }
 
 /// Outcome of `process_conversation_turn`, distinguishing normal completion from cancellation.

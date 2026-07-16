@@ -154,7 +154,7 @@ pub(crate) async fn spawn_session_actor(
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
-    web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    web_search_sampling_config: Option<crate::agent::config::PreparedWebSearchSamplingConfig>,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -358,9 +358,13 @@ pub(crate) async fn spawn_session_actor(
             (0, Vec::new(), Vec::new())
         };
     let primary_model_id = sampling_config.model.clone();
+    let implicit_local_web_search = web_search_sampling_config
+        .as_ref()
+        .is_some_and(|prepared| prepared.is_implicit_default);
     let web_search_config = if disable_web_search {
         xai_grok_tools::implementations::WebSearchConfig::Disabled
-    } else if let Some(cfg) = web_search_sampling_config {
+    } else if let Some(prepared) = web_search_sampling_config {
+        let cfg = prepared.sampler;
         if let Some(api_key) = cfg.api_key {
             xai_grok_tools::implementations::WebSearchConfig::Enabled {
                 api_key,
@@ -634,20 +638,26 @@ pub(crate) async fn spawn_session_actor(
             Some(session_info.id.0.to_string()),
         )
     });
-    let memory_storage_for_session = memory_config.as_ref().filter(|mc| mc.enabled).map(|mc| {
-        if mc.flat_memory_root
-            && let Some(ref root) = mc.root_dir_override
-        {
-            return crate::session::memory::MemoryStorage::new_flat(
+    let memory_provider_allowed = sampling_config.provider
+        == xai_grok_sampling_types::ModelProvider::Xai
+        && persistence.provider_boundary.allows_xai_export();
+    let memory_storage_for_session = memory_config
+        .as_ref()
+        .filter(|mc| mc.enabled && memory_provider_allowed)
+        .map(|mc| {
+            if mc.flat_memory_root
+                && let Some(ref root) = mc.root_dir_override
+            {
+                return crate::session::memory::MemoryStorage::new_flat(
+                    tool_context.cwd.as_path(),
+                    root,
+                );
+            }
+            crate::session::memory::MemoryStorage::new(
                 tool_context.cwd.as_path(),
-                root,
-            );
-        }
-        crate::session::memory::MemoryStorage::new(
-            tool_context.cwd.as_path(),
-            mc.root_dir_override.as_deref(),
-        )
-    });
+                mc.root_dir_override.as_deref(),
+            )
+        });
     let memory_initial_injection_config = memory_config
         .as_ref()
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
@@ -704,16 +714,24 @@ pub(crate) async fn spawn_session_actor(
             watcher,
             stale_claim_secs: watcher_config.stale_claim_secs,
             search_source: "tool",
-            api_key_provider: api_key_provider.clone(),
-            auth_credentials: auth_manager.as_ref().map(|am| {
-                std::sync::Arc::new(
-                    crate::auth::credential_provider::ShellAuthCredentialProvider::new(
-                        am.clone(),
-                        None,
-                        None,
-                    ),
-                ) as std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider>
-            }),
+            api_key_provider: (sampling_config.provider
+                == xai_grok_sampling_types::ModelProvider::Xai)
+                .then(|| api_key_provider.clone())
+                .flatten(),
+            auth_credentials: (sampling_config.provider
+                == xai_grok_sampling_types::ModelProvider::Xai)
+                .then(|| auth_manager.as_ref())
+                .flatten()
+                .map(|am| {
+                    std::sync::Arc::new(
+                        crate::auth::credential_provider::ShellAuthCredentialProvider::new(
+                            am.clone(),
+                            None,
+                            None,
+                        ),
+                    )
+                        as std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider>
+                }),
         };
         let backend = crate::session::memory::MemoryBackendImpl::from_session_params(
             storage.clone(),
@@ -822,6 +840,7 @@ pub(crate) async fn spawn_session_actor(
             .map(|s| s.workspace_memory_file().to_string_lossy().into_owned()),
         memory_backend: memory_backend_for_spec,
         web_search_config: web_search_config.clone(),
+        implicit_local_web_search,
         backend_search: backend_tools_enabled,
         web_fetch_config: web_fetch_config.clone(),
         image_gen_config: image_gen_config.clone(),
@@ -961,7 +980,8 @@ pub(crate) async fn spawn_session_actor(
         }
         client
     });
-    let has_feedback_client = feedback_client.is_some();
+    let has_feedback_client =
+        feedback_client.is_some() && persistence.provider_boundary.allows_xai_export();
     tracing::info!(
         session_id = % session_info.id.0, has_feedback_client = has_feedback_client,
         "Creating feedback manager"
@@ -984,10 +1004,11 @@ pub(crate) async fn spawn_session_actor(
         loc_tracking_enabled,
         ..Default::default()
     };
-    let feedback_manager = Arc::new(FeedbackManager::new(
+    let feedback_manager = Arc::new(FeedbackManager::new_with_provider_boundary(
         session_info.id.0.to_string(),
         feedback_client,
         feedback_config,
+        persistence.provider_boundary.clone(),
     ));
     let signals_handle = feedback_manager.signals_handle();
     if let Some(persisted) = persisted_signals {
@@ -1161,6 +1182,8 @@ pub(crate) async fn spawn_session_actor(
             prefix_released: std::sync::atomic::AtomicBool::new(false),
         },
         memory: super::memory_state::SessionMemory {
+            embedding_provider: sampling_config.provider,
+            active_provider: std::cell::Cell::new(sampling_config.provider),
             flush_config: memory_config.as_ref().map_or_else(
                 || crate::config::MemoryFlushConfig {
                     enabled: false,
@@ -1425,7 +1448,11 @@ pub(crate) async fn spawn_session_actor(
         let sampling_api_key = embed_api_key.clone();
         let session_id_for_reindex = session_info.id.to_string();
         let chunks_added_counter = session.memory.chunks_added.clone();
+        let provider_boundary = persistence.provider_boundary.clone();
         tokio::task::spawn_local(async move {
+            if !provider_boundary.allows_xai_export() {
+                return;
+            }
             let db_path = storage.workspace_dir().join("index.sqlite");
             if let Ok(mut index) = crate::session::memory::MemoryIndex::open_or_create(
                 &db_path,
@@ -1437,6 +1464,9 @@ pub(crate) async fn spawn_session_actor(
                 let reindex_start = std::time::Instant::now();
                 let (mut total_added, mut total_updated, mut total_removed) = (0, 0, 0);
                 for file in &files {
+                    if !provider_boundary.allows_xai_export() {
+                        return;
+                    }
                     let source = storage.classify_source(file);
                     if let Ok(stats) = index.reindex_file(file, source) {
                         total_added += stats.added;
@@ -1448,7 +1478,9 @@ pub(crate) async fn spawn_session_actor(
                     target : xai_grok_telemetry::memory_log::TARGET, files = files.len(),
                     "MEMORY_REINDEX: background reindex complete"
                 );
-                let embedded_count = if let Some(api_key) = sampling_api_key {
+                let embedded_count = if provider_boundary.allows_xai_export()
+                    && let Some(api_key) = sampling_api_key
+                {
                     if let Some(provider) =
                         crate::session::memory::embedding::ApiEmbeddingProvider::from_session(
                             &embed_config,
@@ -1744,7 +1776,7 @@ pub(crate) async fn spawn_session_on_thread(
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
-    web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    web_search_sampling_config: Option<crate::agent::config::PreparedWebSearchSamplingConfig>,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,

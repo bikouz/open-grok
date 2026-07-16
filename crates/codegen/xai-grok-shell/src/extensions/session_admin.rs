@@ -96,6 +96,15 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
         })?;
 
     let info = summary.info.clone();
+    let provider_boundary = agent
+        .sessions
+        .borrow()
+        .get(&session_id)
+        .map(|handle| handle.feedback_manager.provider_boundary());
+    let allows_xai_export = !summary.ever_used_codex
+        && provider_boundary
+            .as_ref()
+            .is_none_or(|boundary| boundary.allows_xai_export());
 
     // Update the session title in local storage
     let storage = JsonlStorageAdapter::default();
@@ -112,7 +121,8 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     // Send a SessionSummaryGenerated notification so the TUI updates its title
     notify_session_title(agent, session_id, &req.title).await;
 
-    if agent.is_writeback_storage()
+    if allows_xai_export
+        && agent.is_writeback_storage()
         && let Some(auth) = agent.current_auth()
         && !auth.is_zdr_team()
     {
@@ -132,8 +142,9 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     }
 
     // Hook 2: update session replica with summary (fire-and-forget)
-    if let Some(client) = agent.session_registry_client() {
+    if allows_xai_export && let Some(client) = agent.session_registry_client() {
         let sid = req.session_id.to_string();
+        let provider_boundary = provider_boundary.clone();
         let title = if agent
             .auth_manager
             .current_or_expired()
@@ -144,6 +155,12 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
             Some(req.title.clone())
         };
         tokio::spawn(async move {
+            if provider_boundary
+                .as_ref()
+                .is_some_and(|boundary| !boundary.allows_xai_export())
+            {
+                return;
+            }
             let update = crate::agent::session_registry_client::UpdateRequest {
                 summary: title,
                 first_prompt: None,

@@ -3,12 +3,16 @@
 //! This intentionally does not reuse Grok's primary [`crate::auth::AuthManager`].
 //! Codex login, refresh, logout, and quota failures must never mutate xAI's
 //! `auth.json` or change the ACP primary-auth state.
+//!
+//! OAuth and account contracts are derived from OpenAI Codex, Apache-2.0,
+//! revision `2be648ba4a6c159a3d80b1c07e7323cbd5efef8f`.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,6 +22,7 @@ use axum::response::Html;
 use axum::routing::get;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -25,6 +30,7 @@ use tokio::net::TcpListener;
 
 pub const CODEX_AUTH_FILE_NAME: &str = "codex-auth.json";
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_ISSUER: &str = "https://auth.openai.com";
 pub const CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const CODEX_INFERENCE_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -34,8 +40,78 @@ const DEFAULT_CALLBACK_PORT: u16 = 1455;
 const FALLBACK_CALLBACK_PORT: u16 = 1457;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REVOKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_WINDOW_SECS: i64 = 5 * 60;
 const UNKNOWN_EXPIRY_REFRESH_DAYS: i64 = 8;
+const CODEX_AUTH_ANCHOR_HEADER: &str = "x-grok-build-codex-auth-anchor";
+const CODEX_ACCOUNT_ANCHOR_HEADER: &str = "x-grok-build-codex-account-anchor";
+const CODEX_USER_ANCHOR_HEADER: &str = "x-grok-build-codex-user-anchor";
+const CODEX_WORKSPACE_ANCHOR_HEADER: &str = "x-grok-build-codex-workspace-anchor";
+const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+const OPENAI_FEDRAMP_HEADER: &str = "x-openai-fedramp";
+const CODEX_RESERVED_AUTH_HEADERS: &[&str] = &[
+    CHATGPT_ACCOUNT_ID_HEADER,
+    OPENAI_FEDRAMP_HEADER,
+    CODEX_AUTH_ANCHOR_HEADER,
+    CODEX_ACCOUNT_ANCHOR_HEADER,
+    CODEX_USER_ANCHOR_HEADER,
+    CODEX_WORKSPACE_ANCHOR_HEADER,
+];
+
+/// A permanent refresh verdict is valid only for the exact on-disk credential
+/// identity that produced it. Hash the refresh token so the process-global
+/// cache never retains another plaintext copy of token material.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RefreshFailureKey {
+    path: PathBuf,
+    refresh_token_digest: [u8; 32],
+    account_id: Option<String>,
+}
+
+static PERMANENT_REFRESH_FAILURES: OnceLock<Mutex<HashMap<RefreshFailureKey, String>>> =
+    OnceLock::new();
+
+fn permanent_refresh_failures() -> &'static Mutex<HashMap<RefreshFailureKey, String>> {
+    PERMANENT_REFRESH_FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn refresh_failure_key(
+    path: &Path,
+    refresh_token: &str,
+    account_id: Option<String>,
+) -> RefreshFailureKey {
+    RefreshFailureKey {
+        path: path.to_path_buf(),
+        refresh_token_digest: Sha256::digest(refresh_token.as_bytes()).into(),
+        account_id,
+    }
+}
+
+fn cached_permanent_refresh_failure(key: &RefreshFailureKey) -> Option<String> {
+    let mut failures = permanent_refresh_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A sibling process or a fresh login may have rotated the file. Once its
+    // refresh identity differs, the old verdict must no longer block traffic.
+    failures.retain(|candidate, _| candidate.path != key.path || candidate == key);
+    failures.get(key).cloned()
+}
+
+fn cache_permanent_refresh_failure(key: RefreshFailureKey, message: String) {
+    let mut failures = permanent_refresh_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    failures.retain(|candidate, _| candidate.path != key.path);
+    failures.insert(key, message);
+}
+
+fn clear_permanent_refresh_failure(path: &Path) {
+    permanent_refresh_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|key, _| key.path != path);
+}
 
 #[derive(Clone, Debug)]
 struct CodexEndpoints {
@@ -91,9 +167,31 @@ pub struct CodexTokenData {
 pub struct CodexCredentials {
     pub access_token: String,
     pub account_id: Option<String>,
+    pub chatgpt_user_id: Option<String>,
     pub email: Option<String>,
     pub plan_type: Option<String>,
+    pub is_workspace_account: bool,
     pub account_is_fedramp: bool,
+}
+
+/// Account-scoped identity captured when a Codex session is configured.
+/// Token refresh may rotate the bearer, but requests fail closed if this
+/// identity changes underneath the running session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexAuthIdentity {
+    account_id: Option<String>,
+    chatgpt_user_id: Option<String>,
+    is_workspace_account: bool,
+}
+
+impl CodexCredentials {
+    fn identity(&self) -> CodexAuthIdentity {
+        CodexAuthIdentity {
+            account_id: self.account_id.clone(),
+            chatgpt_user_id: self.chatgpt_user_id.clone(),
+            is_workspace_account: self.is_workspace_account,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,7 +223,7 @@ pub struct CodexUsageSnapshot {
     pub credits: Option<CodexCredits>,
     #[serde(default)]
     pub spend_control: Option<CodexSpendControl>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub additional_rate_limits: Vec<CodexAdditionalRateLimit>,
     #[serde(default)]
     pub rate_limit_reached_type: Option<serde_json::Value>,
@@ -186,20 +284,36 @@ pub struct CodexAdditionalRateLimit {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CodexTokenUsageStats {
     #[serde(default)]
-    pub lifetime_tokens: Option<u64>,
+    pub lifetime_tokens: Option<i64>,
     #[serde(default)]
-    pub peak_daily_tokens: Option<u64>,
+    pub peak_daily_tokens: Option<i64>,
     #[serde(default)]
-    pub longest_running_turn_sec: Option<u64>,
+    pub longest_running_turn_sec: Option<i64>,
     #[serde(default)]
-    pub current_streak_days: Option<u64>,
+    pub current_streak_days: Option<i64>,
     #[serde(default)]
-    pub longest_streak_days: Option<u64>,
+    pub longest_streak_days: Option<i64>,
+    #[serde(default)]
+    pub daily_usage_buckets: Option<Vec<CodexTokenUsageDailyBucket>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CodexTokenUsageDailyBucket {
+    pub start_date: String,
+    pub tokens: i64,
 }
 
 #[derive(Debug, Deserialize)]
 struct TokenUsageProfile {
     stats: CodexTokenUsageStats,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,7 +362,7 @@ struct DeviceUserCodeResponse {
     device_auth_id: String,
     #[serde(alias = "user_code", alias = "usercode")]
     user_code: String,
-    #[serde(deserialize_with = "deserialize_device_interval")]
+    #[serde(default, deserialize_with = "deserialize_device_interval")]
     interval: u64,
 }
 
@@ -345,6 +459,27 @@ fn credentials_from_tokens(tokens: &CodexTokenData) -> CodexCredentials {
         .and_then(|value| value.get("chatgpt_plan_type"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+    let chatgpt_user_id = auth
+        .and_then(|value| {
+            value
+                .get("chatgpt_user_id")
+                .or_else(|| value.get("user_id"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let is_workspace_account = plan_type.as_deref().is_some_and(|plan| {
+        matches!(
+            plan.to_ascii_lowercase().as_str(),
+            "team"
+                | "self_serve_business_usage_based"
+                | "business"
+                | "enterprise_cbp_usage_based"
+                | "enterprise"
+                | "hc"
+                | "education"
+                | "edu"
+        )
+    });
     let account_is_fedramp = auth
         .and_then(|value| value.get("chatgpt_account_is_fedramp"))
         .and_then(serde_json::Value::as_bool)
@@ -352,8 +487,10 @@ fn credentials_from_tokens(tokens: &CodexTokenData) -> CodexCredentials {
     CodexCredentials {
         access_token: tokens.access_token.clone(),
         account_id,
+        chatgpt_user_id,
         email,
         plan_type,
+        is_workspace_account,
         account_is_fedramp,
     }
 }
@@ -407,10 +544,13 @@ fn save_store_at(path: &Path, store: &CodexAuthStore) -> io::Result<()> {
         .map_err(|error| error.into_error())?
         .sync_all()?;
     #[cfg(windows)]
+    crate::util::secure_file::set_windows_secure_permissions(&temp)?;
+    #[cfg(windows)]
     if path.exists() {
         std::fs::remove_file(path)?;
     }
     std::fs::rename(&temp, path)?;
+    clear_permanent_refresh_failure(path);
     Ok(())
 }
 
@@ -477,13 +617,20 @@ async fn callback_handler(
     State(state): State<Arc<CallbackState>>,
     Query(query): Query<CallbackQuery>,
 ) -> Html<&'static str> {
+    // A stray or forged callback must not complete the one-shot login. Keep
+    // listening so the browser callback carrying the expected state can still
+    // finish the same OAuth attempt.
+    if query.state.as_deref() != Some(state.expected_state.as_str()) {
+        return Html(
+            "<!doctype html><title>Grok Build login failed</title><h1>OpenAI Codex login failed</h1><p>Return to Grok Build for details.</p>",
+        );
+    }
+
     let result = if let Some(error) = query.error {
         Err(match query.error_description {
             Some(description) if !description.is_empty() => format!("{error}: {description}"),
             _ => error,
         })
-    } else if query.state.as_deref() != Some(state.expected_state.as_str()) {
-        Err("OAuth state mismatch".to_owned())
     } else {
         query
             .code
@@ -533,6 +680,7 @@ async fn exchange_code(
             ("client_id", endpoints.client_id.as_str()),
             ("code_verifier", code_verifier),
         ])
+        .timeout(AUTH_REQUEST_TIMEOUT)
         .send()
         .await
         .context("Codex OAuth token exchange failed")?;
@@ -578,12 +726,24 @@ pub async fn run_cli_login(device_code: bool) -> Result<CodexAccountSummary> {
     let credentials = if device_code {
         run_device_login_at(&path, &endpoints).await?
     } else {
-        run_browser_login_at(&path, &endpoints).await?
+        run_browser_login_at(&path, &endpoints, true).await?
     };
     Ok(CodexAccountSummary::from(&credentials))
 }
 
-async fn run_browser_login_at(path: &Path, endpoints: &CodexEndpoints) -> Result<CodexCredentials> {
+/// Browser OAuth for the pager. Unlike the CLI entrypoint, this does not write
+/// directly to stderr and disturb the terminal alternate screen.
+pub async fn run_tui_login() -> Result<CodexAccountSummary> {
+    let endpoints = CodexEndpoints::default();
+    let credentials = run_browser_login_at(&auth_file_path(), &endpoints, false).await?;
+    Ok(CodexAccountSummary::from(&credentials))
+}
+
+async fn run_browser_login_at(
+    path: &Path,
+    endpoints: &CodexEndpoints,
+    announce: bool,
+) -> Result<CodexCredentials> {
     let listener = bind_callback_listener()
         .await
         .context("could not bind Codex OAuth callback on ports 1455 or 1457")?;
@@ -606,18 +766,37 @@ async fn run_browser_login_at(path: &Path, endpoints: &CodexEndpoints) -> Result
         }
     });
 
-    eprintln!();
-    eprintln!("Signing in to OpenAI Codex with ChatGPT...");
-    eprintln!("Open this URL if your browser does not open automatically:");
-    eprintln!("  {auth_url}");
+    if announce {
+        eprintln!();
+        eprintln!("Signing in to OpenAI Codex with ChatGPT...");
+        eprintln!("Open this URL if your browser does not open automatically:");
+        eprintln!("  {auth_url}");
+    }
     let open_url = auth_url.clone();
-    tokio::task::spawn_blocking(move || webbrowser::open(&open_url));
+    let browser_result = tokio::task::spawn_blocking(move || webbrowser::open(&open_url)).await;
+    if !announce {
+        match browser_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                server.abort();
+                return Err(anyhow!(
+                    "could not open a browser for Codex login: {error}. Run `grok login --codex` instead"
+                ));
+            }
+            Err(error) => {
+                server.abort();
+                return Err(anyhow!(
+                    "could not launch Codex browser login: {error}. Run `grok login --codex` instead"
+                ));
+            }
+        }
+    }
 
-    let callback = tokio::time::timeout(CALLBACK_TIMEOUT, result_rx)
-        .await
+    let callback_result = tokio::time::timeout(CALLBACK_TIMEOUT, result_rx).await;
+    server.abort();
+    let callback = callback_result
         .context("timed out waiting for the Codex OAuth callback")?
         .context("Codex OAuth callback server stopped")?;
-    server.abort();
     let code = callback.map_err(|error| anyhow!(error))?;
     let response = exchange_code(endpoints, &code, &redirect_uri, &pkce.code_verifier).await?;
     let _lock = acquire_auth_lock(path)?;
@@ -632,6 +811,7 @@ async fn run_device_login_at(path: &Path, endpoints: &CodexEndpoints) -> Result<
         .json(&DeviceUserCodeRequest {
             client_id: &endpoints.client_id,
         })
+        .timeout(AUTH_REQUEST_TIMEOUT)
         .send()
         .await
         .context("Codex device-code request failed")?;
@@ -660,6 +840,7 @@ async fn run_device_login_at(path: &Path, endpoints: &CodexEndpoints) -> Result<
                 device_auth_id: &device.device_auth_id,
                 user_code: &device.user_code,
             })
+            .timeout(AUTH_REQUEST_TIMEOUT)
             .send()
             .await
             .context("Codex device-code poll failed")?;
@@ -710,7 +891,7 @@ pub async fn fresh_credentials() -> Result<Option<CodexCredentials>> {
     refresh_at(&auth_file_path(), &CodexEndpoints::default(), false).await
 }
 
-async fn force_refresh() -> Result<Option<CodexCredentials>> {
+pub(crate) async fn force_refresh() -> Result<Option<CodexCredentials>> {
     refresh_at(&auth_file_path(), &CodexEndpoints::default(), true).await
 }
 
@@ -743,6 +924,10 @@ async fn refresh_at(
         .account_id
         .clone()
         .or_else(|| account_id_from_id_token(&tokens.id_token));
+    let failure_key = refresh_failure_key(path, &tokens.refresh_token, prior_account_id.clone());
+    if let Some(message) = cached_permanent_refresh_failure(&failure_key) {
+        return Err(anyhow!(message));
+    }
     let response = reqwest::Client::new()
         .post(format!(
             "{}/oauth/token",
@@ -753,6 +938,7 @@ async fn refresh_at(
             grant_type: "refresh_token",
             refresh_token: &tokens.refresh_token,
         })
+        .timeout(AUTH_REQUEST_TIMEOUT)
         .send()
         .await
         .context("Codex OAuth refresh request failed")?;
@@ -772,12 +958,16 @@ async fn refresh_at(
         } else {
             ""
         };
-        bail!(
+        let message = format!(
             "Codex OAuth refresh returned {status}{}.{action}",
             code.as_deref()
                 .map(|code| format!(" ({code})"))
                 .unwrap_or_default()
         );
+        if permanent {
+            cache_permanent_refresh_failure(failure_key, message.clone());
+        }
+        return Err(anyhow!(message));
     }
     let refreshed: RefreshResponse = response
         .json()
@@ -821,11 +1011,22 @@ fn refresh_error_code(body: &str) -> Option<String> {
 
 pub async fn run_cli_logout() -> Result<bool> {
     let path = auth_file_path();
-    let Some(store) = load_store_at(&path)? else {
-        return Ok(false);
-    };
     let endpoints = CodexEndpoints::default();
-    if let Some(tokens) = store.tokens.as_ref() {
+    logout_at(&path, &endpoints).await
+}
+
+async fn logout_at(path: &Path, endpoints: &CodexEndpoints) -> Result<bool> {
+    let store = match load_store_at(path) {
+        Ok(store) => store,
+        Err(error) => {
+            // Logout is a deletion operation first. A malformed or truncated
+            // store may prevent best-effort revocation, but must never prevent
+            // removal of local token material.
+            tracing::warn!(%error, "could not read Codex auth store during logout; removing it");
+            None
+        }
+    };
+    if let Some(tokens) = store.as_ref().and_then(|store| store.tokens.as_ref()) {
         let (token, hint, include_client_id) = if !tokens.refresh_token.trim().is_empty() {
             (&tokens.refresh_token, "refresh_token", true)
         } else {
@@ -838,24 +1039,36 @@ pub async fn run_cli_logout() -> Result<bool> {
         if include_client_id {
             body["client_id"] = serde_json::Value::String(endpoints.client_id.clone());
         }
-        if let Err(error) = reqwest::Client::new()
+        match reqwest::Client::new()
             .post(format!(
                 "{}/oauth/revoke",
                 endpoints.issuer.trim_end_matches('/')
             ))
             .json(&body)
+            .timeout(REVOKE_REQUEST_TIMEOUT)
             .send()
             .await
         {
-            tracing::debug!(%error, "Codex token revocation failed; removing local credentials");
+            Ok(response) if !response.status().is_success() => {
+                tracing::debug!(
+                    status = %response.status(),
+                    "Codex token revocation was rejected; removing local credentials"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(%error, "Codex token revocation failed; removing local credentials");
+            }
+            _ => {}
         }
     }
-    let _lock = acquire_auth_lock(&path)?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
+    let _lock = acquire_auth_lock(path)?;
+    let removed = match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    clear_permanent_refresh_failure(path);
+    Ok(removed)
 }
 
 pub async fn fetch_usage() -> Result<CodexUsageSnapshot> {
@@ -898,9 +1111,11 @@ async fn fetch_usage_with_credentials(
 ) -> std::result::Result<CodexUsageSnapshot, UsageRequestError> {
     let client = reqwest::Client::new();
     let base = endpoints.backend_base_url.trim_end_matches('/');
-    let usage_request = apply_request_auth(client.get(format!("{base}/wham/usage")), credentials);
+    let usage_request = apply_request_auth(client.get(format!("{base}/wham/usage")), credentials)
+        .timeout(AUTH_REQUEST_TIMEOUT);
     let profile_request =
-        apply_request_auth(client.get(format!("{base}/wham/profiles/me")), credentials);
+        apply_request_auth(client.get(format!("{base}/wham/profiles/me")), credentials)
+            .timeout(AUTH_REQUEST_TIMEOUT);
     let (usage_response, profile_response) =
         tokio::join!(usage_request.send(), profile_request.send());
     let usage_response = usage_response.map_err(|error| {
@@ -977,24 +1192,150 @@ pub fn start_proactive_refresh(cancel: tokio_util::sync::CancellationToken) {
     });
 }
 
+fn encode_anchor(value: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes())
+}
+
+fn decode_anchor(value: &str) -> Option<String> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn remove_reserved_auth_headers(headers: &mut IndexMap<String, String>) {
+    headers.retain(|name, _| {
+        !CODEX_RESERVED_AUTH_HEADERS
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    });
+}
+
+/// Replace every model-supplied Codex auth/header override with an internal
+/// identity anchor derived from authenticated ID-token claims. The internal
+/// headers are stripped by the sampler and never appear on the wire.
+pub(crate) fn set_oauth_identity_anchor(
+    headers: &mut IndexMap<String, String>,
+    credentials: Option<&CodexCredentials>,
+) {
+    remove_reserved_auth_headers(headers);
+    let Some(credentials) = credentials else {
+        return;
+    };
+    let identity = credentials.identity();
+    headers.insert(CODEX_AUTH_ANCHOR_HEADER.to_owned(), "1".to_owned());
+    if let Some(account_id) = identity.account_id {
+        headers.insert(
+            CODEX_ACCOUNT_ANCHOR_HEADER.to_owned(),
+            encode_anchor(&account_id),
+        );
+    }
+    if let Some(user_id) = identity.chatgpt_user_id {
+        headers.insert(CODEX_USER_ANCHOR_HEADER.to_owned(), encode_anchor(&user_id));
+    }
+    headers.insert(
+        CODEX_WORKSPACE_ANCHOR_HEADER.to_owned(),
+        identity.is_workspace_account.to_string(),
+    );
+}
+
+fn header_value_case_insensitive<'a>(
+    headers: &'a IndexMap<String, String>,
+    expected: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(expected))
+        .map(|(_, value)| value.as_str())
+}
+
+fn identity_anchor(headers: &IndexMap<String, String>) -> Option<CodexAuthIdentity> {
+    (header_value_case_insensitive(headers, CODEX_AUTH_ANCHOR_HEADER) == Some("1")).then(|| {
+        CodexAuthIdentity {
+            account_id: header_value_case_insensitive(headers, CODEX_ACCOUNT_ANCHOR_HEADER)
+                .and_then(decode_anchor),
+            chatgpt_user_id: header_value_case_insensitive(headers, CODEX_USER_ANCHOR_HEADER)
+                .and_then(decode_anchor),
+            is_workspace_account: header_value_case_insensitive(
+                headers,
+                CODEX_WORKSPACE_ANCHOR_HEADER,
+            ) == Some("true"),
+        }
+    })
+}
+
+pub(crate) fn credentials_match_identity_anchor(
+    headers: &IndexMap<String, String>,
+    credentials: &CodexCredentials,
+) -> Option<bool> {
+    identity_anchor(headers).map(|expected| expected == credentials.identity())
+}
+
 /// Per-request sync resolver used by the sampler. Refresh happens in the
 /// isolated proactive loop; this read observes credential rotation performed
 /// by this or another Grok Build process.
 #[derive(Debug, Default)]
-pub struct CodexBearerResolver;
+pub struct CodexBearerResolver {
+    expected_identity: Option<CodexAuthIdentity>,
+}
+
+impl CodexBearerResolver {
+    pub(crate) fn from_credentials(credentials: Option<&CodexCredentials>) -> Self {
+        Self {
+            expected_identity: credentials.map(CodexCredentials::identity),
+        }
+    }
+
+    pub(crate) fn from_headers(headers: &IndexMap<String, String>) -> Self {
+        Self {
+            expected_identity: identity_anchor(headers),
+        }
+    }
+
+    fn resolve_credentials(
+        &self,
+        credentials: CodexCredentials,
+    ) -> Option<xai_grok_sampler::ResolvedBearerAuth> {
+        let expected = self.expected_identity.as_ref()?;
+        if &credentials.identity() != expected {
+            return None;
+        }
+        let mut extra_headers = IndexMap::new();
+        if let Some(account_id) = credentials.account_id {
+            extra_headers.insert("ChatGPT-Account-ID".to_owned(), account_id);
+        }
+        if credentials.account_is_fedramp {
+            extra_headers.insert("X-OpenAI-Fedramp".to_owned(), "true".to_owned());
+        }
+        Some(xai_grok_sampler::ResolvedBearerAuth {
+            bearer: credentials.access_token,
+            extra_headers,
+        })
+    }
+}
 
 impl xai_grok_sampler::BearerResolver for CodexBearerResolver {
     fn current_bearer(&self) -> Option<String> {
-        load_credentials()
-            .ok()
-            .flatten()
-            .map(|value| value.access_token)
+        self.current_auth().map(|auth| auth.bearer)
+    }
+
+    fn current_auth(&self) -> Option<xai_grok_sampler::ResolvedBearerAuth> {
+        self.resolve_credentials(load_credentials().ok().flatten()?)
+    }
+
+    fn reserved_headers(&self) -> &'static [&'static str] {
+        CODEX_RESERVED_AUTH_HEADERS
+    }
+
+    fn fail_closed_on_missing(&self) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn jwt(payload: serde_json::Value) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
@@ -1009,6 +1350,44 @@ mod tests {
             backend_base_url: issuer.to_owned(),
             client_id: CODEX_CLIENT_ID.to_owned(),
         }
+    }
+
+    async fn refresh_mock_handler(
+        State(calls): State<Arc<AtomicUsize>>,
+        axum::Json(request): axum::Json<serde_json::Value>,
+    ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+        calls.fetch_add(1, Ordering::SeqCst);
+        if request
+            .get("refresh_token")
+            .and_then(|value| value.as_str())
+            == Some("replacement-refresh")
+        {
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "access_token": "refreshed-access"
+                })),
+            )
+        } else {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "error": {"code": "refresh_token_expired"}
+                })),
+            )
+        }
+    }
+
+    async fn spawn_refresh_mock(calls: Arc<AtomicUsize>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/oauth/token", axum::routing::post(refresh_mock_handler))
+            .with_state(calls);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
     }
 
     #[test]
@@ -1051,6 +1430,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn callback_state_mismatch_does_not_consume_login_attempt() {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let state = Arc::new(CallbackState {
+            expected_state: "expected-state".to_owned(),
+            result_tx: tokio::sync::Mutex::new(Some(result_tx)),
+        });
+
+        let rejected = callback_handler(
+            State(state.clone()),
+            Query(CallbackQuery {
+                code: None,
+                state: Some("wrong-state".to_owned()),
+                error: Some("access_denied".to_owned()),
+                error_description: Some("forged callback".to_owned()),
+            }),
+        )
+        .await;
+        assert!(rejected.0.contains("login failed"));
+        assert!(
+            state.result_tx.lock().await.is_some(),
+            "wrong-state callback must leave the one-shot sender available"
+        );
+
+        let accepted = callback_handler(
+            State(state),
+            Query(CallbackQuery {
+                code: Some("valid-code".to_owned()),
+                state: Some("expected-state".to_owned()),
+                error: None,
+                error_description: None,
+            }),
+        )
+        .await;
+        assert!(accepted.0.contains("Codex connected"));
+        assert_eq!(result_rx.await.unwrap().unwrap(), "valid-code");
+    }
+
     #[test]
     fn credentials_read_openai_claim_namespace() {
         let id_token = jwt(serde_json::json!({
@@ -1058,6 +1475,7 @@ mod tests {
             "https://api.openai.com/auth": {
                 "chatgpt_plan_type": "pro",
                 "chatgpt_account_id": "account-1",
+                "chatgpt_user_id": "user-1",
                 "chatgpt_account_is_fedramp": true
             }
         }));
@@ -1070,7 +1488,51 @@ mod tests {
         assert_eq!(credentials.email.as_deref(), Some("dev@example.com"));
         assert_eq!(credentials.plan_type.as_deref(), Some("pro"));
         assert_eq!(credentials.account_id.as_deref(), Some("account-1"));
+        assert_eq!(credentials.chatgpt_user_id.as_deref(), Some("user-1"));
+        assert!(!credentials.is_workspace_account);
         assert!(credentials.account_is_fedramp);
+    }
+
+    #[test]
+    fn bearer_resolver_binds_atomic_headers_to_expected_identity() {
+        fn credentials(account: &str, user: &str, bearer: &str) -> CodexCredentials {
+            CodexCredentials {
+                access_token: bearer.to_owned(),
+                account_id: Some(account.to_owned()),
+                chatgpt_user_id: Some(user.to_owned()),
+                email: None,
+                plan_type: Some("enterprise".to_owned()),
+                is_workspace_account: true,
+                account_is_fedramp: true,
+            }
+        }
+
+        let account_a = credentials("account-a", "user-a", "token-a");
+        let resolver = CodexBearerResolver::from_credentials(Some(&account_a));
+        let resolved = resolver
+            .resolve_credentials(credentials("account-a", "user-a", "token-a-refreshed"))
+            .expect("same identity may rotate its bearer");
+        assert_eq!(resolved.bearer, "token-a-refreshed");
+        assert_eq!(
+            resolved
+                .extra_headers
+                .get("ChatGPT-Account-ID")
+                .map(String::as_str),
+            Some("account-a")
+        );
+        assert_eq!(
+            resolved
+                .extra_headers
+                .get("X-OpenAI-Fedramp")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            resolver
+                .resolve_credentials(credentials("account-b", "user-b", "token-b"))
+                .is_none(),
+            "a live relogin must not cross the session's account boundary"
+        );
     }
 
     #[test]
@@ -1101,6 +1563,18 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn logout_removes_malformed_auth_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        std::fs::write(&path, b"{truncated-token-material").unwrap();
+
+        let removed = logout_at(&path, &CodexEndpoints::default()).await.unwrap();
+
+        assert!(removed);
+        assert!(!path.exists());
+    }
+
     #[test]
     fn refresh_error_code_accepts_codex_shapes() {
         assert_eq!(
@@ -1111,6 +1585,99 @@ mod tests {
             refresh_error_code(r#"{"error":"refresh_token_expired"}"#).as_deref(),
             Some("refresh_token_expired")
         );
+    }
+
+    #[test]
+    fn permanent_refresh_failure_is_scoped_to_refresh_token_and_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        let original = refresh_failure_key(&path, "refresh-one", Some("account-one".to_owned()));
+        cache_permanent_refresh_failure(original.clone(), "reconnect".to_owned());
+
+        assert_eq!(
+            cached_permanent_refresh_failure(&original).as_deref(),
+            Some("reconnect")
+        );
+        assert_eq!(
+            cached_permanent_refresh_failure(&refresh_failure_key(
+                &path,
+                "refresh-two",
+                Some("account-one".to_owned())
+            )),
+            None,
+            "a rotated refresh token must bypass the old verdict"
+        );
+
+        cache_permanent_refresh_failure(original, "reconnect".to_owned());
+        assert_eq!(
+            cached_permanent_refresh_failure(&refresh_failure_key(
+                &path,
+                "refresh-one",
+                Some("account-two".to_owned())
+            )),
+            None,
+            "a rotated account must bypass the old verdict"
+        );
+        clear_permanent_refresh_failure(&path);
+    }
+
+    #[tokio::test]
+    async fn permanent_refresh_failure_prevents_repeat_oauth_calls_until_file_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        let account_id = "account-one";
+        let mut store = CodexAuthStore {
+            auth_mode: Some("chatgpt".to_owned()),
+            openai_api_key: None,
+            tokens: Some(CodexTokenData {
+                id_token: jwt(serde_json::json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": account_id
+                    }
+                })),
+                access_token: "expired-access".to_owned(),
+                refresh_token: "expired-refresh".to_owned(),
+                account_id: Some(account_id.to_owned()),
+            }),
+            last_refresh: None,
+        };
+        save_store_at(&path, &store).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (issuer, server) = spawn_refresh_mock(calls.clone()).await;
+        let endpoints = endpoints(&issuer);
+
+        let first = refresh_at(&path, &endpoints, false).await.unwrap_err();
+        assert!(first.to_string().contains("refresh_token_expired"));
+        assert!(first.to_string().contains("login --codex"));
+
+        let proactive_retry = refresh_at(&path, &endpoints, false).await.unwrap_err();
+        let per_turn_retry = refresh_at(&path, &endpoints, true).await.unwrap_err();
+        assert_eq!(proactive_retry.to_string(), first.to_string());
+        assert_eq!(per_turn_retry.to_string(), first.to_string());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "unchanged credentials must not hammer the OAuth endpoint"
+        );
+
+        store.tokens.as_mut().unwrap().refresh_token = "replacement-refresh".to_owned();
+        save_store_at(&path, &store).unwrap();
+        let credentials = refresh_at(&path, &endpoints, true).await.unwrap().unwrap();
+        assert_eq!(credentials.access_token, "refreshed-access");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        server.abort();
+    }
+
+    #[test]
+    fn device_interval_defaults_when_auth_service_omits_it() {
+        let response: DeviceUserCodeResponse = serde_json::from_value(serde_json::json!({
+            "device_auth_id": "device-auth-123",
+            "user_code": "CODE-12345"
+        }))
+        .unwrap();
+        assert_eq!(response.interval, 0);
     }
 
     #[test]

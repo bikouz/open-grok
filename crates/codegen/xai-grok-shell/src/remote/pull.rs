@@ -122,6 +122,7 @@ pub(crate) mod hydrate {
             num_messages,
             num_chat_messages,
             current_model_id: model_id,
+            ever_used_codex: false,
             parent_session_id,
             forked_at: None,
             collection_id: None,

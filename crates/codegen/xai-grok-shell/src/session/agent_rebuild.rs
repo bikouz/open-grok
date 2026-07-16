@@ -100,6 +100,9 @@ pub(crate) struct AgentRebuildSpec {
     pub memory_workspace_path: Option<String>,
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
     pub web_search_config: WebSearchConfig,
+    /// True when local search came from the compiled xAI helper rather than an
+    /// explicit non-default route. Used to keep Codex sessions provider-local.
+    pub implicit_local_web_search: bool,
     pub backend_search: bool,
     pub web_fetch_config: WebFetchConfig,
     pub image_gen_config: ImageGenConfig,
@@ -198,6 +201,7 @@ impl AgentRebuildSpec {
             memory_workspace_path,
             memory_backend,
             web_search_config,
+            implicit_local_web_search: _,
             backend_search,
             web_fetch_config,
             image_gen_config,
@@ -408,6 +412,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_workspace_path: None,
         memory_backend: None,
         web_search_config: WebSearchConfig::default(),
+        implicit_local_web_search: false,
         backend_search: false,
         web_fetch_config: WebFetchConfig::Disabled,
         image_gen_config: ImageGenConfig::default(),

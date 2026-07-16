@@ -45,18 +45,26 @@ impl MvpAgent {
             alpha_test_key,
             client_version,
         ) {
+            Some(cfg)
+                if crate::agent::config::should_use_active_for_implicit_aux_model(
+                    &slug,
+                    crate::models::default_session_summary_model(),
+                    &cfg,
+                    primary,
+                ) => primary.clone(),
             Some(mut cfg) => {
-                cfg.client_identifier = primary.client_identifier.clone();
-                cfg.attribution_callback = primary.attribution_callback.clone();
-                cfg.bearer_resolver = primary.bearer_resolver.clone();
-                cfg.max_retries = primary.max_retries;
+                crate::agent::config::stamp_session_local_sampler_fields(
+                    &mut cfg,
+                    primary,
+                    primary.client_identifier.clone(),
+                    primary.max_retries,
+                );
                 cfg
             }
-            None => {
-                let mut fallback = primary.clone();
-                fallback.model = slug;
-                fallback
-            }
+            // Keep the active model when the requested helper cannot be
+            // resolved. Rewriting only the slug would send an xAI helper name
+            // such as `grok-build` to a Codex endpoint and guarantee a 404.
+            None => primary.clone(),
         };
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
@@ -1240,6 +1248,22 @@ impl MvpAgent {
             .or_else(|| jwt_tier_claim(&auth.key));
         tier.as_deref().is_some_and(crate::tier::is_restricted_tier_name)
     }
+    /// Resolve only xAI-provenanced credentials for xAI media endpoints. A
+    /// Codex sampling token must never become a static fallback bearer for an
+    /// Imagine request.
+    fn xai_media_api_key(&self) -> Option<String> {
+        let (provider, api_key) = {
+            let sampling_config = self.sampling_config.borrow();
+            (sampling_config.provider, sampling_config.api_key.clone())
+        };
+        if provider == xai_grok_sampling_types::ModelProvider::Xai {
+            return api_key;
+        }
+        self.auth_manager
+            .current_or_expired()
+            .filter(|auth| auth.is_xai_auth())
+            .map(|auth| auth.key)
+    }
     /// Build image generation config.
     ///
     /// Both BYOK and session (OAuth) users go direct to `xai_api_base_url`.
@@ -1250,8 +1274,7 @@ impl MvpAgent {
         &self,
     ) -> xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig {
         use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
-        let sampling_config = self.sampling_config.borrow();
-        let Some(ref api_key) = sampling_config.api_key else {
+        let Some(api_key) = self.xai_media_api_key() else {
             return ImageGenConfig::Disabled;
         };
         let tier_restricted = self.is_tier_restricted_capability();
@@ -1271,7 +1294,7 @@ impl MvpAgent {
             &base_url,
         );
         ImageGenConfig::Enabled {
-            api_key: api_key.clone(),
+            api_key,
             base_url,
             extra_headers: headers,
             image_gen_enabled: cfg.resolve_image_gen().value,
@@ -1292,7 +1315,7 @@ impl MvpAgent {
         &self,
     ) -> xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig {
         use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
-        let Some(api_key) = self.sampling_config.borrow().api_key.clone() else {
+        let Some(api_key) = self.xai_media_api_key() else {
             return VideoGenConfig::Disabled;
         };
         let tier_restricted = self.is_tier_restricted_capability();
@@ -1328,7 +1351,9 @@ impl MvpAgent {
             tier_restricted,
         }
     }
-    pub(super) fn prepare_web_search_sampling_config(&self) -> Option<SamplingConfig> {
+    pub(super) fn prepare_web_search_sampling_config(
+        &self,
+    ) -> Option<config::PreparedWebSearchSamplingConfig> {
         let model_id = self.cfg.borrow().web_search_model.clone();
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
@@ -1349,7 +1374,10 @@ impl MvpAgent {
             alpha_test_key.as_deref(),
             &cfg.base_url,
         );
-        Some(cfg)
+        Some(config::PreparedWebSearchSamplingConfig {
+            sampler: cfg,
+            is_implicit_default: model_id == crate::models::default_web_search_model(),
+        })
     }
     /// Returns `Err` with a user-facing message on invalid config; the caller at
     /// the process boundary prints it and exits.
@@ -2574,9 +2602,41 @@ impl MvpAgent {
         session_info: &crate::session::info::Info,
         turn_number: u64,
     ) -> Option<PromptTraceContext> {
-        let (upload_method, upload_reason) = self
-            .trace_upload_config_with_reason()
-            .await;
+        let session_handle = match self.sessions.borrow().get(&session_info.id) {
+            Some(handle) => handle.clone(),
+            None => {
+                tracing::Span::current().record("uploads_enabled", false);
+                tracing::Span::current().record(
+                    "upload_reason",
+                    crate::upload::turn::TraceUploadReason::SessionNotFound.as_str(),
+                );
+                return None;
+            }
+        };
+        let (upload_method, upload_reason) = if !session_handle
+            .feedback_manager
+            .allows_xai_export()
+        {
+            (
+                None,
+                crate::upload::turn::TraceUploadReason::ProviderBoundary,
+            )
+        } else {
+            let provider = session_handle
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .map(|config| config.provider)
+                .unwrap_or_default();
+            if provider == xai_grok_sampling_types::ModelProvider::Xai {
+                self.trace_upload_config_with_reason().await
+            } else {
+                (
+                    None,
+                    crate::upload::turn::TraceUploadReason::ProviderBoundary,
+                )
+            }
+        };
         tracing::Span::current().record("upload_reason", upload_reason.as_str());
         {
             let mut decision = self.cfg.borrow().trace_upload_decision_debug();
@@ -2648,18 +2708,6 @@ impl MvpAgent {
             archive_name_override: None,
             upload_method,
         };
-        let session_handle = match self.sessions.borrow().get(&session_info.id) {
-            Some(h) => h.clone(),
-            None => {
-                tracing::Span::current().record("uploads_enabled", false);
-                tracing::Span::current()
-                    .record(
-                        "upload_reason",
-                        crate::upload::turn::TraceUploadReason::SessionNotFound.as_str(),
-                    );
-                return None;
-            }
-        };
         let queue = session_handle
             .upload_queue
             .get_or_init(|| {
@@ -2669,6 +2717,7 @@ impl MvpAgent {
                     &gcs_config,
                     Some(xai_grok_version::VERSION),
                     self.auth_manager.clone(),
+                    session_handle.feedback_manager.provider_boundary(),
                 );
                 crate::upload::trace::spawn_startup_spill_reconcile(
                     grok_home,
@@ -3117,9 +3166,6 @@ impl MvpAgent {
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
         let sampling_config = self
             .resolve_sampling_config_for_model(&session_model_id, origin_client.clone());
-        if self.auth_method_id.load().is_none() {
-            return Err(acp::Error::auth_required().data("no auth method id provided"));
-        }
         let auth_method_id = std::sync::Arc::clone(&self.auth_method_id);
         tracing::info!(
             session_id = % session_info.id.0, ? startup_hints, "startup hints"
@@ -3232,6 +3278,26 @@ impl MvpAgent {
                 sampling_config,
                 origin_client.clone(),
             );
+        // Authenticate the effective model after agent-profile pinning. The
+        // preliminary/default model may belong to the other provider.
+        if sampling_config.provider == xai_grok_sampling_types::ModelProvider::Codex {
+            let has_codex_oauth = sampling_config.bearer_resolver.is_some()
+                && crate::codex_auth::load_credentials().ok().flatten().is_some();
+            let has_codex_byok = sampling_config.bearer_resolver.is_none()
+                && sampling_config.api_key.is_some();
+            if !has_codex_oauth && !has_codex_byok {
+                return Err(acp::Error::auth_required().data(
+                    "Codex authentication required; run `grok login --codex` or configure an API key for this model",
+                ));
+            }
+            // Keep sharing the agent's live xAI auth cell even while it is
+            // empty. Codex provenance lives in the resolved sampler, and a
+            // later xAI login can update this same running session if the user
+            // switches providers. Existing xAI auth never satisfies this
+            // provider-local admission check.
+        } else if auth_method_id.load().is_none() {
+            return Err(acp::Error::auth_required().data("no auth method id provided"));
+        }
         let max_turns = {
             let cfg = self.cfg.borrow();
             cfg.cli_agent_overrides
@@ -3418,8 +3484,8 @@ impl MvpAgent {
             let session_key = self.auth_manager.current_or_expired().map(|a| a.key);
             let credentials = xai_chat_state::Credentials {
                 api_key: sampling_config.api_key.clone(),
-                auth_type: crate::agent::config::resolve_chat_state_auth_type(
-                    sampling_config.model.as_str(),
+                auth_type: crate::agent::config::resolve_chat_state_auth_type_for_sampling_config(
+                    &sampling_config,
                     session_key.as_deref(),
                     self.auth_type(),
                 ),
@@ -3428,12 +3494,14 @@ impl MvpAgent {
             };
             let attribution_callback: Option<
                 xai_grok_sampler::SharedAttributionCallback,
-            > = Some(
-                crate::auth::attribution::ShellAttribution::new(
-                    self.auth_manager.clone(),
-                    Some(session_info.id.0.to_string()),
-                ),
-            );
+            > = (sampling_config.provider
+                != xai_grok_sampling_types::ModelProvider::Codex)
+                .then(|| {
+                    crate::auth::attribution::ShellAttribution::new(
+                        self.auth_manager.clone(),
+                        Some(session_info.id.0.to_string()),
+                    )
+                });
             let agent_hook_registry_override = agent_definition
                 .hooks
                 .as_ref()
@@ -3483,6 +3551,7 @@ impl MvpAgent {
                 .tx
                 .send(crate::session::persistence::PersistenceMsg::CurrentModel {
                     model_id: session_model_id.clone(),
+                    provider: sampling_config.provider,
                     agent_name: Some(agent_definition.name.clone()),
                     reasoning_effort: initial_reasoning_effort,
                 });

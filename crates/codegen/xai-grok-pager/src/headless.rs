@@ -519,6 +519,39 @@ fn auth_required_message(interactive: bool) -> String {
     }
 }
 
+/// Resolve a selected Codex model's provider-local authentication before the
+/// legacy ACP/xAI auth gate runs. Codex credentials intentionally stay out of
+/// ACP auth-method ordering, so a Codex-only headless session must bypass that
+/// gate after proving it has either an explicit model key or isolated OAuth.
+fn selected_codex_auth(
+    config: &AgentConfig,
+    requested_model: Option<&str>,
+) -> Option<anyhow::Result<bool>> {
+    let model_id = requested_model.or(config.models.default.as_deref())?;
+    let models = xai_grok_shell::agent::config::resolve_model_list(config, None);
+    let model = models
+        .get(model_id)
+        .or_else(|| models.values().find(|entry| entry.info().model == model_id))?;
+    if model.info().provider != xai_grok_shell::sampling::types::ModelProvider::Codex {
+        return None;
+    }
+    if model.has_own_credentials() {
+        return Some(Ok(true));
+    }
+    Some(match xai_grok_shell::codex_auth::load_credentials() {
+        Ok(Some(_)) => Ok(false),
+        Ok(None) => Err(anyhow::anyhow!(
+            "Not signed in to Codex. Run `grok login --codex --device-auth` for a headless \
+             login, or configure an API key on this model."
+        )),
+        Err(error) => Err(anyhow::anyhow!(
+            "Could not read Codex credentials: {}. Run `grok login --codex --device-auth` to \
+             reconnect.",
+            error
+        )),
+    })
+}
+
 /// Authenticate using the agent's `defaultAuthMethodId` (source of truth for
 /// `[auth] preferred_method`). Fail closed when no method is available — do not
 /// invent api_key vs session ordering client-side.
@@ -607,6 +640,7 @@ async fn open_session(
     cwd: &Path,
     session_id_flag: Option<&str>,
     restore_code: Option<bool>,
+    initial_model_id: Option<&str>,
 ) -> anyhow::Result<OpenedSession> {
     // Pager opens sessions before the agent resolves per-vendor compat;
     // default (all-on) preserves existing behavior — the agent applies
@@ -624,6 +658,12 @@ async fn open_session(
                     if let Some(true) = restore_code {
                         m.insert("x.ai/restore_code".into(), serde_json::Value::Bool(true));
                     }
+                    if let Some(model_id) = initial_model_id {
+                        m.insert(
+                            "modelId".into(),
+                            serde_json::Value::String(model_id.to_string()),
+                        );
+                    }
                     Some(m)
                 }),
             acp_tx,
@@ -638,11 +678,15 @@ async fn open_session(
         anyhow::bail!("Session does not exist");
     }
 
-    let new_resp: acp::NewSessionResponse = acp_send(
-        acp::NewSessionRequest::new(cwd.to_path_buf()).mcp_servers(mcp_servers),
-        acp_tx,
-    )
-    .await?;
+    let mut request = acp::NewSessionRequest::new(cwd.to_path_buf()).mcp_servers(mcp_servers);
+    if let Some(model_id) = initial_model_id {
+        request = request.meta(
+            serde_json::json!({ "modelId": model_id })
+                .as_object()
+                .cloned(),
+        );
+    }
+    let new_resp: acp::NewSessionResponse = acp_send(request, acp_tx).await?;
     Ok(OpenedSession {
         session_id: new_resp.session_id,
         models: ModelState::from(new_resp.models),
@@ -653,19 +697,26 @@ async fn open_session_with_id(
     acp_tx: &AcpAgentTx,
     cwd: &Path,
     session_id: &str,
+    initial_model_id: Option<&str>,
 ) -> anyhow::Result<OpenedSession> {
     let cwd_str = cwd.to_string_lossy();
     crate::app::session_startup::ensure_session_id_available(session_id, &cwd_str)?;
     let mcp_servers =
         cli_config::load_mcp_servers(cwd, &xai_grok_tools::types::compat::CompatConfig::default());
+    let mut meta = serde_json::Map::from_iter([(
+        "sessionId".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    )]);
+    if let Some(model_id) = initial_model_id {
+        meta.insert(
+            "modelId".to_string(),
+            serde_json::Value::String(model_id.to_string()),
+        );
+    }
     let new_resp: acp::NewSessionResponse = acp_send(
         acp::NewSessionRequest::new(cwd.to_path_buf())
             .mcp_servers(mcp_servers)
-            .meta(
-                serde_json::json!({ "sessionId": session_id })
-                    .as_object()
-                    .cloned(),
-            ),
+            .meta(Some(meta)),
         acp_tx,
     )
     .await?;
@@ -682,6 +733,7 @@ async fn fork_then_open(
     parent_cwd: Option<&Path>,
     new_id: Option<&str>,
     restore_code: Option<bool>,
+    initial_model_id: Option<&str>,
 ) -> anyhow::Result<OpenedSession> {
     use crate::app::session_startup::{
         effective_fork_new_cwd, ensure_session_id_available, fork_response_error,
@@ -709,7 +761,15 @@ async fn fork_then_open(
     }
     let child = fork_response_new_session_id(resp.0.get())
         .ok_or_else(|| anyhow::anyhow!("fork response missing newSessionId"))?;
-    match open_session(acp_tx, &write_cwd, Some(&child), restore_code).await {
+    match open_session(
+        acp_tx,
+        &write_cwd,
+        Some(&child),
+        restore_code,
+        initial_model_id,
+    )
+    .await
+    {
         Ok(opened) => Ok(opened),
         Err(e) => Err(anyhow::anyhow!(
             "fork succeeded as {child} but load failed: {e}"
@@ -894,14 +954,91 @@ pub async fn run_single_turn(
         None,
     );
 
-    // No agent-level hub client URL (gateway-only cloud; workspace provider
-    // hub_url lives on `grok workspace` / WorkspaceStartArgs only).
-
     apply_agent_flag(&options.agent, &mut agent_config);
 
     if let Some(ref json) = options.agents_json {
         agent_config.cli_agents = parse_cli_agents(json)?;
     }
+
+    // Materialize resume/fork intent before authentication so provider auth is
+    // chosen from the persisted session model, not an unrelated configured
+    // default. This remains the same startup plan consumed below.
+    use crate::app::session_startup::{self, MaterializedStartup, SessionStartupFlags};
+    let has_resume_id = options.resume.as_deref().filter(|s| !s.is_empty());
+    let resume_most_recent = options.resume.as_deref() == Some("");
+    let intent = session_startup::session_startup_intent_from_flags(SessionStartupFlags {
+        session_id: options.session_id.as_deref(),
+        resume_session_id: has_resume_id,
+        resume_most_recent,
+        continue_last_session: options.continue_last_session,
+        fork_session: options.fork_session,
+        has_worktree: options.worktree.is_some(),
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let materialized = session_startup::materialize_startup_for_cwd(
+        headless_materialize_ctx(options.worktree.is_some()),
+        intent,
+        &cwd_str,
+    )
+    .await?;
+    let persisted_model = match &materialized {
+        MaterializedStartup::Resume { session_id, .. } => {
+            xai_grok_shell::session::persistence::find_summary_by_session_id(session_id)
+                .map(|summary| summary.current_model_id.0.to_string())
+        }
+        MaterializedStartup::Fork {
+            parent_session_id, ..
+        } => xai_grok_shell::session::persistence::find_summary_by_session_id(parent_session_id)
+            .map(|summary| summary.current_model_id.0.to_string()),
+        MaterializedStartup::NewAuto | MaterializedStartup::NewWithId { .. } => None,
+    };
+    let base_auth_model = options.model.as_deref().or(persisted_model.as_deref());
+    let resolved_models = xai_grok_shell::agent::config::resolve_model_list(&agent_config, None);
+    let base_entry = base_auth_model
+        .or(agent_config.models.default.as_deref())
+        .and_then(|model_id| {
+            resolved_models.get(model_id).or_else(|| {
+                resolved_models
+                    .values()
+                    .find(|entry| entry.info().model == model_id)
+            })
+        });
+    let agent_definition = xai_grok_shell::agent::MvpAgent::resolve_agent_definition(
+        &cwd,
+        agent_config.agent_profile_path.as_deref(),
+        &agent_config.agent,
+        None,
+        base_entry.map(|entry| entry.info().agent_type.as_str()),
+    );
+    let profile_model = match &agent_definition.model {
+        xai_grok_agent::config::ModelOverride::Override(model_id)
+            if resolved_models.contains_key(model_id)
+                || resolved_models
+                    .values()
+                    .any(|entry| entry.info().model == *model_id) =>
+        {
+            Some(model_id.as_str())
+        }
+        _ => None,
+    };
+    let explicit_initial_model = options.model.as_deref().and_then(|requested| {
+        resolved_models
+            .get_key_value(requested)
+            .map(|(key, _)| key.as_str())
+            .or_else(|| {
+                resolved_models.iter().find_map(|(key, entry)| {
+                    (entry.info().model == requested
+                        || entry.info().name.as_deref() == Some(requested))
+                    .then_some(key.as_str())
+                })
+            })
+    });
+    let auth_model = profile_model.or(explicit_initial_model).or(base_auth_model);
+    let codex_auth_override = selected_codex_auth(&agent_config, auth_model);
+
+    // No agent-level hub client URL (gateway-only cloud; workspace provider
+    // hub_url lives on `grok workspace` / WorkspaceStartArgs only).
 
     agent_config.cli_agent_overrides = xai_grok_shell::agent::config::CliAgentOverrides {
         tools: parse_comma_list(options.cli_tools.as_deref()),
@@ -964,13 +1101,18 @@ pub async fn run_single_turn(
     // Authenticate using agent defaultAuthMethodId (preferred_method pin).
     let t_auth = Instant::now();
     let default_auth_method_id = crate::acp::parse_default_auth_method_id(init_resp.meta.as_ref());
-    let is_api_key_auth = match authenticate(
-        &acp_tx,
-        &init_resp.auth_methods,
-        default_auth_method_id.as_ref(),
-    )
-    .await
-    {
+    let auth_result = match codex_auth_override {
+        Some(result) => result,
+        None => {
+            authenticate(
+                &acp_tx,
+                &init_resp.auth_methods,
+                default_auth_method_id.as_ref(),
+            )
+            .await
+        }
+    };
+    let is_api_key_auth = match auth_result {
         Ok(is_api_key) => is_api_key,
         Err(e) => {
             emitter.on_error(&e.to_string());
@@ -983,35 +1125,15 @@ pub async fn run_single_turn(
         "headless: authenticate complete"
     );
 
-    // Same intent + materialize path as interactive (shared SSOT).
-    use crate::app::session_startup::{self, MaterializedStartup, SessionStartupFlags};
-    let has_resume_id = options.resume.as_deref().filter(|s| !s.is_empty());
-    let resume_most_recent = options.resume.as_deref() == Some("");
-    let intent = session_startup::session_startup_intent_from_flags(SessionStartupFlags {
-        session_id: options.session_id.as_deref(),
-        resume_session_id: has_resume_id,
-        resume_most_recent,
-        continue_last_session: options.continue_last_session,
-        fork_session: options.fork_session,
-        has_worktree: options.worktree.is_some(),
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let materialized = session_startup::materialize_startup_for_cwd(
-        headless_materialize_ctx(options.worktree.is_some()),
-        intent,
-        &cwd_str,
-    )
-    .await?;
-
     // Open session
     let restore_code = options.restore_code.then_some(true);
     let t_session = Instant::now();
     let opened = match materialized {
-        MaterializedStartup::NewAuto => open_session(&acp_tx, &cwd, None, None).await,
+        MaterializedStartup::NewAuto => {
+            open_session(&acp_tx, &cwd, None, None, explicit_initial_model).await
+        }
         MaterializedStartup::NewWithId { session_id } => {
-            open_session_with_id(&acp_tx, &cwd, &session_id).await
+            open_session_with_id(&acp_tx, &cwd, &session_id, explicit_initial_model).await
         }
         MaterializedStartup::Resume {
             session_id,
@@ -1019,7 +1141,14 @@ pub async fn run_single_turn(
             ..
         } => {
             let load_cwd = original_cwd.as_deref().unwrap_or(cwd.as_path());
-            open_session(&acp_tx, load_cwd, Some(session_id.as_str()), restore_code).await
+            open_session(
+                &acp_tx,
+                load_cwd,
+                Some(session_id.as_str()),
+                restore_code,
+                explicit_initial_model,
+            )
+            .await
         }
         MaterializedStartup::Fork {
             parent_session_id,
@@ -1034,6 +1163,7 @@ pub async fn run_single_turn(
                 parent_cwd.as_deref(),
                 new_session_id.as_deref(),
                 restore_code,
+                explicit_initial_model,
             )
             .await
         }

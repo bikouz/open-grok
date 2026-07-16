@@ -1139,8 +1139,8 @@ mod tests {
                 ..
             })
         ));
-        let logout = PagerArgs::try_parse_from(["grok", "logout", "--codex"])
-            .expect("Codex logout parses");
+        let logout =
+            PagerArgs::try_parse_from(["grok", "logout", "--codex"]).expect("Codex logout parses");
         assert!(matches!(
             logout.command,
             Some(Command::Logout {

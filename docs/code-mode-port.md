@@ -3,6 +3,9 @@
 This document records the compatibility target and implementation plan for bringing
 OpenAI Codex Code Mode to Grok Build.
 
+Provider authentication, quota, and hosted-search compatibility are recorded in
+[Codex provider integration](codex-provider-port.md).
+
 ## Upstream baseline
 
 - Repository: <https://github.com/openai/codex>

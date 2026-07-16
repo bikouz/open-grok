@@ -163,6 +163,10 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+                    active_provider: std::cell::Cell::new(
+                        xai_grok_sampling_types::ModelProvider::Xai,
+                    ),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
@@ -620,6 +624,10 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+                    active_provider: std::cell::Cell::new(
+                        xai_grok_sampling_types::ModelProvider::Xai,
+                    ),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
@@ -893,6 +901,10 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+                    active_provider: std::cell::Cell::new(
+                        xai_grok_sampling_types::ModelProvider::Xai,
+                    ),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
@@ -1938,6 +1950,10 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+                    active_provider: std::cell::Cell::new(
+                        xai_grok_sampling_types::ModelProvider::Xai,
+                    ),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),

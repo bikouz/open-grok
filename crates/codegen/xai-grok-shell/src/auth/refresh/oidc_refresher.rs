@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::auth::error::RefreshTokenFailedReason;
 use crate::auth::manager::RefreshReason;
@@ -272,47 +272,16 @@ impl TokenRefresher for OidcRefresher {
 
 /// Fire-and-forget diagnostic log upload. Guarded against concurrent spawns.
 fn spawn_diagnostic_upload(
-    uploader: &DiagnosticUploader,
-    auth_token: String,
-    email: String,
-    in_flight: &Arc<AtomicBool>,
+    _uploader: &DiagnosticUploader,
+    _auth_token: String,
+    _email: String,
+    _in_flight: &Arc<AtomicBool>,
 ) {
-    if in_flight
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        tracing::debug!("auth: diagnostic upload already in flight, skipping");
-        return;
-    }
-
-    let in_flight = in_flight.clone();
-    let uploader = uploader.clone();
-
-    tokio::spawn(async move {
-        // snapshot_log() holds a mutex, flushes, and reads up to 5 MB —
-        // run it on a blocking thread to avoid stalling the tokio executor.
-        let log_bytes = match tokio::task::spawn_blocking(crate::unified_log::snapshot_log).await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                crate::unified_log::debug("diagnostic snapshot empty", None, None);
-                in_flight.store(false, Ordering::Release);
-                return;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "auth: snapshot_log task failed");
-                crate::unified_log::error(
-                    "diagnostic snapshot failed",
-                    None,
-                    Some(serde_json::json!({ "error": format!("{e}") })),
-                );
-                in_flight.store(false, Ordering::Release);
-                return;
-            }
-        };
-
-        uploader(log_bytes, auth_token, email).await;
-        in_flight.store(false, Ordering::Release);
-    });
+    // The persistent unified log has no per-entry provider provenance and can
+    // span xAI and Codex sessions across restarts. Do not upload the cumulative
+    // file on refresh failure; the structured local auth error above remains
+    // available for diagnosis without crossing a provider boundary.
+    tracing::debug!("auth: cumulative diagnostic upload disabled for provider isolation");
 }
 
 #[cfg(test)]

@@ -83,9 +83,13 @@ pub(crate) fn spawn_trace_upload<T: Serialize + Send + 'static>(
 pub(crate) async fn upload_tool_definitions(
     gcs_config: TraceExportConfig,
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
+    provider_boundary: crate::session::persistence::ProviderBoundary,
     tool_definitions: &[ToolDefinition],
     artifact_tracker: Option<&super::manifest::ArtifactTracker>,
 ) {
+    if !provider_boundary.allows_xai_export() {
+        return;
+    }
     let Some(prefix) = gcs_config.gcs_prefix.as_deref() else {
         tracing::debug!("Skipping tool definitions upload: gcs_prefix is not set");
         return;
@@ -104,6 +108,9 @@ pub(crate) async fn upload_tool_definitions(
         format!("{prefix}/tool_definitions.json")
     };
     use crate::upload::gcs::WithAuth as _;
+    if !provider_boundary.allows_xai_export() {
+        return;
+    }
     let ok = xai_file_utils::gcs::upload_bytes(
         &gcs_config.with_auth(auth_manager),
         &object_path,
@@ -392,7 +399,11 @@ pub(crate) async fn upload_subagent_metadata(
     bucket_url: &str,
     upload_method: crate::session::repo_changes::UploadMethod,
     auth_manager: std::sync::Arc<crate::auth::AuthManager>,
+    provider_boundary: crate::session::persistence::ProviderBoundary,
 ) {
+    if !provider_boundary.allows_xai_export() {
+        return;
+    }
     let json = match serde_json::to_vec_pretty(metadata) {
         Ok(j) => j,
         Err(e) => {
@@ -415,6 +426,9 @@ pub(crate) async fn upload_subagent_metadata(
     };
     use crate::upload::gcs::WithAuth as _;
     let config = base_config.with_auth(Some(auth_manager));
+    if !provider_boundary.allows_xai_export() {
+        return;
+    }
     if let Err(e) =
         xai_file_utils::gcs::upload_bytes(&config, &gcs_path, &json, "application/json").await
     {
@@ -589,6 +603,10 @@ pub(crate) async fn upload_artifact_to_gcs(
     content_type: &str,
     artifact: &str,
 ) -> Option<String> {
+    if !ctx.allows_xai_export() {
+        tracing::debug!(artifact, "artifact upload blocked by provider boundary");
+        return None;
+    }
     let _upload_start = std::time::Instant::now();
     let config = ctx.gcs_config.with_auth(Some(ctx.auth_manager.clone()));
     match upload_bytes(&config, gcs_path, content, content_type).await {
@@ -850,42 +868,19 @@ pub(crate) async fn upload_session_metadata(
     };
     upload_artifact_to_gcs(ctx, &gcs_path, &metadata_json, "application/json", artifact).await;
 }
-/// Upload memory .md files as `memory.tar.gz` alongside the per-turn trace.
-/// Only runs when session registry is enabled via remote settings or config.toml.
+/// Record that workspace memory export is disabled until memory entries carry
+/// provider provenance and can be filtered safely.
 pub(crate) async fn upload_memory_state(ctx: &PromptTraceContext) {
-    if !ctx.session_registry_enabled {
-        tracing::debug!("memory upload skipped: session_registry_enabled=false");
-        super::manifest::skip_artifact(
-            &ctx.artifact_tracker,
-            "memory.tar.gz",
-            "session_registry_disabled",
-        );
-        return;
-    }
-    let storage = crate::session::memory::MemoryStorage::new(
-        std::path::Path::new(&ctx.session_info.cwd),
-        None,
+    // Workspace memory is shared across sessions and currently carries no
+    // per-record provider provenance. Uploading it to an xAI-only bucket is
+    // therefore unsafe once Codex-backed sessions are supported. Keep this
+    // cumulative artifact disabled until the archive format can filter by
+    // provider.
+    super::manifest::skip_artifact(
+        &ctx.artifact_tracker,
+        "memory.tar.gz",
+        "provider_provenance_unavailable",
     );
-    let archive = match crate::session::memory::archive::build_memory_archive(&storage) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(error = % e, "failed to build memory archive, skipping");
-            return;
-        }
-    };
-    if archive.is_empty() || archive.len() < 30 {
-        return;
-    }
-    let prefix = ctx.gcs_config.gcs_prefix.as_deref().unwrap_or("");
-    let gcs_path = format!("{prefix}/memory.tar.gz");
-    upload_trace_artifact(
-        ctx,
-        &archive,
-        &gcs_path,
-        "application/gzip",
-        "memory_archive",
-    )
-    .await;
 }
 /// Uploads the session-scoped unified log to cloud storage.
 /// Path format: {session_id}/turn_{N}/unified_log.jsonl
@@ -929,22 +924,6 @@ pub(crate) async fn upload_unified_log(ctx: &PromptTraceContext, wait: UploadWai
         wait,
     )
     .await;
-    let full_log_bytes =
-        tokio::task::spawn_blocking(xai_grok_telemetry::unified_log::snapshot_log).await;
-    let email = ctx
-        .auth_manager
-        .current_or_expired()
-        .and_then(|a| a.email)
-        .unwrap_or_else(|| "unknown".to_owned());
-    if let Ok(Some(full_bytes)) = full_log_bytes {
-        crate::upload::gcs::upload_to_auth_diagnostics(
-            &full_bytes,
-            &email,
-            &ctx.gcs_config.upload_method,
-            ctx.auth_manager.clone(),
-        )
-        .await;
-    }
 }
 /// Uploads permission events to cloud storage.
 /// Path format: {session_id}/turn_{N}/permission_decisions.json
@@ -1068,6 +1047,7 @@ pub(crate) async fn upload_harness_session_archive(
 pub(crate) struct DynamicResolver {
     auth_manager: Arc<crate::auth::AuthManager>,
     base_config: TraceExportConfig,
+    provider_boundary: crate::session::persistence::ProviderBoundary,
 }
 impl DynamicResolver {
     /// Build the auth-bearing wrapper used by all three `proxy_*` methods.
@@ -1077,6 +1057,10 @@ impl DynamicResolver {
     }
 }
 impl TraceExportSource for DynamicResolver {
+    fn allows_upload(&self) -> bool {
+        self.provider_boundary.allows_xai_export()
+    }
+
     fn resolve(&self) -> TraceExportConfig {
         let mut config = self.base_config.clone();
         if let crate::session::repo_changes::UploadMethod::Proxy {
@@ -1192,10 +1176,12 @@ fn claim_spill_reconcile(state: &std::sync::atomic::AtomicU8, collection_enabled
                 .is_ok()
     }
 }
-/// Reconcile upload-queue spill pairs left by a prior process life:
-/// re-enqueue them when uploads are enabled (`queue` present), purge them
-/// when data collection is disabled (`None`). Detached so session setup
-/// never waits on disk or cloud I/O.
+/// Reconcile upload-queue spill pairs left by a prior process life.
+///
+/// Legacy sidecars do not record provider provenance, so enabled sessions no
+/// longer re-enqueue them. They remain local until normal orphan cleanup;
+/// disabled collection still purges them. Detached so session setup never
+/// waits on disk I/O.
 pub(crate) fn spawn_startup_spill_reconcile(
     grok_home: std::path::PathBuf,
     queue: Option<UploadQueue>,
@@ -1206,10 +1192,8 @@ pub(crate) fn spawn_startup_spill_reconcile(
     tokio::spawn(async move {
         match queue {
             Some(queue) => {
-                let report =
-                    xai_grok_workspace::recovery::run_startup_recovery(&grok_home, &queue).await;
-                tracing::info!(?report, "startup spill recovery complete");
                 queue.cleanup_orphans(xai_file_utils::queue::DEFAULT_MAX_AGE);
+                tracing::info!("startup spill recovery skipped: provider provenance unavailable");
             }
             None => {
                 let purged = tokio::task::spawn_blocking(move || {
@@ -1236,6 +1220,9 @@ pub(crate) async fn flush_upload_queue(
     ctx: &PromptTraceContext,
     deadline: tokio::time::Instant,
 ) -> usize {
+    if !ctx.allows_xai_export() {
+        return 0;
+    }
     let Some(queue) = &ctx.upload_queue else {
         return 0;
     };
@@ -1343,10 +1330,12 @@ pub(crate) fn spawn_upload_queue(
     gcs_config: &TraceExportConfig,
     client_version: Option<&str>,
     auth_manager: Arc<crate::auth::AuthManager>,
+    provider_boundary: crate::session::persistence::ProviderBoundary,
 ) -> UploadQueue {
     let resolver: Arc<dyn TraceExportSource> = Arc::new(DynamicResolver {
         auth_manager,
         base_config: gcs_config.clone(),
+        provider_boundary,
     });
     let queue = UploadQueue::spawn(grok_home, resolver, UploadRetryPolicy::default());
     if let Some(ver) = client_version {
@@ -1369,6 +1358,9 @@ pub(crate) async fn upload_trace_artifact_blocking(
     artifact_name: &str,
     direct_attempt_started: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
+    if !ctx.allows_xai_export() {
+        anyhow::bail!("trace upload blocked by provider boundary");
+    }
     let queue_result = if let Some(queue) = &ctx.upload_queue {
         let session_id = ctx.session_info.id.0.to_string();
         match queue
@@ -1479,6 +1471,9 @@ pub(crate) async fn upload_trace_artifact_deferred(
     artifact_name: &str,
     deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
+    if !ctx.allows_xai_export() {
+        anyhow::bail!("trace upload blocked by provider boundary");
+    }
     if let Some(queue) = &ctx.upload_queue {
         let session_id = ctx.session_info.id.0.to_string();
         let outcome = queue
@@ -1556,6 +1551,13 @@ pub(crate) async fn upload_trace_artifact(
     content_type: &str,
     artifact_name: &str,
 ) {
+    if !ctx.allows_xai_export() {
+        tracing::debug!(
+            artifact = artifact_name,
+            "trace upload blocked by provider boundary"
+        );
+        return;
+    }
     let (ok, err_msg) = if let Some(queue) = &ctx.upload_queue {
         let session_id = ctx.session_info.id.0.to_string();
         match queue
@@ -1619,7 +1621,7 @@ fn sort_session_files_by_priority(files: &mut [crate::session::persistence::Copi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::persistence::CopiedSessionFile;
+    use crate::session::persistence::{CopiedSessionFile, ProviderBoundary};
     use prod_mc_cli_chat_proxy_types::PromptMetadata;
     fn bare_prompt_metadata() -> PromptMetadata {
         PromptMetadata {
@@ -1785,6 +1787,7 @@ mod tests {
         let resolver = DynamicResolver {
             auth_manager: auth_manager.clone(),
             base_config,
+            provider_boundary: ProviderBoundary::default(),
         };
         let provider = resolver
             .proxy_credentials()
@@ -1841,6 +1844,7 @@ mod tests {
         assert!(auth_manager.current().is_none());
         let resolver = DynamicResolver {
             auth_manager: auth_manager.clone(),
+            provider_boundary: ProviderBoundary::default(),
             base_config: TraceExportConfig {
                 bucket_url: None,
                 service_account_key: None,
@@ -1899,6 +1903,7 @@ mod tests {
         let auth_manager = Arc::new(crate::auth::AuthManager::new(dir.path(), grok_com_config));
         let resolver = DynamicResolver {
             auth_manager,
+            provider_boundary: ProviderBoundary::default(),
             base_config: TraceExportConfig {
                 bucket_url: None,
                 service_account_key: None,
@@ -1945,6 +1950,7 @@ mod tests {
         let auth_manager = Arc::new(crate::auth::AuthManager::new(dir.path(), grok_com_config));
         let resolver = DynamicResolver {
             auth_manager,
+            provider_boundary: ProviderBoundary::default(),
             base_config: TraceExportConfig {
                 bucket_url: None,
                 service_account_key: None,
@@ -2013,6 +2019,7 @@ mod tests {
         auth_manager.set_refresher(Arc::new(FreshRefresher));
         let resolver = DynamicResolver {
             auth_manager,
+            provider_boundary: ProviderBoundary::default(),
             base_config: TraceExportConfig {
                 bucket_url: None,
                 service_account_key: None,
@@ -2083,6 +2090,7 @@ mod tests {
         let count_after_proactive = call_count.load(std::sync::atomic::Ordering::SeqCst);
         let resolver = DynamicResolver {
             auth_manager,
+            provider_boundary: ProviderBoundary::default(),
             base_config: TraceExportConfig {
                 bucket_url: None,
                 service_account_key: None,
@@ -2138,6 +2146,7 @@ mod tests {
         let resolver = DynamicResolver {
             auth_manager,
             base_config,
+            provider_boundary: ProviderBoundary::default(),
         };
         let config = resolver.resolve();
         match &config.upload_method {
@@ -2178,6 +2187,7 @@ mod tests {
         let resolver = DynamicResolver {
             auth_manager,
             base_config,
+            provider_boundary: ProviderBoundary::default(),
         };
         let config = resolver.resolve();
         match &config.upload_method {
@@ -2222,6 +2232,7 @@ mod tests {
         let resolver = DynamicResolver {
             auth_manager,
             base_config,
+            provider_boundary: ProviderBoundary::default(),
         };
         assert!(
             resolver.proxy_credentials().is_some(),
@@ -2254,6 +2265,7 @@ mod tests {
         });
         let resolver = DynamicResolver {
             auth_manager,
+            provider_boundary: ProviderBoundary::default(),
             base_config: TraceExportConfig {
                 bucket_url: None,
                 service_account_key: None,
@@ -2297,6 +2309,7 @@ mod tests {
         });
         let resolver = DynamicResolver {
             auth_manager,
+            provider_boundary: ProviderBoundary::default(),
             base_config: TraceExportConfig {
                 bucket_url: None,
                 service_account_key: None,
@@ -2340,7 +2353,13 @@ mod tests {
                 alpha_test_key: None,
             },
         };
-        let _queue = spawn_upload_queue(dir.path(), &gcs_config, Some("1.0.0"), auth_manager);
+        let _queue = spawn_upload_queue(
+            dir.path(),
+            &gcs_config,
+            Some("1.0.0"),
+            auth_manager,
+            crate::session::persistence::ProviderBoundary::default(),
+        );
     }
     #[test]
     fn purge_stale_scratch_only_removes_scratch_tree() {

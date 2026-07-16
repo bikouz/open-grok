@@ -167,9 +167,50 @@ impl Default for SamplerConfig {
     }
 }
 
-/// Cheap sync read of the current bearer for [`SamplerConfig::bearer_resolver`].
+/// One provider-auth snapshot applied atomically to a request.
+///
+/// `extra_headers` must come from the same authenticated state as `bearer`.
+/// This is load-bearing for account-scoped providers such as OpenAI Codex,
+/// where a bearer token, account id, and FedRAMP routing flag must never be
+/// mixed across credential generations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedBearerAuth {
+    pub bearer: String,
+    pub extra_headers: IndexMap<String, String>,
+}
+
+impl ResolvedBearerAuth {
+    pub fn bearer_only(bearer: String) -> Self {
+        Self {
+            bearer,
+            extra_headers: IndexMap::new(),
+        }
+    }
+}
+
+/// Cheap sync read of current provider auth for
+/// [`SamplerConfig::bearer_resolver`].
 pub trait BearerResolver: Send + Sync + std::fmt::Debug {
     fn current_bearer(&self) -> Option<String>;
+
+    /// Resolve bearer plus account-scoped headers from one credential
+    /// snapshot. Existing resolvers remain bearer-only by default.
+    fn current_auth(&self) -> Option<ResolvedBearerAuth> {
+        self.current_bearer().map(ResolvedBearerAuth::bearer_only)
+    }
+
+    /// Headers owned by this auth provider. The client removes them from the
+    /// static header bag before applying [`Self::current_auth`], preventing
+    /// configuration or casing variants from overriding authenticated values.
+    fn reserved_headers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// When true, an unavailable or identity-mismatched live snapshot removes
+    /// the static auth fallback instead of sending a stale credential.
+    fn fail_closed_on_missing(&self) -> bool {
+        false
+    }
 }
 
 pub type SharedBearerResolver = std::sync::Arc<dyn BearerResolver>;

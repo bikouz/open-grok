@@ -60,6 +60,28 @@ impl SessionTokenAuthGate {
         )
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TurnAuthRefreshRoute {
+    CodexOAuth,
+    XaiSession,
+    ConfigApiKey,
+}
+
+pub(super) fn turn_auth_refresh_route(
+    provider: xai_grok_sampling_types::ModelProvider,
+    auth_type: xai_chat_state::AuthType,
+) -> TurnAuthRefreshRoute {
+    match (provider, auth_type) {
+        (xai_grok_sampling_types::ModelProvider::Codex, xai_chat_state::AuthType::SessionToken) => {
+            TurnAuthRefreshRoute::CodexOAuth
+        }
+        (xai_grok_sampling_types::ModelProvider::Xai, xai_chat_state::AuthType::SessionToken) => {
+            TurnAuthRefreshRoute::XaiSession
+        }
+        (_, xai_chat_state::AuthType::ApiKey) => TurnAuthRefreshRoute::ConfigApiKey,
+    }
+}
 /// Run a tool call; on an auth-shaped failure, attempt recovery via
 /// `AuthManager` and one retry. When `shared_recovery` is `Some`, concurrent
 /// 401s in the same batch deduplicate via `OnceCell::get_or_init`.
@@ -135,14 +157,41 @@ impl SessionActor {
     /// parent turn actually sends. `defs` is the already-resolved tool list
     /// (`prepare_tool_definitions_*`); this applies only the `web_search` drop
     /// under backend search and the `ToolSpec::from` mapping.
-    pub(crate) fn turn_base_tool_specs(&self, defs: &[ToolDefinition]) -> Vec<ToolSpec> {
+    pub(crate) fn turn_base_tool_specs(
+        &self,
+        defs: &[ToolDefinition],
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> Vec<ToolSpec> {
         let use_backend_search =
             self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
         defs.iter()
-            .filter(|td| !use_backend_search || td.function.name != "web_search")
+            .filter(|td| {
+                self.local_tool_allowed_for_provider(&td.function.name, provider)
+                    && (!use_backend_search || td.function.name != "web_search")
+            })
             .cloned()
             .map(ToolSpec::from)
             .collect()
+    }
+
+    /// Keep provider-specific local tools out of Codex requests and Code Mode
+    /// dispatch. Search may cross providers only through an explicit
+    /// non-default model route; xAI media tools have no equivalent explicit
+    /// provider-neutral opt-in and stay xAI-only.
+    pub(crate) fn local_tool_allowed_for_provider(
+        &self,
+        tool_name: &str,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> bool {
+        if provider != xai_grok_sampling_types::ModelProvider::Codex {
+            return true;
+        }
+        match tool_name {
+            "web_search" => !self.rebuild_spec.implicit_local_web_search,
+            "image_gen" | "image_edit" | "image_to_video" | "reference_to_video" => false,
+            "memory_search" | "memory_get" => self.memory.provider_access_enabled(),
+            _ => true,
+        }
     }
     pub(super) async fn prepare_tool_definitions_inner(&self) -> Vec<ToolDefinition> {
         let bridge = self.agent.borrow().tool_bridge().clone();
@@ -277,7 +326,8 @@ impl SessionActor {
             SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
         let use_bearer_resolver = gate.active();
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
-        let auth_scheme = model_facts.auth_scheme;
+        let auth_scheme =
+            crate::agent::config::effective_auth_scheme(cfg.provider, model_facts.auth_scheme);
         let mut extra_headers = cfg.extra_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
@@ -314,6 +364,11 @@ impl SessionActor {
         let provider = cfg.provider;
         let use_codex_bearer_resolver = provider == xai_grok_sampling_types::ModelProvider::Codex
             && creds.auth_type == xai_chat_state::AuthType::SessionToken;
+        let codex_bearer_resolver = use_codex_bearer_resolver.then(|| {
+            std::sync::Arc::new(crate::codex_auth::CodexBearerResolver::from_headers(
+                &extra_headers,
+            )) as xai_grok_sampler::SharedBearerResolver
+        });
         SamplingConfig {
             api_key: creds.api_key,
             base_url: cfg.base_url,
@@ -332,7 +387,9 @@ impl SessionActor {
             max_retries: Some(self.max_retries),
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,
-            client_identifier: self.client_identifier.clone(),
+            client_identifier: (provider == xai_grok_sampling_types::ModelProvider::Xai)
+                .then(|| self.client_identifier.clone())
+                .flatten(),
             deployment_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
                 .then(|| {
                     crate::managed_config::resolve_deployment_id(
@@ -356,8 +413,9 @@ impl SessionActor {
                 self.attribution_callback.clone()
             },
             bearer_resolver: if use_codex_bearer_resolver {
-                Some(std::sync::Arc::new(crate::codex_auth::CodexBearerResolver))
-            } else if use_bearer_resolver {
+                codex_bearer_resolver
+            } else if provider == xai_grok_sampling_types::ModelProvider::Xai && use_bearer_resolver
+            {
                 self.auth_manager
                     .as_ref()
                     .map(|am| -> xai_grok_sampler::SharedBearerResolver {
@@ -577,17 +635,27 @@ impl SessionActor {
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
         self.sampler_handle.update_config(sampler_config);
     }
-    fn log_terminal_failure(&self, error_type: &str, status_code: Option<u16>, message: &str) {
-        let auth = self
-            .auth_manager
-            .as_ref()
-            .and_then(|am| am.current_or_expired());
+    fn log_terminal_failure(
+        &self,
+        error_type: &str,
+        status_code: Option<u16>,
+        message: &str,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) {
+        let auth = (provider == xai_grok_sampling_types::ModelProvider::Xai)
+            .then(|| {
+                self.auth_manager
+                    .as_ref()
+                    .and_then(|am| am.current_or_expired())
+            })
+            .flatten();
         let reauthable = is_reauthable_failure(Some(error_type), message);
         xai_grok_telemetry::unified_log::warn(
             "turn.terminal_failure",
             Some(self.session_info.id.0.as_ref()),
             Some(serde_json::json!(
                 { "error_type" : error_type, "status_code" : status_code,
+                "provider" : format!("{provider:?}"),
                 "reauthable" : reauthable, "auth_mode" : auth.as_ref().map(| a |
                 format!("{:?}", a.auth_mode)), "key_prefix" : auth.as_ref().map(| a |
                 crate ::auth::token_suffix(& a.key).to_owned()), "expires_at" : auth
@@ -600,7 +668,21 @@ impl SessionActor {
         self: &Arc<Self>,
         error: xai_grok_sampler::SamplingErrorInfo,
     ) -> Result<SamplerFailureRecovery, acp::Error> {
+        self.handle_sampling_failure_with_policy(error, true).await
+    }
+
+    pub(super) async fn handle_sampling_failure_with_policy(
+        self: &Arc<Self>,
+        error: xai_grok_sampler::SamplingErrorInfo,
+        codex_auth_refresh_allowed: bool,
+    ) -> Result<SamplerFailureRecovery, acp::Error> {
         use xai_grok_sampler::SamplingErrorKind;
+        let request_config = self.chat_state_handle.get_sampling_config().await;
+        let request_provider = request_config
+            .as_ref()
+            .map(|config| config.provider)
+            .unwrap_or_default();
+        let request_auth_type = self.chat_state_handle.get_credentials().await.auth_type;
         if self.should_compact_on_error(&error).await {
             let cw = error
                 .model_metadata
@@ -636,7 +718,12 @@ impl SessionActor {
             let friendly = "This session's conversation history is incompatible \
                             with the current model. Please start a new session."
                 .to_string();
-            self.log_terminal_failure("encrypted_content_mismatch", error.status_code, &friendly);
+            self.log_terminal_failure(
+                "encrypted_content_mismatch",
+                error.status_code,
+                &friendly,
+                request_provider,
+            );
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Failed {
                     error_type: "encrypted_content_mismatch".to_string(),
@@ -647,7 +734,12 @@ impl SessionActor {
             return Err(acp::Error::invalid_params().data(friendly));
         }
         if matches!(error.kind, SamplingErrorKind::RateLimited) {
-            self.log_terminal_failure("rate_limited", error.status_code, &detailed_message);
+            self.log_terminal_failure(
+                "rate_limited",
+                error.status_code,
+                &detailed_message,
+                request_provider,
+            );
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Exhausted {
                     attempts: 0,
@@ -663,36 +755,50 @@ impl SessionActor {
             .data(detailed_message);
             return Err(acp_err);
         }
-        let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
-            let (model_id, base_url) = self
-                .chat_state_handle
-                .get_sampling_config()
-                .await
-                .map(|c| (c.model, c.base_url))
-                .unwrap_or_default();
-            let gate = self.auth_gate(&model_id, &base_url);
-            let eligible = gate.active();
-            self.log_auth_gate_unknown("handle_sampling_failure", gate, &base_url);
-            if !eligible {
-                tracing::warn!(
-                    session_id = % self.session_info.id.0, is_session_based = gate
-                    .is_session_based, model_byok = gate.model_byok.as_str(),
-                    endpoint_is_first_party = gate.endpoint_is_first_party,
-                    "auth recovery: sampler 401 not refreshable (api-key auth) — surfacing 401",
-                );
-                xai_grok_telemetry::unified_log::warn(
-                    "auth recovery: sampler 401 not eligible (api-key auth)",
-                    Some(self.session_info.id.0.as_ref()),
-                    Some(serde_json::json!(
-                        { "kind" : error.kind.as_str(), "status_code" : error
-                        .status_code, "is_session_based" : gate.is_session_based,
-                        "model_byok" : gate.model_byok.as_str(),
-                        "endpoint_is_first_party" : gate.endpoint_is_first_party, }
-                    )),
-                );
-            }
-            eligible
-        };
+        let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth)
+            && match request_provider {
+                xai_grok_sampling_types::ModelProvider::Codex => {
+                    let eligible = request_auth_type == xai_chat_state::AuthType::SessionToken
+                        && codex_auth_refresh_allowed;
+                    if !eligible {
+                        tracing::warn!(
+                            session_id = % self.session_info.id.0,
+                            auth_type = ?request_auth_type,
+                            codex_auth_refresh_allowed,
+                            "Codex auth recovery unavailable; surfacing 401",
+                        );
+                    }
+                    eligible
+                }
+                xai_grok_sampling_types::ModelProvider::Xai => {
+                    let (model_id, base_url) = request_config
+                        .as_ref()
+                        .map(|config| (config.model.as_str(), config.base_url.as_str()))
+                        .unwrap_or_default();
+                    let gate = self.auth_gate(model_id, base_url);
+                    let eligible = gate.active();
+                    self.log_auth_gate_unknown("handle_sampling_failure", gate, base_url);
+                    if !eligible {
+                        tracing::warn!(
+                            session_id = % self.session_info.id.0, is_session_based = gate
+                            .is_session_based, model_byok = gate.model_byok.as_str(),
+                            endpoint_is_first_party = gate.endpoint_is_first_party,
+                            "auth recovery: sampler 401 not refreshable (api-key auth) — surfacing 401",
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "auth recovery: sampler 401 not eligible (api-key auth)",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!(
+                                { "kind" : error.kind.as_str(), "status_code" : error
+                                .status_code, "is_session_based" : gate.is_session_based,
+                                "model_byok" : gate.model_byok.as_str(),
+                                "endpoint_is_first_party" : gate.endpoint_is_first_party, }
+                            )),
+                        );
+                    }
+                    eligible
+                }
+            };
         if !matches!(error.kind, SamplingErrorKind::Auth) && error.status_code == Some(401) {
             xai_grok_telemetry::unified_log::warn(
                 "auth recovery: sampler 401 not eligible (non-auth error kind)",
@@ -704,6 +810,38 @@ impl SessionActor {
             );
         }
         if auth_recovery_eligible
+            && request_provider == xai_grok_sampling_types::ModelProvider::Codex
+        {
+            match crate::codex_auth::force_refresh().await {
+                Ok(Some(credentials)) => {
+                    if self.update_codex_chat_credentials(Some(credentials)).await {
+                        self.prepare_sampler_for_turn().await;
+                        return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                            provider: request_provider,
+                        });
+                    }
+                    tracing::warn!(
+                        session_id = % self.session_info.id.0,
+                        "Codex auth recovery rejected an account identity change"
+                    );
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        session_id = % self.session_info.id.0,
+                        "Codex auth recovery failed: no isolated Codex account"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = % self.session_info.id.0,
+                        %error,
+                        "Codex auth recovery failed"
+                    );
+                }
+            }
+        }
+        if auth_recovery_eligible
+            && request_provider == xai_grok_sampling_types::ModelProvider::Xai
             && crate::auth::devbox_login::is_devbox_environment()
             && let Some(ref am) = self.auth_manager
         {
@@ -714,7 +852,9 @@ impl SessionActor {
                         "auth recovery: sampler 401, devbox re-mint, retrying"
                     );
                     self.prepare_sampler_for_turn().await;
-                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                        provider: request_provider,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -729,7 +869,10 @@ impl SessionActor {
                 }
             }
         }
-        if auth_recovery_eligible && let Some(ref am) = self.auth_manager {
+        if auth_recovery_eligible
+            && request_provider == xai_grok_sampling_types::ModelProvider::Xai
+            && let Some(ref am) = self.auth_manager
+        {
             if am
                 .try_recover_unauthorized(crate::auth::recovery::RecoverySource::Turn)
                 .await
@@ -744,7 +887,9 @@ impl SessionActor {
                     None,
                 );
                 self.prepare_sampler_for_turn().await;
-                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                    provider: request_provider,
+                });
             }
             tracing::warn!(
                 session_id = % self.session_info.id.0,
@@ -788,9 +933,18 @@ impl SessionActor {
             .and_then(|am| am.current())
             .map(|a| a.auth_mode)
             .unwrap_or(crate::auth::AuthMode::ApiKey);
-        let auth_mode_str = format!("{auth_mode:?}");
+        let auth_mode_str = if request_provider == xai_grok_sampling_types::ModelProvider::Codex {
+            match request_auth_type {
+                xai_chat_state::AuthType::SessionToken => "CodexOAuth".to_owned(),
+                xai_chat_state::AuthType::ApiKey => "ApiKey".to_owned(),
+            }
+        } else {
+            format!("{auth_mode:?}")
+        };
         let client_version = xai_grok_version::VERSION;
-        if auth_mode == crate::auth::AuthMode::WebLogin {
+        if request_provider == xai_grok_sampling_types::ModelProvider::Xai
+            && auth_mode == crate::auth::AuthMode::WebLogin
+        {
             let msg = format!(
                 "{detailed_message}\n\n\
                  You are using a deprecated authentication method (WebLogin).\n\
@@ -798,7 +952,7 @@ impl SessionActor {
                  To fix: run `grok logout` then `grok login` to re-authenticate with OAuth2.\n\n\
                  Version: {client_version}"
             );
-            self.log_terminal_failure("legacy_auth", error.status_code, &msg);
+            self.log_terminal_failure("legacy_auth", error.status_code, &msg, request_provider);
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Failed {
                     error_type: "legacy_auth".to_string(),
@@ -841,6 +995,12 @@ impl SessionActor {
                 ));
                 msg.push_str("\n  Switch models with /model or start a new session.");
             }
+            if is_auth_401
+                && request_provider == xai_grok_sampling_types::ModelProvider::Codex
+                && request_auth_type == xai_chat_state::AuthType::SessionToken
+            {
+                msg.push_str("\n\n  Reconnect with `grok login --codex`.");
+            }
             msg
         } else {
             detailed_message
@@ -850,7 +1010,12 @@ impl SessionActor {
         } else {
             error.kind.as_str()
         };
-        self.log_terminal_failure(error_type, error.status_code, &detailed_message);
+        self.log_terminal_failure(
+            error_type,
+            error.status_code,
+            &detailed_message,
+            request_provider,
+        );
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type: error_type.to_string(),
@@ -881,6 +1046,7 @@ impl SessionActor {
     pub(crate) async fn run_turn_via_sampler(
         self: &Arc<Self>,
         request: ConversationRequest,
+        codex_auth_refresh_allowed: bool,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         self.prepare_sampler_for_turn().await;
         let stream_drained_rx = {
@@ -922,43 +1088,130 @@ impl SessionActor {
             Err(rich_err) => {
                 self.turn_stream_drained.lock().take();
                 let info = xai_grok_sampler::SamplingErrorInfo::from(&rich_err);
-                match self.handle_sampling_failure(info).await? {
+                match self
+                    .handle_sampling_failure_with_policy(info, codex_auth_refresh_allowed)
+                    .await?
+                {
                     SamplerFailureRecovery::CompactAndResubmit => {
                         Ok(SamplerTurnOutcome::CompactAndResubmit)
                     }
-                    SamplerFailureRecovery::RefreshAuthAndResubmit => {
-                        Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)
+                    SamplerFailureRecovery::RefreshAuthAndResubmit { provider } => {
+                        Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { provider })
                     }
                 }
             }
         }
     }
+    pub(super) async fn update_codex_chat_credentials(
+        &self,
+        credentials: Option<crate::codex_auth::CodexCredentials>,
+    ) -> bool {
+        let mut adopted_identity = false;
+        if let Some(credentials) = credentials.as_ref() {
+            let Some(mut sampling_config) = self.chat_state_handle.get_sampling_config().await
+            else {
+                return false;
+            };
+            match crate::codex_auth::credentials_match_identity_anchor(
+                &sampling_config.extra_headers,
+                credentials,
+            ) {
+                Some(true) => {}
+                Some(false) => {
+                    let mut chat_credentials = self.chat_state_handle.get_credentials().await;
+                    chat_credentials.api_key = None;
+                    chat_credentials.auth_type = xai_chat_state::AuthType::SessionToken;
+                    self.chat_state_handle.update_credentials(chat_credentials);
+                    return false;
+                }
+                None => {
+                    // A session started before Codex login adopts the first
+                    // authenticated identity exactly once. Later account or
+                    // workspace changes fail closed against this anchor.
+                    crate::codex_auth::set_oauth_identity_anchor(
+                        &mut sampling_config.extra_headers,
+                        Some(credentials),
+                    );
+                    self.chat_state_handle
+                        .update_sampling_config(sampling_config);
+                    adopted_identity = true;
+                }
+            }
+        }
+        let mut chat_credentials = self.chat_state_handle.get_credentials().await;
+        let has_access_token = credentials.is_some();
+        let access_token = credentials
+            .as_ref()
+            .map(|credentials| credentials.access_token.clone());
+        if chat_credentials.api_key != access_token
+            || chat_credentials.auth_type != xai_chat_state::AuthType::SessionToken
+        {
+            chat_credentials.api_key = access_token;
+            chat_credentials.auth_type = xai_chat_state::AuthType::SessionToken;
+            self.chat_state_handle.update_credentials(chat_credentials);
+        }
+        if has_access_token && adopted_identity {
+            let bearer_resolver = std::sync::Arc::new(
+                crate::codex_auth::CodexBearerResolver::from_credentials(credentials.as_ref()),
+            ) as xai_grok_sampler::SharedBearerResolver;
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::RefreshCodexSummaryAuth { bearer_resolver });
+        }
+        has_access_token
+    }
     /// Proactively refresh the auth token if near expiry.
     pub(super) async fn refresh_token_if_expired(&self) {
-        if let Some(ref am) = self.auth_manager {
-            let creds = self.chat_state_handle.get_credentials().await;
-            let (model_id, base_url) = self
-                .chat_state_handle
-                .get_sampling_config()
-                .await
-                .map(|c| (c.model, c.base_url))
-                .unwrap_or_default();
-            if self.auth_gate(&model_id, &base_url).active()
-                && let Ok(key) = am.get_valid_token().await
-            {
-                if creds.api_key.as_deref() != Some(&key) {
-                    let mut creds = creds;
-                    creds.api_key = Some(key);
-                    self.chat_state_handle.update_credentials(creds);
-                }
+        let mut creds = self.chat_state_handle.get_credentials().await;
+        let sampling_config = self.chat_state_handle.get_sampling_config().await;
+        let provider = sampling_config
+            .as_ref()
+            .map(|config| config.provider)
+            .unwrap_or_default();
+
+        match turn_auth_refresh_route(provider, creds.auth_type) {
+            TurnAuthRefreshRoute::CodexOAuth => {
+                let credentials = match crate::codex_auth::fresh_credentials().await {
+                    Ok(credentials) => credentials,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "Codex OAuth preflight refresh failed; using isolated cached token"
+                        );
+                        crate::codex_auth::load_credentials().ok().flatten()
+                    }
+                };
+                // `None` is intentional after Codex logout or an unreadable
+                // auth store: it prevents the sampler's static Authorization
+                // fallback from retaining any prior-provider token.
+                self.update_codex_chat_credentials(credentials).await;
                 return;
             }
-        } else {
-            xai_grok_telemetry::unified_log::debug(
-                "token refresh skipped: no auth manager",
-                Some(self.session_info.id.0.as_ref()),
-                None,
-            );
+            TurnAuthRefreshRoute::XaiSession => {
+                let Some(ref am) = self.auth_manager else {
+                    xai_grok_telemetry::unified_log::debug(
+                        "xAI token refresh skipped: no auth manager",
+                        Some(self.session_info.id.0.as_ref()),
+                        None,
+                    );
+                    return;
+                };
+                let (model_id, base_url) = sampling_config
+                    .as_ref()
+                    .map(|config| (config.model.as_str(), config.base_url.as_str()))
+                    .unwrap_or_default();
+                if self.auth_gate(model_id, base_url).active()
+                    && let Ok(key) = am.get_valid_token().await
+                {
+                    if creds.api_key.as_deref() != Some(&key) {
+                        creds.api_key = Some(key);
+                        self.chat_state_handle.update_credentials(creds);
+                    }
+                    return;
+                }
+            }
+            TurnAuthRefreshRoute::ConfigApiKey => {}
         }
         use crate::auth::{is_jwt_expired_or_near, parse_jwt_expiration};
         const REFRESH_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);

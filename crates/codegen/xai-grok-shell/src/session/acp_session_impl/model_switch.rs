@@ -11,6 +11,10 @@ impl SessionActor {
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
     ) -> Result<acp::ModelId, acp::Error> {
+        // Close the cumulative xAI export boundary synchronously before any
+        // state mutation, await, or telemetry task can observe Codex content.
+        self.feedback_manager
+            .observe_provider(sampling_config.provider);
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
@@ -30,6 +34,7 @@ impl SessionActor {
         self.compaction
             .threshold_percent
             .set(auto_compact_threshold_percent);
+        self.memory.active_provider.set(sampling_config.provider);
         self.supports_backend_search
             .set(sampling_config.supports_backend_search);
         self.compactions_remaining
@@ -78,8 +83,8 @@ impl SessionActor {
         self.chat_state_handle
             .update_credentials(xai_chat_state::Credentials {
                 api_key: sampling_config.api_key.clone(),
-                auth_type: crate::agent::config::resolve_chat_state_auth_type(
-                    sampling_config.model.as_str(),
+                auth_type: crate::agent::config::resolve_chat_state_auth_type_for_sampling_config(
+                    &sampling_config,
                     session_key.as_deref(),
                     existing.auth_type,
                 ),
@@ -122,6 +127,7 @@ impl SessionActor {
             .persistence_tx
             .send(PersistenceMsg::CurrentModel {
                 model_id: model_id.clone(),
+                provider: sampling_config.provider,
                 agent_name: Some(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
             });

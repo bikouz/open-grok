@@ -535,6 +535,10 @@ pub trait StorageAdapter: Send + Sync {
         reasoning_effort: Option<Option<ReasoningEffort>>,
     ) -> io::Result<()>;
 
+    /// Persist the monotonic marker that this session has carried Codex
+    /// content. Implementations must never clear an existing marker.
+    async fn mark_ever_used_codex(&self, info: &Info) -> io::Result<()>;
+
     /// Update the collection ID for telemetry tracing
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()>;
 

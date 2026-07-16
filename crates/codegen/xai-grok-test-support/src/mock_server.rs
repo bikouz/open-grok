@@ -86,6 +86,7 @@ impl RequestLog {
 }
 
 type ScriptQueues = Arc<std::sync::Mutex<HashMap<String, VecDeque<ScriptedResponse>>>>;
+type AgentTurnScriptQueue = Arc<std::sync::Mutex<VecDeque<ScriptedResponse>>>;
 
 /// A model entry for the mock `/v1/models` endpoint.
 #[derive(Debug, Clone)]
@@ -298,6 +299,8 @@ pub struct MockInferenceServer {
     settings: Arc<std::sync::RwLock<Option<Value>>>,
     response_mode: Arc<std::sync::RwLock<ResponseMode>>,
     scripted: ScriptQueues,
+    /// Scripted responses consumed only by tool-bearing agent turns.
+    scripted_agent_turns: AgentTurnScriptQueue,
     /// Per-agent-turn assistant texts (see [`set_agent_turns`]).
     ///
     /// [`set_agent_turns`]: Self::set_agent_turns
@@ -348,6 +351,8 @@ impl MockInferenceServer {
         let shared_settings = Arc::new(std::sync::RwLock::new(None::<Value>));
         let response_mode = Arc::new(std::sync::RwLock::new(ResponseMode::Echo));
         let scripted: ScriptQueues = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let scripted_agent_turns: AgentTurnScriptQueue =
+            Arc::new(std::sync::Mutex::new(VecDeque::new()));
         let agent_turns = Arc::new(std::sync::Mutex::new(VecDeque::new()));
         let messages_stop_reason = Arc::new(std::sync::RwLock::new("end_turn".to_string()));
         let chunk_delay = Arc::new(std::sync::RwLock::new(None::<Duration>));
@@ -360,6 +365,7 @@ impl MockInferenceServer {
             shared_settings.clone(),
             response_mode.clone(),
             scripted.clone(),
+            scripted_agent_turns.clone(),
             agent_turns.clone(),
             messages_stop_reason.clone(),
             chunk_delay.clone(),
@@ -401,6 +407,7 @@ impl MockInferenceServer {
             settings: shared_settings,
             response_mode,
             scripted,
+            scripted_agent_turns,
             agent_turns,
             messages_stop_reason,
             chunk_delay,
@@ -436,6 +443,17 @@ impl MockInferenceServer {
             .unwrap()
             .entry(path.into())
             .or_default()
+            .push_back(response);
+    }
+
+    /// Queue a [`ScriptedResponse`] for the next tool-bearing agent turn on
+    /// any inference endpoint. Auxiliary requests such as title generation
+    /// never consume this queue.
+    pub fn enqueue_agent_turn_response(&self, response: ScriptedResponse) {
+        response.validate();
+        self.scripted_agent_turns
+            .lock()
+            .unwrap()
             .push_back(response);
     }
 
@@ -691,17 +709,28 @@ impl MockInferenceServer {
             .and_then(VecDeque::pop_front)
     }
 
+    fn is_agent_turn(body: &Value) -> bool {
+        body.get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| tools.len() >= 2)
+    }
+
+    fn pop_scripted_agent_turn(
+        scripted_agent_turns: &AgentTurnScriptQueue,
+        body: &Value,
+    ) -> Option<ScriptedResponse> {
+        Self::is_agent_turn(body)
+            .then(|| scripted_agent_turns.lock().unwrap().pop_front())
+            .flatten()
+    }
+
     /// Pop the next scripted turn, gated to agent turns (2+ tools) so aux
     /// requests don't consume one.
     fn pop_agent_turn(
         agent_turns: &Arc<std::sync::Mutex<VecDeque<String>>>,
         body: &Value,
     ) -> Option<String> {
-        let tool_count = body
-            .get("tools")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        if tool_count < 2 {
+        if !Self::is_agent_turn(body) {
             return None;
         }
         agent_turns.lock().unwrap().pop_front()
@@ -732,6 +761,7 @@ impl MockInferenceServer {
         settings: Arc<std::sync::RwLock<Option<Value>>>,
         response_mode: Arc<std::sync::RwLock<ResponseMode>>,
         scripted: ScriptQueues,
+        scripted_agent_turns: AgentTurnScriptQueue,
         agent_turns: Arc<std::sync::Mutex<VecDeque<String>>>,
         messages_stop_reason: Arc<std::sync::RwLock<String>>,
         chunk_delay: Arc<std::sync::RwLock<Option<Duration>>>,
@@ -753,6 +783,9 @@ impl MockInferenceServer {
         let scripted_rs = scripted.clone();
         let scripted_settings = scripted.clone();
         let scripted_msg = scripted;
+        let scripted_agent_turns_cc = scripted_agent_turns.clone();
+        let scripted_agent_turns_rs = scripted_agent_turns.clone();
+        let scripted_agent_turns_msg = scripted_agent_turns;
         let delay_cc = chunk_delay.clone();
         let delay_rs = chunk_delay.clone();
         let delay_msg = chunk_delay;
@@ -765,6 +798,7 @@ impl MockInferenceServer {
                     let required = token_cc.clone();
                     let mode = mode_cc.clone();
                     let scripted = scripted_cc.clone();
+                    let scripted_agent_turns = scripted_agent_turns_cc.clone();
                     let agent_turns = agent_turns.clone();
                     let delay = delay_cc.clone();
                     let completion_gate = completion_gate.clone();
@@ -777,6 +811,11 @@ impl MockInferenceServer {
                             auth.as_deref(),
                             Self::headers_vec(&headers),
                         );
+
+                        if let Some(s) = Self::pop_scripted_agent_turn(&scripted_agent_turns, &body)
+                        {
+                            return s.into_response_paced(*delay.read().unwrap());
+                        }
 
                         if let Some(s) = Self::pop_scripted(&scripted, "/v1/chat/completions") {
                             return s.into_response_paced(*delay.read().unwrap());
@@ -839,6 +878,7 @@ impl MockInferenceServer {
                     let required = token_rs.clone();
                     let mode = mode_rs.clone();
                     let scripted = scripted_rs.clone();
+                    let scripted_agent_turns = scripted_agent_turns_rs.clone();
                     let delay = delay_rs.clone();
                     async move {
                         let auth = Self::extract_auth(&headers);
@@ -849,6 +889,11 @@ impl MockInferenceServer {
                             auth.as_deref(),
                             Self::headers_vec(&headers),
                         );
+
+                        if let Some(s) = Self::pop_scripted_agent_turn(&scripted_agent_turns, &body)
+                        {
+                            return s.into_response_paced(*delay.read().unwrap());
+                        }
 
                         if let Some(s) = Self::pop_scripted(&scripted, "/v1/responses") {
                             return s.into_response_paced(*delay.read().unwrap());
@@ -916,6 +961,7 @@ impl MockInferenceServer {
                     let required = token_msg.clone();
                     let mode = mode_msg.clone();
                     let scripted = scripted_msg.clone();
+                    let scripted_agent_turns = scripted_agent_turns_msg.clone();
                     let stop_reason = messages_stop_reason.clone();
                     let delay = delay_msg.clone();
                     async move {
@@ -927,6 +973,11 @@ impl MockInferenceServer {
                             auth.as_deref(),
                             Self::headers_vec(&headers),
                         );
+
+                        if let Some(s) = Self::pop_scripted_agent_turn(&scripted_agent_turns, &body)
+                        {
+                            return s.into_response_paced(*delay.read().unwrap());
+                        }
 
                         if let Some(s) = Self::pop_scripted(&scripted, "/v1/messages") {
                             return s.into_response_paced(*delay.read().unwrap());

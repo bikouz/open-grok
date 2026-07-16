@@ -100,6 +100,31 @@ impl SummaryGenerator {
     pub(crate) fn mark_done(&mut self) {
         self.state = State::Done;
     }
+
+    /// Provider used by this frozen auxiliary client. Title generation is
+    /// allowed only while it matches the session's active provider.
+    pub(crate) fn provider(&self) -> xai_grok_sampling_types::ModelProvider {
+        self.config.sampling_client.provider()
+    }
+
+    /// Bind a frozen Codex OAuth client after the owning session adopts its
+    /// first identity. Only the resolver changes: the configured auxiliary
+    /// model, endpoint, and headers stay intact, while BYOK clients (which have
+    /// no live resolver) remain authoritative.
+    pub(crate) fn refresh_codex_bearer_resolver(
+        &mut self,
+        bearer_resolver: xai_grok_sampler::SharedBearerResolver,
+    ) {
+        if !matches!(self.state, State::Idle)
+            || self.config.sampling_client.provider()
+                != xai_grok_sampling_types::ModelProvider::Codex
+        {
+            return;
+        }
+        self.config
+            .sampling_client
+            .replace_bearer_resolver_if_present(bearer_resolver);
+    }
 }
 
 /// Notify the client that a session summary is available.

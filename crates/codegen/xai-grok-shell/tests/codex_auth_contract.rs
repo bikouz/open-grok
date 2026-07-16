@@ -1,6 +1,6 @@
 use chrono::Utc;
 use xai_grok_shell::codex_auth::{
-    CodexAuthStore, CodexTokenData, CodexUsageSnapshot,
+    CodexAuthStore, CodexTokenData, CodexTokenUsageStats, CodexUsageSnapshot,
 };
 
 #[test]
@@ -21,7 +21,25 @@ fn codex_auth_store_matches_codex_rust_json_shape() {
     assert!(json["OPENAI_API_KEY"].is_null());
     assert_eq!(json["tokens"]["access_token"], "access");
     assert_eq!(json["tokens"]["account_id"], "account-1");
-    assert_eq!(serde_json::from_value::<CodexAuthStore>(json).unwrap(), store);
+    assert_eq!(
+        serde_json::from_value::<CodexAuthStore>(json).unwrap(),
+        store
+    );
+}
+
+#[test]
+fn codex_token_usage_profile_matches_backend_shape() {
+    let stats: CodexTokenUsageStats = serde_json::from_value(serde_json::json!({
+        "lifetime_tokens": 123,
+        "peak_daily_tokens": 45,
+        "longest_running_turn_sec": 67,
+        "current_streak_days": 2,
+        "longest_streak_days": 5,
+        "daily_usage_buckets": [{"start_date": "2026-07-15", "tokens": 42}]
+    }))
+    .unwrap();
+    assert_eq!(stats.lifetime_tokens, Some(123));
+    assert_eq!(stats.daily_usage_buckets.unwrap()[0].tokens, 42);
 }
 
 #[test]
@@ -69,4 +87,8 @@ fn codex_usage_accepts_quota_windows_credits_and_extra_limits() {
         Some(50.0)
     );
     assert_eq!(usage.additional_rate_limits.len(), 1);
+
+    let no_additional_limits: CodexUsageSnapshot =
+        serde_json::from_value(serde_json::json!({"additional_rate_limits": null})).unwrap();
+    assert!(no_additional_limits.additional_rate_limits.is_empty());
 }

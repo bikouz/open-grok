@@ -690,6 +690,7 @@ impl SessionActor {
         let (describe_model, sampler_config) =
             crate::agent::config::finalize_image_describe_sampler_config(
                 resolved_describe,
+                &self.image_description_model,
                 &active_session_config,
                 self.client_identifier.clone(),
                 Some(self.max_retries),

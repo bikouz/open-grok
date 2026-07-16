@@ -184,7 +184,7 @@ impl SessionActor {
             }
         };
         let tool_defs = self.prepare_tool_definitions().await;
-        let tools = self.turn_base_tool_specs(&tool_defs);
+        let tools = self.turn_base_tool_specs(&tool_defs, sampling_config.provider);
         let (hosted_tools, wall_clock_budget_secs) = {
             let agent = self.agent.borrow();
             let use_backend_search =
@@ -1412,20 +1412,24 @@ impl SessionActor {
                     _ => None,
                 }
             };
-        let memory_backend_impl = {
-            let g = self.memory.storage.borrow();
-            g.as_ref()
-                .zip(self.memory.backend_params.as_ref())
-                .map(|(storage, params)| {
-                    crate::session::memory::MemoryBackendImpl::from_session_params(
-                        storage.clone(),
-                        &crate::session::memory::MemoryBackendParams {
-                            search_source: "compaction_recovery",
-                            ..params.clone()
-                        },
-                    )
-                })
-        };
+        let memory_backend_impl = self
+            .memory
+            .is_enabled()
+            .then(|| {
+                let g = self.memory.storage.borrow();
+                g.as_ref()
+                    .zip(self.memory.backend_params.as_ref())
+                    .map(|(storage, params)| {
+                        crate::session::memory::MemoryBackendImpl::from_session_params(
+                            storage.clone(),
+                            &crate::session::memory::MemoryBackendParams {
+                                search_source: "compaction_recovery",
+                                ..params.clone()
+                            },
+                        )
+                    })
+            })
+            .flatten();
         let memory_opt_out = false;
         let memory_ref: Option<&dyn xai_grok_tools::types::memory_backend::MemoryBackend> =
             if memory_opt_out {
@@ -2256,6 +2260,8 @@ mod inline_auto_compact_flow_tests {
                 prefix_released: std::sync::atomic::AtomicBool::new(false),
             },
             memory: crate::session::memory_state::SessionMemory {
+                embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+                active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
                 flush_config: crate::config::MemoryFlushConfig::default(),
                 is_flushing: std::sync::atomic::AtomicBool::new(false),
                 last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
@@ -3059,6 +3065,8 @@ mod inline_auto_compact_flow_tests {
         )
         .await;
         actor.memory = crate::session::memory_state::SessionMemory {
+            embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+            active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: memory_config
                 .as_ref()
                 .map_or_else(Default::default, |mc| mc.flush.clone()),

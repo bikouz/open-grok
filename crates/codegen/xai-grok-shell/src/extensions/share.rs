@@ -66,6 +66,19 @@ async fn handle_share_session(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
         .find(|s| s.info.id.0.as_ref() == request.session_id.as_str())
         .ok_or_else(|| acp::Error::resource_not_found(Some("Session not found".into())))?;
 
+    let provider_boundary = agent
+        .sessions
+        .borrow()
+        .get(&acp::SessionId::new(request.session_id.clone()))
+        .map(|handle| handle.feedback_manager.provider_boundary());
+    let live_allows_xai_export = provider_boundary
+        .as_ref()
+        .is_none_or(|boundary| boundary.allows_xai_export());
+    if summary.ever_used_codex || !live_allows_xai_export {
+        return Err(acp::Error::invalid_params()
+            .data("Codex-backed sessions cannot be shared through xAI services."));
+    }
+
     // Get turn number from the summary we already loaded
     let current_turn = summary.next_trace_turn.saturating_sub(1);
 
@@ -96,8 +109,17 @@ async fn handle_share_session(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
             &exported.messages,
             &ctx.gcs_config,
             Some(agent.auth_manager.clone()),
+            provider_boundary.as_ref(),
         )
         .await;
+    }
+
+    if provider_boundary
+        .as_ref()
+        .is_some_and(|boundary| !boundary.allows_xai_export())
+    {
+        return Err(acp::Error::invalid_params()
+            .data("Session crossed the Codex provider boundary while sharing."));
     }
 
     // Upload to backend and get share URL.
@@ -136,7 +158,11 @@ async fn upload_share_data_to_gcs(
     messages: &[ExportedMessage],
     gcs_config: &crate::session::repo_changes::TraceExportConfig,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
+    provider_boundary: Option<&crate::session::persistence::ProviderBoundary>,
 ) {
+    if provider_boundary.is_some_and(|boundary| !boundary.allows_xai_export()) {
+        return;
+    }
     let data_json = match serde_json::to_vec(messages) {
         Ok(json) => json,
         Err(e) => {
@@ -153,6 +179,9 @@ async fn upload_share_data_to_gcs(
     let gcs_path = format!("share/{}_{}_data.json", session_id, timestamp);
 
     use crate::upload::gcs::WithAuth as _;
+    if provider_boundary.is_some_and(|boundary| !boundary.allows_xai_export()) {
+        return;
+    }
     if let Err(e) = xai_file_utils::gcs::upload_bytes_signed(
         &gcs_config.with_auth(auth_manager),
         &gcs_path,

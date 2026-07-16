@@ -213,7 +213,7 @@ pub(crate) struct SubagentSpawnContext {
     /// cross-session memory store.
     pub memory_config: Option<crate::config::MemoryConfig>,
     /// Resolved sampling config for web_search.
-    pub web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    pub web_search_sampling_config: Option<crate::agent::config::PreparedWebSearchSamplingConfig>,
     /// Resolved config for web fetch.
     pub web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     /// Image generation config (parent-inherited).
@@ -294,6 +294,12 @@ pub(crate) struct SubagentSpawnContext {
     pub gcs_bucket_url: Option<String>,
     /// GCS upload method (direct or proxy).
     pub gcs_upload_method: Option<crate::session::repo_changes::UploadMethod>,
+    /// Sticky export boundary shared with the parent session tree.
+    pub provider_boundary: crate::session::persistence::ProviderBoundary,
+    /// Direct channel used to persist provider use without changing the
+    /// parent's active model.
+    pub parent_persistence_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::session::persistence::PersistenceMsg>>,
     pub hook_registry: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
     #[expect(
         dead_code,
@@ -854,15 +860,17 @@ async fn resolve_effective_model_config(
     }
     resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
 }
-/// Truncate an API key to a safe prefix for logging.
-fn key_prefix(key: &Option<String>) -> String {
-    match key {
-        Some(k) => {
-            let len = k.len().min(8);
-            k[..len].to_string()
-        }
-        None => "<none>".to_string(),
-    }
+/// Non-secret credential metadata suitable for unified logs.
+///
+/// Never include token or key material here, even in truncated form: unified
+/// logs can outlive the credential and are routinely copied into diagnostics.
+fn sampling_auth_log_metadata(config: &xai_grok_sampler::SamplerConfig) -> serde_json::Value {
+    serde_json::json!({
+        "provider": format!("{:?}", config.provider),
+        "auth_scheme": format!("{:?}", config.auth_scheme),
+        "has_api_key": config.api_key.is_some(),
+        "has_bearer_resolver": config.bearer_resolver.is_some(),
+    })
 }
 /// Emit a unified log entry recording which model and credentials a subagent
 /// resolved to, and how they compare to the parent's.
@@ -873,8 +881,6 @@ fn log_subagent_model_resolution(
     resolved_id: &acp::ModelId,
     parent: &xai_grok_sampler::SamplerConfig,
 ) {
-    let child_key = key_prefix(&resolved.api_key);
-    let parent_key = key_prefix(&parent.api_key);
     let keys_match = resolved.api_key == parent.api_key;
     xai_grok_telemetry::unified_log::debug(
         "subagent model resolved",
@@ -882,9 +888,9 @@ fn log_subagent_model_resolution(
         Some(serde_json::json!(
             { "agent" : agent_name, "priority" : priority, "child_model" :
             resolved_id.0.as_ref(), "child_base_url" : & resolved.base_url,
-            "child_key_prefix" : child_key, "parent_model" : & parent.model,
-            "parent_base_url" : & parent.base_url, "parent_key_prefix" : parent_key,
-            "keys_match" : keys_match, }
+            "child_auth" : sampling_auth_log_metadata(resolved), "parent_model" : &
+            parent.model, "parent_base_url" : & parent.base_url, "parent_auth" :
+            sampling_auth_log_metadata(parent), "keys_match" : keys_match, }
         )),
     );
 }
@@ -897,18 +903,47 @@ fn log_subagent_model_resolution(
 async fn read_parent_sampling_config(
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+    struct AuthManagerBearerResolver(std::sync::Arc<crate::auth::AuthManager>);
+    impl std::fmt::Debug for AuthManagerBearerResolver {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AuthManagerBearerResolver").finish()
+        }
+    }
+    impl xai_grok_sampler::BearerResolver for AuthManagerBearerResolver {
+        fn current_bearer(&self) -> Option<String> {
+            self.0.current_or_expired().map(|auth| auth.key)
+        }
+    }
+
     if let Some(ref chat_state) = ctx.parent_chat_state {
         if let Some(cfg) = chat_state.get_sampling_config().await {
             let creds = chat_state.get_credentials().await;
+            let provider = cfg.provider;
+            let uses_session_token = creds.auth_type == xai_chat_state::AuthType::SessionToken;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
                 &mut extra_headers,
                 creds.alpha_test_key.as_deref(),
                 &cfg.base_url,
             );
-            let auth_scheme = crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                .map(|r| r.auth_scheme)
-                .unwrap_or_default();
+            let bearer_resolver: Option<xai_grok_sampler::SharedBearerResolver> =
+                match (provider, uses_session_token) {
+                    (xai_grok_sampling_types::ModelProvider::Codex, true) => {
+                        Some(std::sync::Arc::new(
+                            crate::codex_auth::CodexBearerResolver::from_headers(&extra_headers),
+                        ))
+                    }
+                    (xai_grok_sampling_types::ModelProvider::Xai, true) => Some(
+                        std::sync::Arc::new(AuthManagerBearerResolver(ctx.auth_manager.clone())),
+                    ),
+                    (_, false) => None,
+                };
+            let auth_scheme = crate::agent::config::effective_auth_scheme(
+                provider,
+                crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
+                    .map(|r| r.auth_scheme)
+                    .unwrap_or_default(),
+            );
             let inherited = xai_grok_sampler::SamplerConfig {
                 api_key: creds.api_key,
                 base_url: cfg.base_url,
@@ -917,7 +952,7 @@ async fn read_parent_sampling_config(
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
                 api_backend: cfg.api_backend,
-                provider: ctx.sampling_config.provider,
+                provider,
                 auth_scheme,
                 extra_headers,
                 context_window: cfg.context_window.get(),
@@ -927,17 +962,20 @@ async fn read_parent_sampling_config(
                 max_retries: None,
                 stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
                 idle_timeout_secs: None,
-                client_identifier: ctx.sampling_config.client_identifier.clone(),
-                deployment_id: ctx.sampling_config.deployment_id.clone(),
-                user_id: ctx.sampling_config.user_id.clone(),
+                client_identifier: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+                    .then(|| ctx.sampling_config.client_identifier.clone())
+                    .flatten(),
+                deployment_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+                    .then(|| ctx.sampling_config.deployment_id.clone())
+                    .flatten(),
+                user_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+                    .then(|| ctx.sampling_config.user_id.clone())
+                    .flatten(),
                 origin_client: ctx.sampling_config.origin_client.clone(),
-                attribution_callback: ctx.attribution_callback.clone(),
-                bearer_resolver: (ctx.sampling_config.provider
-                    == xai_grok_sampling_types::ModelProvider::Codex)
-                    .then(|| {
-                        std::sync::Arc::new(crate::codex_auth::CodexBearerResolver)
-                            as xai_grok_sampler::SharedBearerResolver
-                    }),
+                attribution_callback: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+                    .then(|| ctx.attribution_callback.clone())
+                    .flatten(),
+                bearer_resolver,
                 supports_backend_search: ctx
                     .models_manager
                     .model_supports_backend_search(ctx.model_id.0.as_ref()),
@@ -957,8 +995,8 @@ async fn read_parent_sampling_config(
                 None,
                 Some(serde_json::json!(
                     { "parent_model" : & inherited.model, "parent_base_url" : &
-                    inherited.base_url, "parent_key_prefix" : key_prefix(& inherited
-                    .api_key), "session_model_id" : model_id.0.as_ref(),
+                    inherited.base_url, "parent_auth" : sampling_auth_log_metadata(&
+                    inherited), "session_model_id" : model_id.0.as_ref(),
                     "global_model_id" : global_model_id.0.as_ref(), "source" :
                     "chat_state", }
                 )),
@@ -975,8 +1013,8 @@ async fn read_parent_sampling_config(
         None,
         Some(serde_json::json!(
             { "parent_model" : & ctx.sampling_config.model, "parent_base_url" : & ctx
-            .sampling_config.base_url, "parent_key_prefix" : key_prefix(& ctx
-            .sampling_config.api_key), "source" : "spawn_context_baseline",
+            .sampling_config.base_url, "parent_auth" : sampling_auth_log_metadata(& ctx
+            .sampling_config), "source" : "spawn_context_baseline",
             "has_chat_state" : ctx.parent_chat_state.is_some(), }
         )),
     );
@@ -1023,7 +1061,9 @@ fn resolve_model_override_to_config(
     let session_key = ctx.auth.as_ref().map(|a| a.key.as_str());
     let has_session_key = session_key.is_some();
     let mut credentials = resolve_credentials(&entry, session_key);
-    credentials.auth_type = subagent_auth_type(Some(&entry), &ctx.auth_method_id);
+    if entry.info().provider != xai_grok_sampling_types::ModelProvider::Codex {
+        credentials.auth_type = subagent_auth_type(Some(&entry), &ctx.auth_method_id);
+    }
     let resolved_auth_type = credentials.auth_type;
     let config = sampling_config_for_model(
         &entry,
@@ -1039,7 +1079,7 @@ fn resolve_model_override_to_config(
         Some(serde_json::json!(
             { "model_id" : model_id, "canonical_model" : canonical_model_id.0
             .as_ref(), "resolved_model_raw" : & config.model, "base_url" : & config
-            .base_url, "key_prefix" : key_prefix(& config.api_key),
+            .base_url, "resolved_auth" : sampling_auth_log_metadata(& config),
             "has_own_credentials" : entry.has_own_credentials(), "has_session_key" :
             has_session_key, "auth_type" : format!("{:?}", resolved_auth_type),
             "auth_method_id" : ctx.auth_method_id.0.as_ref(), }
@@ -2594,6 +2634,7 @@ struct GcsUploadContext {
     parent_prompt_id: Option<String>,
     depth: u32,
     auth_manager: std::sync::Arc<crate::auth::AuthManager>,
+    provider_boundary: crate::session::persistence::ProviderBoundary,
 }
 /// Persist the durable worktree `snapshot_ref` into the on-disk `meta.json`
 /// after completion, so `resumable_source_for` can rehydrate the disposed
@@ -2656,8 +2697,16 @@ fn update_subagent_meta_completed(dir: &Path, result: &SubagentResult, gcs_ctx: 
             let bucket = bucket.clone();
             let method = method.clone();
             let auth_for_spawn = gcs_ctx.auth_manager.clone();
+            let provider_boundary = gcs_ctx.provider_boundary.clone();
             tokio::spawn(async move {
-                upload_subagent_metadata(&gcs_meta, &bucket, method, auth_for_spawn).await;
+                upload_subagent_metadata(
+                    &gcs_meta,
+                    &bucket,
+                    method,
+                    auth_for_spawn,
+                    provider_boundary,
+                )
+                .await;
             });
         }
     }

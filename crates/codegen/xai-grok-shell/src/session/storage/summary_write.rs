@@ -76,6 +76,9 @@ pub(crate) struct TraceTurnPatch {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SummaryPatch {
     pub record_activity: bool,
+    /// Monotonic provider boundary: once Codex has been used this can never be
+    /// cleared by a stale or provider-local writer.
+    pub ever_used_codex: bool,
     pub messages: Option<CounterOp>,
     pub chat_messages: Option<CounterOp>,
     pub chat_format_version: Option<u8>,
@@ -103,6 +106,7 @@ impl Summary {
     /// propagate an auto-generated title to remote replicas; every other field
     /// always applies and is not reflected in the return value.
     pub(crate) fn apply_patch(&mut self, patch: &SummaryPatch, now: DateTime<Utc>) -> bool {
+        self.ever_used_codex |= patch.ever_used_codex;
         if patch.record_activity {
             // Monotonic: a stale concurrent writer can never move it backwards.
             self.last_active_at = Some(

@@ -334,6 +334,7 @@ mod tests {
             num_messages: 10,
             num_chat_messages: 5,
             current_model_id: acp::ModelId::new("test-model"),
+            ever_used_codex: false,
             parent_session_id: None,
             forked_at: None,
             collection_id: None,

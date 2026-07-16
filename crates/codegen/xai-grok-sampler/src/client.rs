@@ -580,6 +580,11 @@ impl SamplingClient {
                 .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header value"))?;
             headers.insert(header_name, header_value);
         }
+        if let Some(resolver) = &config.bearer_resolver {
+            for name in resolver.reserved_headers() {
+                headers.remove(*name);
+            }
+        }
 
         // x-grok-* headers are private xAI proxy metadata and must never be
         // synthesized for the Codex Responses endpoint. Explicit provider
@@ -648,6 +653,7 @@ impl SamplingClient {
             base_url = %config.base_url,
             model = %config.model,
             api_backend = ?config.api_backend,
+            provider = ?config.provider,
             auth_scheme = ?config.auth_scheme,
             // "unset" (not "none"): `ReasoningEffort::None` is a real wire value;
             // logging the absent Option as "none" looked like we were sending it.
@@ -686,50 +692,90 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
+    /// Provider selected when this client was constructed.
+    pub fn provider(&self) -> xai_grok_sampling_types::ModelProvider {
+        self.defaults.provider
+    }
+
+    /// Replace a live bearer resolver without rebuilding the client's model,
+    /// endpoint, or request defaults. Returns `false` when this client was
+    /// constructed with static credentials and therefore must not be upgraded
+    /// into session auth (for example, an explicit BYOK auxiliary model).
+    pub fn replace_bearer_resolver_if_present(
+        &mut self,
+        resolver: crate::config::SharedBearerResolver,
+    ) -> bool {
+        let Some(previous) = self.bearer_resolver.as_ref() else {
+            return false;
+        };
+        for name in previous
+            .reserved_headers()
+            .iter()
+            .chain(resolver.reserved_headers())
+        {
+            self.default_headers.remove(*name);
+        }
+        self.bearer_resolver = Some(resolver);
+        true
+    }
+
     /// POST with default headers. Overrides auth from resolver if wired.
     fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
         let mut headers = self.default_headers.clone();
-        if let Some(resolver) = &self.bearer_resolver
-            && let Some(fresh) = resolver.current_bearer()
-        {
-            match self.defaults.auth_scheme {
-                AuthScheme::XApiKey => {
-                    headers.remove(AUTHORIZATION);
-                    if let Ok(v) = HeaderValue::from_str(&fresh) {
-                        headers.insert(HeaderName::from_static("x-api-key"), v);
+        if let Some(resolver) = &self.bearer_resolver {
+            for name in resolver.reserved_headers() {
+                headers.remove(*name);
+            }
+            let resolved = resolver.current_auth();
+            if resolved.is_some() || resolver.fail_closed_on_missing() {
+                headers.remove(AUTHORIZATION);
+                headers.remove(HeaderName::from_static("x-api-key"));
+            }
+            if let Some(resolved) = resolved {
+                match self.defaults.auth_scheme {
+                    AuthScheme::XApiKey => {
+                        if let Ok(value) = HeaderValue::from_str(&resolved.bearer) {
+                            headers.insert(HeaderName::from_static("x-api-key"), value);
+                        }
+                    }
+                    AuthScheme::Bearer => {
+                        if let Ok(value) =
+                            HeaderValue::from_str(&format!("Bearer {}", resolved.bearer))
+                        {
+                            headers.insert(AUTHORIZATION, value);
+                        }
                     }
                 }
-                AuthScheme::Bearer => {
-                    headers.remove(HeaderName::from_static("x-api-key"));
-                    if let Ok(v) = HeaderValue::from_str(&format!("Bearer {fresh}")) {
-                        headers.insert(AUTHORIZATION, v);
+                for (name, value) in resolved.extra_headers {
+                    match (
+                        HeaderName::try_from(name.as_str()),
+                        HeaderValue::from_str(&value),
+                    ) {
+                        (Ok(name), Ok(value)) => {
+                            headers.insert(name, value);
+                        }
+                        _ => {
+                            tracing::warn!(
+                                header = %name,
+                                "live auth resolver returned an invalid provider header"
+                            );
+                        }
                     }
                 }
             }
         }
-        {
-            let auth_prefix = headers
-                .get(AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.chars().take(20).collect::<String>());
-            let x_api_key_prefix = headers
-                .get(HeaderName::from_static("x-api-key"))
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.chars().take(12).collect::<String>());
-            tracing::info!(
-                target: crate::sampling_log::TARGET,
-                event = "client_post",
-                base_url = %self.base_url,
-                model = %self.defaults.model,
-                api_backend = ?self.defaults.api_backend,
-                auth_scheme = ?self.defaults.auth_scheme,
-                has_bearer_resolver = self.bearer_resolver.is_some(),
-                has_authorization_header = headers.get(AUTHORIZATION).is_some(),
-                has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
-                auth_header_prefix = auth_prefix.as_deref().unwrap_or("none"),
-                x_api_key_prefix = x_api_key_prefix.as_deref().unwrap_or("none"),
-            );
-        }
+        tracing::info!(
+            target: crate::sampling_log::TARGET,
+            event = "client_post",
+            base_url = %self.base_url,
+            model = %self.defaults.model,
+            api_backend = ?self.defaults.api_backend,
+            provider = ?self.defaults.provider,
+            auth_scheme = ?self.defaults.auth_scheme,
+            has_bearer_resolver = self.bearer_resolver.is_some(),
+            has_authorization_header = headers.get(AUTHORIZATION).is_some(),
+            has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
+        );
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
         }
@@ -738,14 +784,18 @@ impl SamplingClient {
 
     /// Bearer prefix for 401 attribution. Prefers live resolver, falls back to default_headers.
     fn current_sent_bearer_prefix(&self) -> Option<String> {
-        self.bearer_resolver
-            .as_ref()
-            .and_then(|r| r.current_bearer())
-            .or_else(|| self.extract_sent_bearer())
-            .map(|mut s| {
-                s.truncate(crate::attribution::SENT_BEARER_PREFIX_LEN.min(s.len()));
-                s
-            })
+        let bearer = match self.bearer_resolver.as_ref() {
+            Some(resolver) => resolver.current_bearer().or_else(|| {
+                (!resolver.fail_closed_on_missing())
+                    .then(|| self.extract_sent_bearer())
+                    .flatten()
+            }),
+            None => self.extract_sent_bearer(),
+        };
+        bearer.map(|mut s| {
+            s.truncate(crate::attribution::SENT_BEARER_PREFIX_LEN.min(s.len()));
+            s
+        })
     }
 
     /// Extract the bearer from `default_headers`, truncated to prefix length.
@@ -2430,6 +2480,101 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct ScopedAuthResolver(Option<crate::config::ResolvedBearerAuth>);
+
+    impl crate::config::BearerResolver for ScopedAuthResolver {
+        fn current_bearer(&self) -> Option<String> {
+            self.0.as_ref().map(|auth| auth.bearer.clone())
+        }
+
+        fn current_auth(&self) -> Option<crate::config::ResolvedBearerAuth> {
+            self.0.clone()
+        }
+
+        fn reserved_headers(&self) -> &'static [&'static str] {
+            &["chatgpt-account-id", "x-openai-fedramp"]
+        }
+
+        fn fail_closed_on_missing(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn scoped_auth_snapshot_atomically_replaces_reserved_header_overrides() {
+        let mut provider_headers = IndexMap::new();
+        provider_headers.insert("ChatGPT-Account-ID".to_string(), "account-b".to_string());
+        provider_headers.insert("X-OpenAI-Fedramp".to_string(), "true".to_string());
+        let mut cfg = minimal_config();
+        cfg.provider = ModelProvider::Codex;
+        cfg.api_key = Some("stale-token-a".to_string());
+        cfg.extra_headers.insert(
+            "cHaTgPt-aCcOuNt-Id".to_string(),
+            "spoofed-account".to_string(),
+        );
+        cfg.extra_headers
+            .insert("x-OPENAI-fedramp".to_string(), "false".to_string());
+        cfg.bearer_resolver = Some(std::sync::Arc::new(ScopedAuthResolver(Some(
+            crate::config::ResolvedBearerAuth {
+                bearer: "current-token-b".to_string(),
+                extra_headers: provider_headers,
+            },
+        ))));
+
+        let request = SamplingClient::new(cfg)
+            .unwrap()
+            .post("https://example.test/backend-api/codex/responses")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer current-token-b")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("account-b")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-openai-fedramp")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn scoped_auth_snapshot_fails_closed_when_identity_is_unavailable() {
+        let mut cfg = minimal_config();
+        cfg.provider = ModelProvider::Codex;
+        cfg.api_key = Some("must-not-be-sent".to_string());
+        cfg.extra_headers.insert(
+            "ChatGPT-Account-ID".to_string(),
+            "stale-account".to_string(),
+        );
+        cfg.extra_headers
+            .insert("X-OpenAI-Fedramp".to_string(), "true".to_string());
+        cfg.bearer_resolver = Some(std::sync::Arc::new(ScopedAuthResolver(None)));
+
+        let request = SamplingClient::new(cfg)
+            .unwrap()
+            .post("https://example.test/backend-api/codex/responses")
+            .build()
+            .unwrap();
+
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+        assert!(request.headers().get("chatgpt-account-id").is_none());
+        assert!(request.headers().get("x-openai-fedramp").is_none());
+    }
+
     #[test]
     fn grok_request_headers_are_xai_only() {
         let headers = GrokRequestHeaders {
@@ -2597,6 +2742,111 @@ mod tests {
         fn current_bearer(&self) -> Option<String> {
             Some(self.0.to_string())
         }
+    }
+
+    #[derive(Debug)]
+    struct ScopedBearerResolver {
+        bearer: &'static str,
+        account: &'static str,
+    }
+
+    impl crate::config::BearerResolver for ScopedBearerResolver {
+        fn current_bearer(&self) -> Option<String> {
+            Some(self.bearer.to_owned())
+        }
+
+        fn current_auth(&self) -> Option<crate::config::ResolvedBearerAuth> {
+            Some(crate::config::ResolvedBearerAuth {
+                bearer: self.bearer.to_owned(),
+                extra_headers: indexmap::indexmap! {
+                    "ChatGPT-Account-ID".to_owned() => self.account.to_owned(),
+                },
+            })
+        }
+
+        fn reserved_headers(&self) -> &'static [&'static str] {
+            &["chatgpt-account-id"]
+        }
+
+        fn fail_closed_on_missing(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn replacing_existing_resolver_preserves_route_and_rebinds_scoped_auth() {
+        let cfg = SamplerConfig {
+            api_key: Some("stale-static-token".to_owned()),
+            provider: xai_grok_sampling_types::ModelProvider::Codex,
+            extra_headers: indexmap::indexmap! {
+                "CHATGPT-ACCOUNT-ID".to_owned() => "spoofed-account".to_owned(),
+            },
+            bearer_resolver: Some(std::sync::Arc::new(ScopedBearerResolver {
+                bearer: "unbound-token",
+                account: "unbound-account",
+            })),
+            ..minimal_config()
+        };
+        let mut client = SamplingClient::new(cfg).expect("client should build");
+        assert!(
+            client.replace_bearer_resolver_if_present(std::sync::Arc::new(ScopedBearerResolver {
+                bearer: "bound-token",
+                account: "bound-account",
+            },))
+        );
+        assert_eq!(
+            client.provider(),
+            xai_grok_sampling_types::ModelProvider::Codex
+        );
+
+        let request = client
+            .post("https://example.test/backend-api/codex/responses")
+            .build()
+            .expect("request should build");
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer bound-token")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("bound-account")
+        );
+    }
+
+    #[test]
+    fn replacing_resolver_refuses_static_byok_client() {
+        let cfg = SamplerConfig {
+            api_key: Some("codex-byok".to_owned()),
+            provider: xai_grok_sampling_types::ModelProvider::Codex,
+            bearer_resolver: None,
+            ..minimal_config()
+        };
+        let mut client = SamplingClient::new(cfg).expect("client should build");
+        assert!(
+            !client.replace_bearer_resolver_if_present(std::sync::Arc::new(ScopedBearerResolver {
+                bearer: "must-not-win",
+                account: "oauth-account",
+            },))
+        );
+
+        let request = client
+            .post("https://example.test/backend-api/codex/responses")
+            .build()
+            .expect("request should build");
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer codex-byok")
+        );
+        assert!(request.headers().get("chatgpt-account-id").is_none());
     }
 
     impl crate::attribution::Auth401AttributionCallback for CountingCallback {

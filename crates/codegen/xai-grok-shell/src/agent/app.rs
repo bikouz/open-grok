@@ -373,9 +373,7 @@ pub async fn run_stdio_agent(
             let auth_manager = Arc::new(agent_config.create_auth_manager());
             // Proactive token refresh; runs until process exit.
             auth_manager.start_proactive_refresh(tokio_util::sync::CancellationToken::new());
-            crate::codex_auth::start_proactive_refresh(
-                tokio_util::sync::CancellationToken::new(),
-            );
+            crate::codex_auth::start_proactive_refresh(tokio_util::sync::CancellationToken::new());
             let _ = crate::codex_auth::fresh_credentials().await;
             // Pause refreshes across system sleep so an OIDC refresh can't straddle a
             // suspend (which can revoke the refresh token and force re-login).

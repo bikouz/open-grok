@@ -42,6 +42,12 @@ use xai_grok_auth::AuthCredentialProvider;
 /// it to the upload helpers.
 pub trait TraceExportSource: Send + Sync {
     fn resolve(&self) -> TraceExportConfig;
+    /// Live policy gate checked immediately before every background wire
+    /// attempt. Provider-aware clients use this to stop queued xAI exports
+    /// after a session crosses into Codex.
+    fn allows_upload(&self) -> bool {
+        true
+    }
     /// Async variant. Override to drive auth refresh; default delegates to sync.
     fn resolve_async(
         &self,
@@ -1486,7 +1492,17 @@ impl UploadQueue {
                         )
                     })
                     .ok();
+                if !resolver.allows_upload() {
+                    let _ = completion_tx
+                        .send(Err(anyhow::anyhow!("upload blocked by live export policy")));
+                    return;
+                }
                 let wrapped = ResolvedStorageConfig::from_resolver_async(&resolver).await;
+                if !resolver.allows_upload() {
+                    let _ = completion_tx
+                        .send(Err(anyhow::anyhow!("upload blocked by live export policy")));
+                    return;
+                }
                 let result =
                     match upload_file(&wrapped, &gcs_path, &source_path, &content_type).await {
                         Ok(url) => Ok(UploadCompletion {
@@ -1538,7 +1554,23 @@ impl UploadQueue {
                         )
                     })
                     .ok();
+                if !resolver.allows_upload() {
+                    try_remove_temp(&snapshot, Some(&stats));
+                    if let Some(tx) = completion_tx {
+                        let _ =
+                            tx.send(Err(anyhow::anyhow!("upload blocked by live export policy")));
+                    }
+                    return;
+                }
                 let wrapped = ResolvedStorageConfig::from_resolver_async(&resolver).await;
+                if !resolver.allows_upload() {
+                    try_remove_temp(&snapshot, Some(&stats));
+                    if let Some(tx) = completion_tx {
+                        let _ =
+                            tx.send(Err(anyhow::anyhow!("upload blocked by live export policy")));
+                    }
+                    return;
+                }
                 let result = match upload_file(&wrapped, &gcs_path, &snapshot, &content_type).await
                 {
                     Ok(url) => Ok(UploadCompletion {
@@ -1591,7 +1623,13 @@ impl UploadQueue {
                         )
                     })
                     .ok();
+                if !resolver.allows_upload() {
+                    return;
+                }
                 let wrapped = ResolvedStorageConfig::from_resolver_async(&resolver).await;
+                if !resolver.allows_upload() {
+                    return;
+                }
                 if let Err(e) = upload_file(&wrapped, &gcs_path, &source_path, &content_type).await
                 {
                     tracing::warn!(
@@ -1628,7 +1666,13 @@ impl UploadQueue {
                         )
                     })
                     .ok();
+                if !resolver.allows_upload() {
+                    return;
+                }
                 let wrapped = ResolvedStorageConfig::from_resolver_async(&resolver).await;
+                if !resolver.allows_upload() {
+                    return;
+                }
                 if let Err(e) = upload_bytes(&wrapped, &gcs_path, &content, &content_type).await {
                     tracing::warn!(
                         gcs_path, error = % e, "Inline fallback upload failed"
@@ -2010,8 +2054,14 @@ async fn upload_with_retries(
     let mut auth_retried = false;
     let mut parked = false;
     loop {
+        if !resolver.allows_upload() {
+            anyhow::bail!("upload blocked by live export policy");
+        }
         item.attempts += 1;
         let wrapped = ResolvedStorageConfig::from_resolver_async(resolver).await;
+        if !resolver.allows_upload() {
+            anyhow::bail!("upload blocked by live export policy");
+        }
         let last_wire_attempt = Instant::now();
         let attempt_bearer = wrapped.wire_bearer();
         let result = if should_compress {
@@ -3947,6 +3997,33 @@ mod tests {
         count: Arc<AtomicU32>,
         proxy_base_url: String,
     }
+    struct GatedResolver {
+        allowed: Arc<AtomicBool>,
+        resolves: Arc<AtomicU32>,
+    }
+    impl TraceExportSource for GatedResolver {
+        fn allows_upload(&self) -> bool {
+            self.allowed.load(Ordering::SeqCst)
+        }
+
+        fn resolve(&self) -> TraceExportConfig {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            TraceExportConfig {
+                bucket_url: None,
+                service_account_key: None,
+                gcs_prefix: None,
+                prefix_dir: None,
+                absolute_paths: false,
+                archive_name_override: None,
+                upload_method: UploadMethod::Proxy {
+                    proxy_base_url: "http://127.0.0.1:1".to_string(),
+                    user_token: "test-token".to_string(),
+                    deployment_key: None,
+                    alpha_test_key: None,
+                },
+            }
+        }
+    }
     impl TraceExportSource for CountingResolver {
         fn resolve(&self) -> TraceExportConfig {
             self.count.fetch_add(1, Ordering::SeqCst);
@@ -4097,6 +4174,38 @@ mod tests {
             3,
             "resolver.resolve() called each attempt"
         );
+    }
+
+    #[tokio::test]
+    async fn live_export_policy_blocks_before_resolve_or_wire_attempt() {
+        let allowed = Arc::new(AtomicBool::new(false));
+        let resolves = Arc::new(AtomicU32::new(0));
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(GatedResolver {
+            allowed,
+            resolves: resolves.clone(),
+        });
+        let policy = UploadRetryPolicy::default();
+        let mut item = UploadQueueItem {
+            source: UploadSource::OwnedTemp(PathBuf::from("/nonexistent/policy-gated-upload")),
+            gcs_path: "test/path".to_string(),
+            content_type: "application/json".to_string(),
+            artifact_name: "test".to_string(),
+            attempts: 0,
+            enqueued_at: Instant::now(),
+            sidecar_path: None,
+            completion_tx: None,
+            client_version: None,
+            compress: false,
+            parent_span: tracing::Span::none(),
+            _in_flight: None,
+        };
+
+        let err = run_upload_with_retries(&mut item, &resolver, &policy)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("live export policy"));
+        assert_eq!(item.attempts, 0);
+        assert_eq!(resolves.load(Ordering::SeqCst), 0);
     }
     /// Exercises the 401 abort path end-to-end via a mock axum server.
     ///

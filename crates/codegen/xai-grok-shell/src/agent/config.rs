@@ -3211,8 +3211,7 @@ pub fn resolve_model_list(
             })
             .collect();
         for entry in resolved.values_mut() {
-            if let Some((donor_cw, donor_backend, donor_tool_mode)) =
-                donors.get(&entry.info.model)
+            if let Some((donor_cw, donor_backend, donor_tool_mode)) = donors.get(&entry.info.model)
             {
                 if entry.info.context_window.get() == default_cw {
                     tracing::debug!(
@@ -4321,6 +4320,17 @@ pub struct ResolvedCredentials {
     pub auth_type: xai_chat_state::AuthType,
     pub auth_scheme: AuthScheme,
 }
+
+/// Codex endpoints accept OpenAI-style bearer authentication. Provider
+/// identity is authoritative even when a remote-only model has no matching
+/// disk entry or collides with stale xAI model facts.
+pub fn effective_auth_scheme(provider: ModelProvider, configured: AuthScheme) -> AuthScheme {
+    if provider == ModelProvider::Codex {
+        AuthScheme::Bearer
+    } else {
+        configured
+    }
+}
 /// First usable BYOK credential: a non-empty (trimmed) api_key, else the first
 /// set, non-empty env_key value. Single source of truth for has_own_credentials,
 /// resolve_credentials, and the JWT-reload path.
@@ -4390,7 +4400,7 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
             xai_chat_state::AuthType::ApiKey,
         )
     };
-    let auth_scheme = info.auth_scheme;
+    let auth_scheme = effective_auth_scheme(info.provider, info.auth_scheme);
     tracing::debug!(
         model = % info.model, auth_type = ? auth_type, "resolved credentials"
     );
@@ -4620,32 +4630,73 @@ pub fn resolve_aux_model_sampling_config(
 /// Shared so the aux resolve happy path and the
 /// `None` fallback cannot diverge between those entry points.
 ///
-/// On aux resolve `Some`, stamp session-local fields (client id, attribution, bearer,
-/// retries) onto the helper config. On `None`, fall back to the active session model and
+/// On aux resolve `Some`, stamp compatible session-local fields onto the helper config.
+/// On `None`, fall back to the active session model and
 /// full config (not forcing `image_description_model` onto the agent endpoint, which 404s
 /// on BYOK / non-proxy routes for internal slugs like `grok-build`).
-/// Stamp the session-local fields (client id, attribution, bearer resolver,
-/// retries) from the active session onto a routed aux `SamplerConfig` so a
-/// helper model keeps the session's auth/attribution. Shared by image-describe
-/// and the auto-mode classifier so the two can't drift.
+///
+/// Provider identity is a hard credential boundary. An auxiliary request may
+/// target a different provider or carry its own BYOK credential, so only copy
+/// an active session's resolver/attribution when both configs represent the
+/// same provider and the same credential. Shared by image-describe, summaries,
+/// and the auto-mode classifier so those paths cannot drift.
 pub fn stamp_session_local_sampler_fields(
     cfg: &mut SamplerConfig,
     active_session_config: &SamplerConfig,
     client_identifier: Option<String>,
     max_retries: Option<u32>,
 ) {
-    cfg.client_identifier = client_identifier;
-    cfg.attribution_callback = active_session_config.attribution_callback.clone();
-    cfg.bearer_resolver = active_session_config.bearer_resolver.clone();
+    let shares_session_credential = cfg.provider == active_session_config.provider
+        && cfg.api_key == active_session_config.api_key;
+
+    // `client_identifier` produces xAI-specific request metadata and must not
+    // be stamped onto OpenAI Codex traffic.
+    cfg.client_identifier = (cfg.provider == ModelProvider::Xai)
+        .then_some(client_identifier)
+        .flatten();
+    if shares_session_credential {
+        cfg.attribution_callback = active_session_config.attribution_callback.clone();
+        if cfg.bearer_resolver.is_none() {
+            cfg.bearer_resolver = active_session_config.bearer_resolver.clone();
+        }
+    }
     cfg.max_retries = max_retries;
 }
+
+/// Keep an auxiliary request on the active provider when its requested model
+/// is only the compiled default and resolving that default would cross a
+/// provider boundary. The built-in summary and image-description defaults are
+/// xAI routing slugs; silently using them from a Codex session would disclose
+/// session content to a second provider. A non-default model remains an
+/// explicit cross-provider opt-in.
+pub fn should_use_active_for_implicit_aux_model(
+    requested_model: &str,
+    default_model: &str,
+    resolved_aux: &SamplerConfig,
+    active_session_config: &SamplerConfig,
+) -> bool {
+    requested_model == default_model && resolved_aux.provider != active_session_config.provider
+}
+
 pub fn finalize_image_describe_sampler_config(
     resolved_aux: Option<SamplerConfig>,
+    requested_model: &str,
     active_session_config: &SamplerConfig,
     client_identifier: Option<String>,
     max_retries: Option<u32>,
 ) -> (String, SamplerConfig) {
     match resolved_aux {
+        Some(describe_cfg)
+            if should_use_active_for_implicit_aux_model(
+                requested_model,
+                crate::models::default_image_description_model(),
+                &describe_cfg,
+                active_session_config,
+            ) =>
+        {
+            let model = active_session_config.model.clone();
+            (model, active_session_config.clone())
+        }
         Some(mut describe_cfg) => {
             stamp_session_local_sampler_fields(
                 &mut describe_cfg,
@@ -4673,6 +4724,24 @@ pub fn resolve_chat_state_auth_type(
     try_resolve_model_credentials(model_id, session_key)
         .map(|r| r.auth_type)
         .unwrap_or(fallback)
+}
+
+/// Preserve the credential provenance already resolved into a full sampler
+/// config. Remote Codex models are not necessarily present in the disk model
+/// catalog, so re-resolving them by slug would incorrectly inherit xAI auth.
+pub fn resolve_chat_state_auth_type_for_sampling_config(
+    config: &SamplerConfig,
+    session_key: Option<&str>,
+    fallback: xai_chat_state::AuthType,
+) -> xai_chat_state::AuthType {
+    if config.provider == ModelProvider::Codex {
+        return if config.bearer_resolver.is_some() {
+            xai_chat_state::AuthType::SessionToken
+        } else {
+            xai_chat_state::AuthType::ApiKey
+        };
+    }
+    resolve_chat_state_auth_type(&config.model, session_key, fallback)
 }
 pub fn sampling_config_for_model(
     model: &ModelEntry,
@@ -4704,20 +4773,19 @@ pub fn sampling_config_for_model(
         .ok()
         .flatten()
         .flatten();
-    if let Some(credentials) = codex_credentials.as_ref() {
-        if let Some(account_id) = credentials.account_id.as_ref() {
-            extra_headers
-                .entry("ChatGPT-Account-ID".to_owned())
-                .or_insert_with(|| account_id.clone());
-        }
-        if credentials.account_is_fedramp {
-            extra_headers
-                .entry("X-OpenAI-Fedramp".to_owned())
-                .or_insert_with(|| "true".to_owned());
-        }
+    if info.provider == ModelProvider::Codex {
+        extra_headers
+            .entry("originator".to_owned())
+            .or_insert_with(|| crate::codex_auth::CODEX_ORIGINATOR.to_owned());
         extra_headers
             .entry("version".to_owned())
             .or_insert_with(|| xai_grok_version::VERSION.to_owned());
+    }
+    if uses_codex_oauth {
+        crate::codex_auth::set_oauth_identity_anchor(
+            &mut extra_headers,
+            codex_credentials.as_ref(),
+        );
     }
     SamplerConfig {
         api_key: credentials.api_key,
@@ -4728,7 +4796,7 @@ pub fn sampling_config_for_model(
         top_p,
         api_backend,
         provider: info.provider,
-        auth_scheme: credentials.auth_scheme,
+        auth_scheme: effective_auth_scheme(info.provider, credentials.auth_scheme),
         extra_headers,
         context_window: info.context_window.get(),
         client_version: (info.provider != ModelProvider::Codex)
@@ -4749,8 +4817,9 @@ pub fn sampling_config_for_model(
         origin_client: None,
         attribution_callback: None,
         bearer_resolver: uses_codex_oauth.then(|| {
-            std::sync::Arc::new(crate::codex_auth::CodexBearerResolver)
-                as xai_grok_sampler::SharedBearerResolver
+            std::sync::Arc::new(crate::codex_auth::CodexBearerResolver::from_credentials(
+                codex_credentials.as_ref(),
+            )) as xai_grok_sampler::SharedBearerResolver
         }),
         supports_backend_search: info.supports_backend_search,
         compactions_remaining: info.compactions_remaining,
@@ -4908,6 +4977,16 @@ pub fn resolve_web_search_sampling_config(
     }
     resolved.map(crate::tools::config::web_search_sampling_config)
 }
+
+/// A local web-search sampler plus the provenance needed to enforce provider
+/// boundaries after an in-place model switch. The compiled default is an xAI
+/// helper; a non-default configured model is an explicit cross-provider opt-in.
+#[derive(Clone)]
+pub(crate) struct PreparedWebSearchSamplingConfig {
+    pub sampler: SamplerConfig,
+    pub is_implicit_default: bool,
+}
+
 pub fn to_acp_model_info(
     models: &IndexMap<String, ModelEntry>,
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
@@ -5382,7 +5461,13 @@ reasoning_effort = "low"
             model: "composer-session-model".into(),
             ..Default::default()
         };
-        let (model, cfg) = finalize_image_describe_sampler_config(None, &active, None, Some(3));
+        let (model, cfg) = finalize_image_describe_sampler_config(
+            None,
+            crate::models::default_image_description_model(),
+            &active,
+            None,
+            Some(3),
+        );
         assert_eq!(model, "composer-session-model");
         assert_eq!(cfg.model, "composer-session-model");
         assert_ne!(cfg.model, "grok-build");
@@ -5397,12 +5482,122 @@ reasoning_effort = "low"
             model: "grok-build".into(),
             ..Default::default()
         };
-        let (model, cfg) =
-            finalize_image_describe_sampler_config(Some(aux), &active, Some("cli".into()), Some(7));
+        let (model, cfg) = finalize_image_describe_sampler_config(
+            Some(aux),
+            crate::models::default_image_description_model(),
+            &active,
+            Some("cli".into()),
+            Some(7),
+        );
         assert_eq!(model, "grok-build");
         assert_eq!(cfg.model, "grok-build");
         assert_eq!(cfg.client_identifier.as_deref(), Some("cli"));
         assert_eq!(cfg.max_retries, Some(7));
+    }
+    #[test]
+    fn implicit_image_describe_default_stays_on_active_codex_provider() {
+        let active = SamplerConfig {
+            provider: ModelProvider::Codex,
+            model: "gpt-5.6-sol".into(),
+            ..Default::default()
+        };
+        let aux = SamplerConfig {
+            provider: ModelProvider::Xai,
+            model: crate::models::default_image_description_model().into(),
+            ..Default::default()
+        };
+        let (model, cfg) = finalize_image_describe_sampler_config(
+            Some(aux),
+            crate::models::default_image_description_model(),
+            &active,
+            None,
+            Some(7),
+        );
+        assert_eq!(model, "gpt-5.6-sol");
+        assert_eq!(cfg.provider, ModelProvider::Codex);
+    }
+    #[test]
+    fn explicit_image_describe_model_may_cross_provider() {
+        let active = SamplerConfig {
+            provider: ModelProvider::Codex,
+            model: "gpt-5.6-sol".into(),
+            ..Default::default()
+        };
+        let aux = SamplerConfig {
+            provider: ModelProvider::Xai,
+            model: "custom-xai-image-helper".into(),
+            ..Default::default()
+        };
+        let (model, cfg) = finalize_image_describe_sampler_config(
+            Some(aux),
+            "custom-xai-image-helper",
+            &active,
+            None,
+            Some(7),
+        );
+        assert_eq!(model, "custom-xai-image-helper");
+        assert_eq!(cfg.provider, ModelProvider::Xai);
+    }
+    #[test]
+    fn auxiliary_sampler_reuses_live_resolver_only_for_same_provider_and_credential() {
+        let resolver: xai_grok_sampler::SharedBearerResolver =
+            std::sync::Arc::new(crate::codex_auth::CodexBearerResolver::default());
+        let active = SamplerConfig {
+            provider: ModelProvider::Xai,
+            api_key: Some("shared-session-token".into()),
+            bearer_resolver: Some(resolver.clone()),
+            ..Default::default()
+        };
+        let mut aux = SamplerConfig {
+            provider: ModelProvider::Xai,
+            api_key: Some("shared-session-token".into()),
+            ..Default::default()
+        };
+
+        stamp_session_local_sampler_fields(&mut aux, &active, Some("grok-build".into()), Some(4));
+
+        assert!(
+            aux.bearer_resolver
+                .as_ref()
+                .is_some_and(|actual| std::sync::Arc::ptr_eq(actual, &resolver))
+        );
+        assert_eq!(aux.client_identifier.as_deref(), Some("grok-build"));
+    }
+    #[test]
+    fn auxiliary_sampler_does_not_cross_provider_credential_boundary() {
+        let resolver: xai_grok_sampler::SharedBearerResolver =
+            std::sync::Arc::new(crate::codex_auth::CodexBearerResolver::default());
+        let active = SamplerConfig {
+            provider: ModelProvider::Codex,
+            api_key: Some("same-text-does-not-imply-same-provider".into()),
+            bearer_resolver: Some(resolver),
+            ..Default::default()
+        };
+        let mut aux = SamplerConfig {
+            provider: ModelProvider::Xai,
+            api_key: Some("same-text-does-not-imply-same-provider".into()),
+            ..Default::default()
+        };
+
+        stamp_session_local_sampler_fields(&mut aux, &active, Some("grok-build".into()), Some(4));
+
+        assert!(aux.bearer_resolver.is_none());
+    }
+    #[test]
+    fn auxiliary_codex_sampler_never_receives_xai_client_metadata() {
+        let mut aux = SamplerConfig {
+            provider: ModelProvider::Codex,
+            ..Default::default()
+        };
+
+        stamp_session_local_sampler_fields(
+            &mut aux,
+            &SamplerConfig::default(),
+            Some("grok-build".into()),
+            Some(4),
+        );
+
+        assert!(aux.client_identifier.is_none());
     }
     #[test]
     fn resolve_aux_model_honors_grok_build_override() {
@@ -6343,7 +6538,7 @@ reasoning_effort = "low"
                 api_key: Some("oauth-access".to_owned()),
                 base_url: model.info.base_url.clone(),
                 auth_type: xai_chat_state::AuthType::SessionToken,
-                auth_scheme: AuthScheme::Bearer,
+                auth_scheme: AuthScheme::XApiKey,
             },
             None,
             Some("ignored-x-grok-version".to_owned()),
@@ -6351,10 +6546,19 @@ reasoning_effort = "low"
             Some("ignored-xai-user".to_owned()),
         );
         assert_eq!(sampling.provider, ModelProvider::Codex);
+        assert_eq!(sampling.auth_scheme, AuthScheme::Bearer);
         assert!(sampling.bearer_resolver.is_some());
         assert!(sampling.client_version.is_none());
         assert!(sampling.deployment_id.is_none());
         assert!(sampling.user_id.is_none());
+        assert_eq!(
+            sampling.extra_headers.get("originator").map(String::as_str),
+            Some(crate::codex_auth::CODEX_ORIGINATOR)
+        );
+        assert_eq!(
+            sampling.extra_headers.get("version").map(String::as_str),
+            Some(xai_grok_version::VERSION)
+        );
 
         let byok_sampling = sampling_config_for_model(
             model,
@@ -6437,8 +6641,9 @@ reasoning_effort = "low"
             r#"
             [model.gpt-5-6-sol]
             model = "gpt-5.6-sol"
-            base_url = "https://api.openai.com/v1"
-            context_window = 372000
+            provider = "codex"
+            base_url = "https://chatgpt.com/backend-api/codex"
+            context_window = 353000
             api_backend = "responses"
             agent_type = "codex"
             tool_mode = "code_mode_only"

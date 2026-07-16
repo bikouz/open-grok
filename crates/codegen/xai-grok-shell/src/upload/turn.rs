@@ -64,6 +64,10 @@ pub(crate) struct PromptTraceContext {
     pub(crate) auth_manager: std::sync::Arc<crate::auth::AuthManager>,
 }
 impl PromptTraceContext {
+    pub(crate) fn allows_xai_export(&self) -> bool {
+        self.session_handle.feedback_manager.allows_xai_export()
+    }
+
     pub(crate) fn artifact_upload_context(&self) -> super::manifest::ArtifactUploadContext {
         super::manifest::ArtifactUploadContext {
             gcs_config: self.gcs_config.clone(),
@@ -179,6 +183,10 @@ pub(crate) async fn complete_prompt_trace(
     use super::manifest::{
         build_manifest, resolve_upload_method, skip_artifact, write_upload_manifest,
     };
+    if !ctx.allows_xai_export() {
+        tracing::debug!("prompt trace completion blocked by provider boundary");
+        return Ok(false);
+    }
     let upload_method = resolve_upload_method(&ctx);
     let method_str = upload_method.as_str();
     xai_grok_telemetry::session_ctx::log_session_event(
@@ -219,6 +227,10 @@ pub(crate) async fn complete_prompt_trace(
         UploadWait::Confirm => 0,
         UploadWait::Defer { deadline } => super::trace::flush_upload_queue(&ctx, deadline).await,
     };
+    if !ctx.allows_xai_export() {
+        tracing::debug!("prompt trace finalization blocked by provider boundary");
+        return Ok(false);
+    }
     let manifest = build_manifest(&ctx.artifact_tracker, upload_method);
     let flush_timed_out = flush_remaining > 0 || matches!(upload_outcome, UploadOutcome::Deferred);
     let worker_drops = match wait {

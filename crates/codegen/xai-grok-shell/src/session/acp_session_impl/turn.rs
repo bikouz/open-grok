@@ -624,6 +624,22 @@ impl SessionActor {
                 local_path: truncated_local_path,
             });
         }
+        // A session created before Codex login may still have an unbound,
+        // fail-closed title client. Adopt isolated Codex OAuth before queuing
+        // the first content chunk so the resolver-refresh message reaches the
+        // persistence actor ahead of title generation on the same FIFO.
+        let summary_auth_provider = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|config| config.provider)
+            .unwrap_or_default();
+        let summary_auth_type = self.chat_state_handle.get_credentials().await.auth_type;
+        if turn_auth_refresh_route(summary_auth_provider, summary_auth_type)
+            == TurnAuthRefreshRoute::CodexOAuth
+        {
+            self.refresh_token_if_expired().await;
+        }
         let _ = self
             .notifications
             .persistence_tx
@@ -1907,13 +1923,16 @@ impl SessionActor {
         }
         let mut prompt_timing = Some(crate::session::prompt_timing::PromptTiming::start());
         let tool_prep_start = std::time::Instant::now();
-        let (tool_definitions, mcp_wait_ms) = self.prepare_tool_definitions_timed().await;
+        let (mut tool_definitions, mcp_wait_ms) = self.prepare_tool_definitions_timed().await;
         let model_provider = self
             .chat_state_handle
             .get_sampling_config()
             .await
             .map(|config| config.provider)
             .unwrap_or_default();
+        tool_definitions.retain(|definition| {
+            self.local_tool_allowed_for_provider(&definition.function.name, model_provider)
+        });
         let tool_mode = self.agent.borrow().tool_mode();
         let code_mode_enabled = matches!(
             tool_mode,
@@ -1951,10 +1970,12 @@ impl SessionActor {
             let tool_defs = tool_definitions.clone();
             let manifest_clone = artifact_tracker.cloned();
             let auth_manager = self.auth_manager.clone();
+            let provider_boundary = self.feedback_manager.provider_boundary();
             tokio::spawn(async move {
                 crate::upload::trace::upload_tool_definitions(
                     gcs_cfg,
                     auth_manager,
+                    provider_boundary,
                     &tool_defs,
                     manifest_clone.as_ref(),
                 )
@@ -1968,6 +1989,7 @@ impl SessionActor {
         let mut loop_index: u32 = 0;
         let mut todo_gate_fires: u32 = 0;
         let mut auth_retry_schedule = AuthRetrySchedule::new();
+        let mut codex_auth_retry_attempted = false;
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
@@ -2037,8 +2059,10 @@ impl SessionActor {
                 if let Some(ref override_tools) = self.forked_tool_override {
                     override_tools.clone()
                 } else {
-                    self.turn_base_tool_specs(&tool_definitions)
+                    self.turn_base_tool_specs(&tool_definitions, model_provider)
                 };
+            effective_tools
+                .retain(|tool| self.local_tool_allowed_for_provider(&tool.name, model_provider));
             if code_mode_only {
                 effective_tools.retain(|tool| {
                     crate::session::code_mode::is_code_mode_direct_only_tool(&tool.name)
@@ -2141,13 +2165,32 @@ impl SessionActor {
                 )),
             );
             let model_timer = std::time::Instant::now();
-            let (response, latency) = match self.run_turn_via_sampler(request.clone()).await? {
+            let (response, latency) = match self
+                .run_turn_via_sampler(request.clone(), !codex_auth_retry_attempted)
+                .await?
+            {
                 SamplerTurnOutcome::Response(r, latency) => (r, latency),
                 SamplerTurnOutcome::CompactAndResubmit => {
                     auth_retry_schedule.reset();
                     continue;
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit => {
+                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                    provider: xai_grok_sampling_types::ModelProvider::Codex,
+                } => {
+                    codex_auth_retry_attempted = true;
+                    self.send_xai_notification(XaiSessionUpdate::RetryState(
+                        crate::extensions::notification::RetryState::Retrying {
+                            attempt: 1,
+                            max_retries: 1,
+                            reason: "Refreshed Codex OAuth after 401; retrying request".to_string(),
+                        },
+                    ))
+                    .await;
+                    continue;
+                }
+                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                    provider: xai_grok_sampling_types::ModelProvider::Xai,
+                } => {
                     if let Some((attempt, delay)) = auth_retry_schedule.next_delay() {
                         let delay_ms = delay.as_millis() as u64;
                         tracing::warn!(
@@ -2187,6 +2230,7 @@ impl SessionActor {
                 }
             };
             auth_retry_schedule.reset();
+            codex_auth_retry_attempted = false;
             let model_elapsed_ms = model_timer.elapsed().as_millis() as u64;
             let usage = response.usage.as_ref();
             let prompt_tokens = usage.map(|u| u.prompt_tokens);

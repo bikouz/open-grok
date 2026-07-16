@@ -324,6 +324,8 @@ impl MvpAgent {
             parent_attribution_callback,
             parent_agent_name,
             parent_managed_mcp_proxy_base_url,
+            provider_boundary,
+            parent_persistence_tx,
         ) = {
             let sessions = self.sessions.borrow();
             let ps = sessions.get(&parent_sid);
@@ -359,6 +361,11 @@ impl MvpAgent {
                 ps.and_then(|h| h.attribution_callback.clone()),
                 ps.map(|h| h.agent_name.clone()),
                 ps.map(|h| h.managed_mcp_proxy_base_url.clone()),
+                ps.map(|h| h.feedback_manager.provider_boundary())
+                    .unwrap_or_else(|| {
+                        crate::session::persistence::ProviderBoundary::new(true)
+                    }),
+                ps.map(|h| h.persistence_tx.clone()),
             )
         };
         let (
@@ -415,7 +422,11 @@ impl MvpAgent {
                 .map(|h| h.ask_user_question_enabled)
                 .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value)
         };
-        let (gcs_upload_method, gcs_bucket_url) = match self.trace_upload_config_snapshot() {
+        let (gcs_upload_method, gcs_bucket_url) = match provider_boundary
+            .allows_xai_export()
+            .then(|| self.trace_upload_config_snapshot())
+            .flatten()
+        {
             Some(method) => {
                 use crate::session::repo_changes::UploadMethod;
                 let bucket = match &method {
@@ -515,6 +526,8 @@ impl MvpAgent {
             gcs_bucket_url,
             agent_config: Some(self.cfg.borrow().clone()),
             gcs_upload_method,
+            provider_boundary,
+            parent_persistence_tx,
             hook_registry: parent_hook_registry,
             hook_workspace_root: String::new(),
             permission_handle: {

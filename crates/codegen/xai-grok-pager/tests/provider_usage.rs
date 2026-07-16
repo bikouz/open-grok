@@ -68,7 +68,10 @@ fn codex_usage_shows_remaining_windows_credits_and_additional_limits() {
     let summary = format_codex_usage_summary(&snapshot(false, true));
     assert!(summary.contains("5h limit: 72% left"), "{summary}");
     assert!(summary.contains("Weekly limit: 41% left"), "{summary}");
-    assert!(summary.contains("Codex Other 5h limit: 50% left"), "{summary}");
+    assert!(
+        summary.contains("Codex Other 5h limit: 50% left"),
+        "{summary}"
+    );
     assert!(summary.contains("Credits: 13 credits"), "{summary}");
     assert!(summary.contains("Lifetime tokens: 1,234,567"), "{summary}");
 }

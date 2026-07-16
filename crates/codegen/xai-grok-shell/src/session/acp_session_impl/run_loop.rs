@@ -641,8 +641,10 @@ pub(super) async fn run_session(
             SessionCommand::SnapshotClientHooks { respond_to } => { let _ = respond_to
             .send(session.client_hooks.borrow().clone()); }
             SessionCommand::SnapshotToolDefinitions { respond_to } => { let defs =
-            session.prepare_tool_definitions_inner(). await; let specs = session
-            .turn_base_tool_specs(& defs); let _ = respond_to.send(specs); }
+            session.prepare_tool_definitions_inner(). await; let provider = session
+            .chat_state_handle.get_sampling_config().await.map(| config | config.provider)
+            .unwrap_or_default(); let specs = session.turn_base_tool_specs(& defs,
+            provider); let _ = respond_to.send(specs); }
             SessionCommand::SetClientHooks { hooks } => { * session.client_hooks
             .borrow_mut() = hooks; } SessionCommand::GetMcpStatus { respond_to } => { let
             mcp_state = session.mcp_state.clone(); let tool_bridge = session.agent

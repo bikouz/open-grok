@@ -3,6 +3,13 @@ use super::*;
 use crate::test_support::lsp_runtime::{
     DummyLspDispatch, ctx_with_toggle, make_request, test_gateway,
 };
+#[derive(Debug)]
+struct TestParentBearerResolver(&'static str);
+impl xai_grok_sampler::BearerResolver for TestParentBearerResolver {
+    fn current_bearer(&self) -> Option<String> {
+        Some(self.0.to_string())
+    }
+}
 #[test]
 fn normalize_forked_context_strips_project_layout() {
     use xai_grok_sampling_types::conversation::ConversationItem;
@@ -2603,6 +2610,90 @@ async fn read_parent_sampling_config_fallback_resolves_compactions_remaining_fro
         "fallback path should also resolve compactions-remaining capability from the catalog"
     );
 }
+#[tokio::test]
+async fn xai_parent_to_codex_child_uses_only_codex_credentials() {
+    use xai_grok_agent::config::ModelOverride;
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.sampling_config.provider = xai_grok_sampling_types::ModelProvider::Xai;
+    ctx.sampling_config.api_key = Some("xai-parent-token".to_string());
+    ctx.sampling_config.client_identifier = Some("xai-client".to_string());
+    ctx.sampling_config.deployment_id = Some("xai-deployment".to_string());
+    ctx.sampling_config.user_id = Some("xai-user".to_string());
+    ctx.sampling_config.extra_headers.insert(
+        "x-parent-only".to_string(),
+        "must-not-cross".to_string(),
+    );
+    ctx.sampling_config.bearer_resolver = Some(std::sync::Arc::new(
+        TestParentBearerResolver("xai-live-token"),
+    ));
+
+    let mut child = byok_model_entry("gpt-5.6-sol");
+    child.info.provider = xai_grok_sampling_types::ModelProvider::Codex;
+    child.info.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    child.info.auth_scheme = xai_grok_sampler::AuthScheme::XApiKey;
+    ctx.available_models.insert("codex-child".to_string(), child);
+
+    let (config, model_id) = resolve_effective_model_config(
+            Some("codex-child"),
+            "explore",
+            &ModelOverride::Inherit,
+            &ctx,
+        )
+        .await;
+
+    assert_eq!(model_id.0.as_ref(), "codex-child");
+    assert_eq!(config.provider, xai_grok_sampling_types::ModelProvider::Codex);
+    assert_eq!(config.api_key.as_deref(), Some("byok-key"));
+    assert_eq!(config.auth_scheme, xai_grok_sampler::AuthScheme::Bearer);
+    assert!(config.bearer_resolver.is_none());
+    assert!(config.client_identifier.is_none());
+    assert!(config.deployment_id.is_none());
+    assert!(config.user_id.is_none());
+    assert!(config.attribution_callback.is_none());
+    assert!(config.extra_headers.get("x-parent-only").is_none());
+    assert_eq!(
+        config.extra_headers.get("originator").map(String::as_str),
+        Some(crate::codex_auth::CODEX_ORIGINATOR),
+    );
+}
+#[tokio::test]
+async fn codex_parent_to_xai_child_uses_only_xai_credentials() {
+    use xai_grok_agent::config::ModelOverride;
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.sampling_config.provider = xai_grok_sampling_types::ModelProvider::Codex;
+    ctx.sampling_config.api_key = Some("codex-parent-token".to_string());
+    ctx.sampling_config.extra_headers.insert(
+        "ChatGPT-Account-ID".to_string(),
+        "codex-account".to_string(),
+    );
+    ctx.sampling_config.extra_headers.insert(
+        "originator".to_string(),
+        crate::codex_auth::CODEX_ORIGINATOR.to_string(),
+    );
+    ctx.sampling_config.bearer_resolver = Some(std::sync::Arc::new(
+        TestParentBearerResolver("codex-live-token"),
+    ));
+
+    let mut child = byok_model_entry("grok-build");
+    child.info.provider = xai_grok_sampling_types::ModelProvider::Xai;
+    child.info.base_url = "https://api.x.ai/v1".to_string();
+    ctx.available_models.insert("xai-child".to_string(), child);
+
+    let (config, model_id) = resolve_effective_model_config(
+            Some("xai-child"),
+            "explore",
+            &ModelOverride::Inherit,
+            &ctx,
+        )
+        .await;
+
+    assert_eq!(model_id.0.as_ref(), "xai-child");
+    assert_eq!(config.provider, xai_grok_sampling_types::ModelProvider::Xai);
+    assert_eq!(config.api_key.as_deref(), Some("byok-key"));
+    assert!(config.bearer_resolver.is_none());
+    assert!(config.extra_headers.get("ChatGPT-Account-ID").is_none());
+    assert!(config.extra_headers.get("originator").is_none());
+}
 /// Drive the REAL precedence path
 /// (`resolve_effective_model_config`, which `handle_subagent_request`
 /// calls) with BOTH an explicit `runtime_override_model` AND a
@@ -2850,23 +2941,22 @@ async fn resolve_subagent_agent_definition_unknown_model_falls_through_to_inheri
     assert_eq!(model_id.0.as_ref(), "grok-4.5");
 }
 #[test]
-fn key_prefix_truncates_to_8_chars() {
-    let key = Some("eyJ0eXAiOiJhbGciOiJSUzI1NiJ9".to_string());
-    assert_eq!(key_prefix(& key), "eyJ0eXAi");
-}
-#[test]
-fn key_prefix_short_key_not_truncated() {
-    let key = Some("abc".to_string());
-    assert_eq!(key_prefix(& key), "abc");
-}
-#[test]
-fn key_prefix_none_returns_placeholder() {
-    assert_eq!(key_prefix(& None), "<none>");
-}
-#[test]
-fn key_prefix_empty_string() {
-    let key = Some(String::new());
-    assert_eq!(key_prefix(& key), "");
+fn sampling_auth_log_metadata_contains_no_credential_material() {
+    let secret = "eyJ0eXAiOiJhbGciOiJSUzI1NiJ9";
+    let config = xai_grok_sampler::SamplerConfig {
+        api_key: Some(secret.to_string()),
+        provider: xai_grok_sampling_types::ModelProvider::Codex,
+        auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
+        ..Default::default()
+    };
+    let metadata = sampling_auth_log_metadata(&config);
+    assert_eq!(metadata["provider"], "Codex");
+    assert_eq!(metadata["auth_scheme"], "Bearer");
+    assert_eq!(metadata["has_api_key"], true);
+    assert_eq!(metadata["has_bearer_resolver"], false);
+    let serialized = metadata.to_string();
+    assert!(!serialized.contains(secret));
+    assert!(!serialized.contains("prefix"));
 }
 #[test]
 fn non_cursor_persona_injected_as_system_reminder() {

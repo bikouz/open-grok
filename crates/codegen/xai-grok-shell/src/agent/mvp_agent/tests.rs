@@ -464,6 +464,7 @@ async fn upload_harness_trace_turns_numbers_siblings_and_persists_counter() {
         &queue_cfg,
         Some(xai_grok_version::VERSION),
         agent.auth_manager.clone(),
+        crate::session::persistence::ProviderBoundary::default(),
     );
     let _ = handle.upload_queue.set(queue);
     agent.sessions.borrow_mut().insert(sid.clone(), handle);
@@ -585,6 +586,7 @@ async fn upload_harness_trace_turns_build_per_turn_manifest() {
         &queue_cfg,
         Some(xai_grok_version::VERSION),
         agent.auth_manager.clone(),
+        crate::session::persistence::ProviderBoundary::default(),
     );
     let _ = handle.upload_queue.set(queue);
     agent.sessions.borrow_mut().insert(sid.clone(), handle);

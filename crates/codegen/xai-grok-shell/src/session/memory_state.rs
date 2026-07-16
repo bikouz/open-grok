@@ -9,6 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 /// Memory subsystem state for a session.
 pub struct SessionMemory {
+    /// Provider whose endpoint and credentials were captured in
+    /// `backend_params` at spawn.
+    pub embedding_provider: xai_grok_sampling_types::ModelProvider,
+    /// Live provider for the active model. Remote memory access is allowed
+    /// only while it matches `embedding_provider`.
+    pub active_provider: std::cell::Cell<xai_grok_sampling_types::ModelProvider>,
     /// Memory storage handle for writing flush output (None when memory disabled).
     /// Wrapped in `RefCell` to allow `/memory on|off` toggle from `&Arc<SessionActor>`.
     pub storage: RefCell<Option<crate::session::memory::MemoryStorage>>,
@@ -60,11 +66,19 @@ pub struct SessionMemory {
 impl SessionMemory {
     /// Whether memory is enabled for this session.
     pub fn is_enabled(&self) -> bool {
-        self.storage.borrow().is_some()
+        self.provider_access_enabled() && self.storage.borrow().is_some()
+    }
+
+    /// Whether the frozen embedding route belongs to the active provider.
+    pub fn provider_access_enabled(&self) -> bool {
+        self.embedding_provider == self.active_provider.get()
     }
 
     /// Clone the storage out of the `RefCell`, dropping the borrow immediately.
     pub fn storage(&self) -> Option<crate::session::memory::MemoryStorage> {
+        if !self.provider_access_enabled() {
+            return None;
+        }
         self.storage.borrow().clone()
     }
 
@@ -150,13 +164,14 @@ impl SessionMemory {
 
     /// Reindex a file and embed new chunks when embedding is configured.
     pub async fn reindex_and_embed(&self, path: &std::path::Path, source: &str) {
-        let Some(storage) = self.storage.borrow().clone() else {
+        let Some(storage) = self.storage() else {
             return;
         };
         if let Some(mut index) = self.open_index(&storage) {
             let _ = index.reindex_file(path, source);
             if let Some(ref params) = self.backend_params
                 && let Some(provider) = params.make_embedding_provider().await
+                && self.provider_access_enabled()
             {
                 crate::session::memory::embed_missing_chunks(&index, &provider).await;
             }
@@ -172,7 +187,7 @@ impl SessionMemory {
         if paths.is_empty() {
             return;
         }
-        let Some(storage) = self.storage.borrow().clone() else {
+        let Some(storage) = self.storage() else {
             return;
         };
         if let Some(mut index) = self.open_index(&storage) {

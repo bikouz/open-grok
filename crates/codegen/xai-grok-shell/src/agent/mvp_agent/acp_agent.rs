@@ -967,8 +967,9 @@ impl acp::Agent for MvpAgent {
         }
         let (summary_client, summary_model) = self
             .build_summary_client(&session_sampling)?;
-        let relay_sync = if let Some(sync) = self
-            .create_relay_sync(&session_id.0, &session_info)
+        let relay_sync = if session_sampling.provider
+            == xai_grok_sampling_types::ModelProvider::Xai
+            && let Some(sync) = self.create_relay_sync(&session_id.0, &session_info)
         {
             Self::spawn_relay_state_forwarder(
                 sync.subscribe_state(),
@@ -989,7 +990,9 @@ impl acp::Agent for MvpAgent {
         };
         let session_model_id = model_id.clone();
         let persistence = if is_chat_kind {
-            crate::session::persistence::PersistenceHandle::noop()
+            crate::session::persistence::PersistenceHandle::noop_for_provider(
+                session_sampling.provider,
+            )
         } else {
             let _timer = crate::instrumentation_timer!("session.persistence_init");
             let registry_title_sync = self
@@ -1229,6 +1232,31 @@ impl acp::Agent for MvpAgent {
             meta: request_meta,
             ..
         } = arguments;
+        let requested_model_id = request_meta
+            .as_ref()
+            .and_then(|meta| meta.get("modelId"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .and_then(|value| {
+                let model_id = acp::ModelId::new(value.to_string());
+                match self.resolve_model_id(&model_id) {
+                    Ok(model) if model.info().user_selectable => Some(model_id),
+                    Ok(_) => {
+                        tracing::warn!(
+                            requested_model = value,
+                            "Load-session model override is not user-selectable; restoring persisted model"
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            requested_model = value,
+                            "Load-session model override is unknown; restoring persisted model"
+                        );
+                        None
+                    }
+                }
+            });
         let cwd = AbsPathBuf::new(cwd)
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
@@ -1295,8 +1323,24 @@ impl acp::Agent for MvpAgent {
             );
         let (summary_client, summary_model) = self
             .build_summary_client(&load_session_sampling)?;
-        let relay_sync = if let Some(sync) = self
-            .create_relay_sync(&session_id.0, &session_info)
+        // RelaySync connects as soon as it is constructed, so fail closed
+        // before loading the persistence actor. A missing/legacy summary is
+        // not enough provenance to start an xAI-only relay.
+        let persisted_relay_allowed =
+            crate::session::persistence::find_summary_by_session_id(&session_id.0)
+                .is_some_and(|summary| {
+                    if summary.ever_used_codex {
+                        return false;
+                    }
+                    self.resolve_sampling_config_for_model(
+                        &summary.current_model_id,
+                        origin_client.clone(),
+                    )
+                    .provider
+                        == xai_grok_sampling_types::ModelProvider::Xai
+                });
+        let relay_sync = if persisted_relay_allowed
+            && let Some(sync) = self.create_relay_sync(&session_id.0, &session_info)
         {
             Self::spawn_relay_state_forwarder(
                 sync.subscribe_state(),
@@ -1383,6 +1427,9 @@ impl acp::Agent for MvpAgent {
         let restored_awaiting_plan_approval = persisted_plan_mode
             .as_ref()
             .is_some_and(|s| s.awaiting_plan_approval);
+        let startup_model_id = requested_model_id
+            .clone()
+            .unwrap_or_else(|| summary.current_model_id.clone());
         self.session_turn_numbers
             .borrow_mut()
             .insert(session_id.clone(), summary.next_trace_turn);
@@ -1576,7 +1623,7 @@ impl acp::Agent for MvpAgent {
                 .clone()
                 .or_else(|| {
                     self
-                        .resolve_model_id(&summary.current_model_id)
+                        .resolve_model_id(&startup_model_id)
                         .ok()
                         .map(|m| m.info().agent_type.clone())
                 });
@@ -1605,7 +1652,7 @@ impl acp::Agent for MvpAgent {
                         session_meta: request_meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
-                        session_model_id: summary.current_model_id.clone(),
+                        session_model_id: startup_model_id.clone(),
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd,
@@ -1715,7 +1762,7 @@ impl acp::Agent for MvpAgent {
                 Some(&parent_cmd_tx),
             );
         }
-        let persisted_model = summary.current_model_id.clone();
+        let persisted_model = startup_model_id;
         let models = self.models_manager.models();
         let available = self.models_manager.available();
         self.model_unavailable_sessions.borrow_mut().remove(session_id.0.as_ref());
@@ -1837,8 +1884,8 @@ impl acp::Agent for MvpAgent {
         );
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
-            let restore_meta = summary
-                .reasoning_effort
+            let restore_meta = requested_model_id.is_none().then(|| summary.reasoning_effort)
+                .flatten()
                 .map(|effort| {
                     let mut map = acp::Meta::new();
                     map.insert(
@@ -2565,6 +2612,8 @@ impl acp::Agent for MvpAgent {
                     }
                 }
                 if let Some(ctx) = trace_context {
+                    let provider_boundary =
+                        ctx.session_handle.feedback_manager.provider_boundary();
                     let (session_copy_tx, session_copy_rx) = oneshot::channel();
                     let copy_sent = ctx
                         .session_handle
@@ -2608,7 +2657,11 @@ impl acp::Agent for MvpAgent {
                                     })
                         };
                         let sid = arguments.session_id.to_string();
+                        let register_boundary = provider_boundary.clone();
                         tokio::spawn(async move {
+                            if !register_boundary.allows_xai_export() {
+                                return;
+                            }
                             let git_out = |args: &[&str]| -> Option<String> {
                                 xai_tty_utils::git_command()
                                     .current_dir(&cwd_str)
@@ -2646,6 +2699,9 @@ impl acp::Agent for MvpAgent {
                                 fork_context_source: None,
                                 subagent_depth: None,
                             };
+                            if !register_boundary.allows_xai_export() {
+                                return;
+                            }
                             if let Err(e) = client.register(&reg_req).await {
                                 tracing::warn!(
                                     error = % e, "session registry register failed (non-fatal)"
@@ -2675,7 +2731,9 @@ impl acp::Agent for MvpAgent {
                                         .map(|s| s.session_summary)
                                         .filter(|s| !s.is_empty())
                             };
-                            if first_prompt.is_some() || summary.is_some() {
+                            if register_boundary.allows_xai_export()
+                                && (first_prompt.is_some() || summary.is_some())
+                            {
                                 let upd_req = crate::agent::session_registry_client::UpdateRequest {
                                     summary,
                                     first_prompt,
@@ -2708,10 +2766,14 @@ impl acp::Agent for MvpAgent {
                     /// session-state uploads.
                     async fn advance_last_turn(
                         client: crate::agent::session_registry_client::SessionRegistryClient,
+                        provider_boundary: crate::session::persistence::ProviderBoundary,
                         session_id: String,
                         turn: i32,
                         cwd: String,
                     ) {
+                        if !provider_boundary.allows_xai_export() {
+                            return;
+                        }
                         let repo_head_at_end = xai_tty_utils::git_command()
                             .current_dir(&cwd)
                             .args(["rev-parse", "HEAD"])
@@ -2729,7 +2791,9 @@ impl acp::Agent for MvpAgent {
                             repo_head_at_end,
                             restorable_turn_number: None,
                         };
-                        if let Err(e) = client.update(&session_id, &req).await {
+                        if provider_boundary.allows_xai_export()
+                            && let Err(e) = client.update(&session_id, &req).await
+                        {
                             tracing::warn!(
                                 error = % e,
                                 "session registry last_turn_number update failed (non-fatal)"
@@ -2742,9 +2806,13 @@ impl acp::Agent for MvpAgent {
                     /// Called after the post-turn session archive is confirmed in cloud storage.
                     async fn advance_restorable_turn(
                         client: crate::agent::session_registry_client::SessionRegistryClient,
+                        provider_boundary: crate::session::persistence::ProviderBoundary,
                         session_id: String,
                         turn: i32,
                     ) {
+                        if !provider_boundary.allows_xai_export() {
+                            return;
+                        }
                         let req = crate::agent::session_registry_client::UpdateRequest {
                             summary: None,
                             first_prompt: None,
@@ -2759,11 +2827,14 @@ impl acp::Agent for MvpAgent {
                             );
                         }
                     }
-                    if let Some(client) = self.session_registry_client() {
+                    if provider_boundary.allows_xai_export()
+                        && let Some(client) = self.session_registry_client()
+                    {
                         let sid = arguments.session_id.to_string();
                         let cwd = cwd_for_git.clone();
+                        let boundary = provider_boundary.clone();
                         tokio::spawn(async move {
-                            advance_last_turn(client, sid, registry_turn, cwd).await;
+                            advance_last_turn(client, boundary, sid, registry_turn, cwd).await;
                         });
                     }
                     {
@@ -2785,7 +2856,10 @@ impl acp::Agent for MvpAgent {
                                 });
                         });
                     }
-                    let registry_client_for_restorable = self.session_registry_client();
+                    let registry_client_for_restorable = provider_boundary
+                        .allows_xai_export()
+                        .then(|| self.session_registry_client())
+                        .flatten();
                     let registry_sid_for_restorable = arguments.session_id.to_string();
                     let err_ctx = ctx.clone();
                     if let Some(deadline) = upload_deadline {
@@ -2802,8 +2876,9 @@ impl acp::Agent for MvpAgent {
                             Ok(true) => {
                                 if let Some(client) = registry_client_for_restorable {
                                     advance_restorable_turn(
-                                            client,
-                                            registry_sid_for_restorable,
+                                        client,
+                                        provider_boundary.clone(),
+                                        registry_sid_for_restorable,
                                             registry_turn,
                                         )
                                         .await;
@@ -2842,6 +2917,7 @@ impl acp::Agent for MvpAgent {
                                         if let Some(client) = registry_client_for_restorable {
                                             advance_restorable_turn(
                                                     client,
+                                                    provider_boundary.clone(),
                                                     registry_sid_for_restorable,
                                                     registry_turn,
                                                 )

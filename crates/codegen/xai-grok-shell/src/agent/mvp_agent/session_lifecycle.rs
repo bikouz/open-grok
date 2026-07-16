@@ -19,9 +19,24 @@ impl MvpAgent {
     pub(super) fn finalize_session_replica(&self, id: &acp::SessionId) {
         #[cfg(test)]
         self.finalize_spy.borrow_mut().push(id.0.to_string());
-        if let Some(client) = self.session_registry_client() {
+        let provider_boundary = self
+            .sessions
+            .borrow()
+            .get(id)
+            .map(|handle| handle.feedback_manager.provider_boundary());
+        if provider_boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.allows_xai_export())
+            && let Some(client) = self.session_registry_client()
+        {
             let sid = id.0.to_string();
             tokio::spawn(async move {
+                if provider_boundary
+                    .as_ref()
+                    .is_some_and(|boundary| !boundary.allows_xai_export())
+                {
+                    return;
+                }
                 if let Err(e) = client.finalize(&sid).await {
                     tracing::warn!(
                         error = % e, "session registry finalize failed (non-fatal)"

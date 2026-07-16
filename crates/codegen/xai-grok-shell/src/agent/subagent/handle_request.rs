@@ -485,6 +485,17 @@ pub(crate) async fn handle_subagent_request(
             }
         }
     }
+    ctx.provider_boundary
+        .observe(effective_sampling_config.provider);
+    if effective_sampling_config.provider == xai_grok_sampling_types::ModelProvider::Codex
+        && let Some(tx) = &ctx.parent_persistence_tx
+    {
+        let _ = tx.send(
+            crate::session::persistence::PersistenceMsg::ObserveProvider(
+                effective_sampling_config.provider,
+            ),
+        );
+    }
     let subagent_id = request.id.clone();
     let child_session_id = acp::SessionId::new(subagent_id.clone());
     let override_cwd = select_override_cwd(
@@ -588,10 +599,19 @@ pub(crate) async fn handle_subagent_request(
         snapshot_ref: None,
         effective_model_id: Some(effective_model_id.0.to_string()),
     };
+    let child_allows_xai_export = effective_sampling_config.provider
+        == xai_grok_sampling_types::ModelProvider::Xai
+        && ctx.provider_boundary.allows_xai_export();
+    let child_gcs_bucket_url = child_allows_xai_export
+        .then(|| ctx.gcs_bucket_url.clone())
+        .flatten();
+    let child_gcs_upload_method = child_allows_xai_export
+        .then(|| ctx.gcs_upload_method.clone())
+        .flatten();
     write_subagent_meta(&subagent_meta_dir, &subagent_meta);
     if let (Some(bucket_url), Some(upload_method)) = (
-        &ctx.gcs_bucket_url,
-        &ctx.gcs_upload_method,
+        &child_gcs_bucket_url,
+        &child_gcs_upload_method,
     ) {
         let gcs_meta = SubagentSessionMetadata::from_meta(
             &subagent_meta,
@@ -608,19 +628,28 @@ pub(crate) async fn handle_subagent_request(
         let bucket = bucket_url.clone();
         let method = upload_method.clone();
         let auth_for_spawn = ctx.auth_manager.clone();
+        let provider_boundary = ctx.provider_boundary.clone();
         tokio::spawn(async move {
-            upload_subagent_metadata(&gcs_meta, &bucket, method, auth_for_spawn).await;
+            upload_subagent_metadata(
+                &gcs_meta,
+                &bucket,
+                method,
+                auth_for_spawn,
+                provider_boundary,
+            )
+            .await;
         });
     }
     let gcs_upload_ctx = GcsUploadContext {
-        bucket_url: ctx.gcs_bucket_url.clone(),
-        upload_method: ctx.gcs_upload_method.clone(),
+        bucket_url: child_gcs_bucket_url.clone(),
+        upload_method: child_gcs_upload_method.clone(),
         model_id: Some(effective_model_id.0.to_string()),
         cwd: Some(child_session_info.cwd.clone()),
         reasoning_effort: effective_runtime.reasoning_effort.clone(),
         role_name: effective_runtime.role_name.clone(),
         parent_prompt_id: request.parent_prompt_id.clone(),
         auth_manager: ctx.auth_manager.clone(),
+        provider_boundary: ctx.provider_boundary.clone(),
         isolation_mode: Some(format!("{:?}", effective_runtime.isolation)),
         capability_mode: effective_runtime
             .capability_mode
@@ -655,8 +684,8 @@ pub(crate) async fn handle_subagent_request(
         ctx.parent_cmd_tx.as_ref(),
     );
     let early_gcs_ctx = GcsUploadContext {
-        bucket_url: ctx.gcs_bucket_url.clone(),
-        upload_method: ctx.gcs_upload_method.clone(),
+        bucket_url: child_gcs_bucket_url.clone(),
+        upload_method: child_gcs_upload_method.clone(),
         model_id: None,
         cwd: None,
         isolation_mode: None,
@@ -666,6 +695,7 @@ pub(crate) async fn handle_subagent_request(
         parent_prompt_id: request.parent_prompt_id.clone(),
         depth: 0,
         auth_manager: ctx.auth_manager.clone(),
+        provider_boundary: ctx.provider_boundary.clone(),
     };
     let sampling_client = match crate::sampling::Client::new(
         effective_sampling_config.clone(),
@@ -690,13 +720,13 @@ pub(crate) async fn handle_subagent_request(
         }
     };
     let persistence = match session::persistence::new_with_explicit_dir(
-            &child_session_info,
-            child_session_dir.clone(),
-            effective_model_id.clone(),
-            sampling_client,
-            effective_sampling_config.model.clone(),
-        )
-        .await
+        &child_session_info,
+        child_session_dir.clone(),
+        effective_model_id.clone(),
+        sampling_client,
+        effective_sampling_config.model.clone(),
+    )
+    .await
     {
         Ok(p) => p,
         Err(e) => {
@@ -764,7 +794,20 @@ pub(crate) async fn handle_subagent_request(
     );
     let model_has_own_creds = model_entry
         .is_some_and(|entry| entry.has_own_credentials());
-    let inherited_auth_type = subagent_auth_type(model_entry, &ctx.auth_method_id);
+    // Credential provenance belongs to the fully resolved sampler, not the
+    // parent's ACP auth method. A Codex model can be selected from an xAI
+    // session (and vice versa), so consulting only `auth_method_id` here can
+    // make a Codex OAuth child look like xAI API-key auth and drop its live
+    // refresh resolver.
+    let inherited_auth_type =
+        crate::agent::config::resolve_chat_state_auth_type_for_sampling_config(
+            &effective_sampling_config,
+            ctx.auth_manager
+                .current_or_expired()
+                .as_ref()
+                .map(|auth| auth.key.as_str()),
+            subagent_auth_type(model_entry, &ctx.auth_method_id),
+        );
     let credentials = xai_chat_state::Credentials {
         api_key: effective_sampling_config.api_key.clone(),
         auth_type: inherited_auth_type,
@@ -779,12 +822,12 @@ pub(crate) async fn handle_subagent_request(
                 { "subagent_id" : & request.id, "subagent_type" : & request
                 .subagent_type, "effective_model" : effective_model_id.0.as_ref(),
                 "effective_model_raw" : & effective_sampling_config.model, "base_url" : &
-                effective_sampling_config.base_url, "key_prefix" : key_prefix(&
-                effective_sampling_config.api_key), "auth_type" : format!("{:?}",
+                effective_sampling_config.base_url, "effective_auth" :
+                sampling_auth_log_metadata(& effective_sampling_config), "auth_type" : format!("{:?}",
                 inherited_auth_type), "model_has_own_creds" : model_has_own_creds,
                 "auth_method_id" : ctx.auth_method_id.0.as_ref(), "parent_model" : ctx
-                .model_id.0.as_ref(), "parent_key_prefix" : key_prefix(& ctx
-                .sampling_config.api_key), "context_window" : effective_sampling_config
+                .model_id.0.as_ref(), "parent_auth" : sampling_auth_log_metadata(& ctx
+                .sampling_config), "context_window" : effective_sampling_config
                 .context_window, }
             ),
         ),
@@ -1038,6 +1081,7 @@ pub(crate) async fn handle_subagent_request(
         .tx
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
             model_id: effective_model_id.clone(),
+            provider: effective_sampling_config.provider,
             agent_name: Some(definition.name.clone()),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
         });
@@ -1286,15 +1330,17 @@ pub(crate) async fn handle_subagent_request(
             ],
             prompt_mode: crate::session::plan_mode::PromptMode::Agent,
             artifact_upload_ctx: ctx
-                .gcs_bucket_url
+                .provider_boundary
+                .allows_xai_export()
+                .then_some(child_gcs_bucket_url.as_ref())
+                .flatten()
                 .as_ref()
                 .and_then(|_| {
-                    ctx
-                        .gcs_upload_method
+                    child_gcs_upload_method
                         .as_ref()
                         .map(|method| crate::upload::manifest::ArtifactUploadContext {
                             gcs_config: crate::session::repo_changes::TraceExportConfig {
-                                bucket_url: ctx.gcs_bucket_url.clone(),
+                                bucket_url: child_gcs_bucket_url.clone(),
                                 service_account_key: None,
                                 prefix_dir: None,
                                 gcs_prefix: Some(format!("{}/turn_0", child_session_id.0)),

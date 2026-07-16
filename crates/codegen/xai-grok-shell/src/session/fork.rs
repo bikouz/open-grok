@@ -7,7 +7,7 @@ use crate::remote::BackendClient;
 const FORK_LOG: &str = "xai_fork";
 use crate::session::export::ExportedMetadata;
 use crate::session::info::Info;
-use crate::session::storage::{CopySessionOptions, JsonlStorageAdapter};
+use crate::session::storage::{CopySessionOptions, JsonlStorageAdapter, StorageAdapter};
 use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
 use std::io;
@@ -106,8 +106,9 @@ pub async fn fork_session(
         ..Default::default()
     };
 
+    let target_info_for_copy = target_info.clone();
     let result = tokio::task::spawn_blocking(move || {
-        storage.copy_session_data_sync(&source_info, &target_info, options)
+        storage.copy_session_data_sync(&source_info, &target_info_for_copy, options)
     })
     .await
     .map_err(|e| io::Error::other(format!("spawn_blocking panicked: {e}")))??;
@@ -121,7 +122,11 @@ pub async fn fork_session(
     // learns about the session when the background task completes.
     // Spawning removes the network round-trip (~200-400ms) from the
     // critical path.
-    if let Some(am) = auth_manager {
+    let fork_allows_xai_export = JsonlStorageAdapter::with_root(root_dir)
+        .load_summary(&target_info)
+        .await
+        .is_ok_and(|summary| !summary.ever_used_codex);
+    if fork_allows_xai_export && let Some(am) = auth_manager {
         let sid = new_session_id.clone();
         let cwd = request.new_cwd.clone();
         let parent = request.source_session_id.clone();

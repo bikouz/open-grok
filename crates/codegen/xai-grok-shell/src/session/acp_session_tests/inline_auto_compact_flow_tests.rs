@@ -116,6 +116,8 @@ async fn create_test_actor(
             prefix_released: std::sync::atomic::AtomicBool::new(false),
         },
         memory: crate::session::memory_state::SessionMemory {
+            embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+            active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: crate::config::MemoryFlushConfig::default(),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
@@ -549,6 +551,8 @@ async fn create_test_actor_with_memory(
             prefix_released: std::sync::atomic::AtomicBool::new(false),
         },
         memory: crate::session::memory_state::SessionMemory {
+            embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+            active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: memory_config
                 .as_ref()
                 .map_or_else(Default::default, |mc| mc.flush.clone()),
@@ -1318,6 +1322,10 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+                    active_provider: std::cell::Cell::new(
+                        xai_grok_sampling_types::ModelProvider::Xai,
+                    ),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::atomic::AtomicBool::new(false),
                     last_flush_compaction: std::sync::atomic::AtomicU64::new(0),

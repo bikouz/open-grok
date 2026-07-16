@@ -322,6 +322,7 @@ pub struct FeedbackClient {
     base_url: String,
     credentials: crate::util::grok_auth_credentials::GrokAuthCredentials,
     session_id: Option<String>,
+    provider_boundary: Option<crate::session::persistence::ProviderBoundary>,
 }
 
 impl FeedbackClient {
@@ -335,6 +336,7 @@ impl FeedbackClient {
             base_url: base_url.into(),
             credentials,
             session_id: None,
+            provider_boundary: None,
         }
     }
 
@@ -369,7 +371,22 @@ impl FeedbackClient {
             base_url: base_url.into(),
             credentials,
             session_id: None,
+            provider_boundary: None,
         }
+    }
+
+    pub(crate) fn with_provider_boundary(
+        mut self,
+        provider_boundary: crate::session::persistence::ProviderBoundary,
+    ) -> Self {
+        self.provider_boundary = Some(provider_boundary);
+        self
+    }
+
+    fn provider_export_allowed(&self) -> bool {
+        self.provider_boundary
+            .as_ref()
+            .is_none_or(|boundary| boundary.allows_xai_export())
     }
 
     pub(crate) fn with_auth_manager(
@@ -385,9 +402,11 @@ impl FeedbackClient {
     /// attached `AuthManager` and a wired `TokenRefresher` (e.g. static
     /// deployment-key sessions return false).
     pub fn has_token_refresher(&self) -> bool {
-        self.credentials
-            .auth_manager()
-            .is_some_and(|am| am.has_refresher_attached())
+        self.provider_export_allowed()
+            && self
+                .credentials
+                .auth_manager()
+                .is_some_and(|am| am.has_refresher_attached())
     }
 
     /// Rebuild the middleware-wrapped client from the current credentials.
@@ -457,6 +476,9 @@ impl FeedbackClient {
     }
 
     pub async fn try_refresh_credentials(&self) -> bool {
+        if !self.provider_export_allowed() {
+            return false;
+        }
         let Some(manager) = self.credentials.auth_manager() else {
             return false;
         };
@@ -470,6 +492,9 @@ impl FeedbackClient {
     /// timeout.  Background consumers call this before driving their own
     /// `ServerRejected` recovery to avoid amplifying 401 bursts.
     pub(crate) async fn wait_for_token_refresh(&self, timeout: std::time::Duration) -> bool {
+        if !self.provider_export_allowed() {
+            return false;
+        }
         let Some(manager) = self.credentials.auth_manager() else {
             return false;
         };
@@ -517,6 +542,9 @@ impl FeedbackClient {
     ) -> Result<T> {
         let request = xai_file_utils::trace_context::inject_trace_context_into_request(request);
         let req = request.build().context(context)?;
+        if !self.provider_export_allowed() {
+            anyhow::bail!("{context} blocked by provider boundary");
+        }
         let response = self.client.execute(req).await.context(context)?;
 
         self.record_401_attribution_if_needed(&response, context);
@@ -549,6 +577,9 @@ impl FeedbackClient {
     async fn send_empty(&self, request: RequestBuilder, context: &'static str) -> Result<()> {
         let request = xai_file_utils::trace_context::inject_trace_context_into_request(request);
         let req = request.build().context(context)?;
+        if !self.provider_export_allowed() {
+            anyhow::bail!("{context} blocked by provider boundary");
+        }
         let response = self.client.execute(req).await.context(context)?;
 
         self.record_401_attribution_if_needed(&response, context);
@@ -1056,6 +1087,7 @@ mod forbidden_tests {
     use super::*;
     use axum::{Router, response::IntoResponse, routing::post};
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
     async fn start_server(router: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -1113,6 +1145,35 @@ mod forbidden_tests {
             err.to_string().contains("(403)"),
             "error must mention 403, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_boundary_blocks_before_http_execute() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = requests.clone();
+        let router = Router::new().route(
+            "/v1/feedback/config",
+            axum::routing::get(move || {
+                let requests = requests_for_route.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let (addr, _) = start_server(router).await;
+        let boundary = crate::session::persistence::ProviderBoundary::default();
+        let client = FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1"),
+            Some("tok".into()),
+        )
+        .with_provider_boundary(boundary.clone());
+        boundary.observe(xai_grok_sampling_types::ModelProvider::Codex);
+
+        let err = client.get_feedback_config().await.unwrap_err();
+        assert!(err.to_string().contains("provider boundary"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 }
 

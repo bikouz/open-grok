@@ -240,6 +240,8 @@ pub(crate) async fn create_test_actor_ex(
             prefix_released: std::sync::atomic::AtomicBool::new(false),
         },
         memory: crate::session::memory_state::SessionMemory {
+            embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
+            active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: crate::config::MemoryFlushConfig::default(),
             is_flushing: std::sync::atomic::AtomicBool::new(false),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),

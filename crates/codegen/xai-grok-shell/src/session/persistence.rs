@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::StorageMode;
 
@@ -18,7 +19,7 @@ use crate::tools::todo::TodoState;
 use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
-use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_sampling_types::{ModelProvider, ReasoningEffort};
 
 use crate::session::info::Info;
 use tokio::sync::mpsc;
@@ -312,11 +313,25 @@ pub enum PersistenceMsg {
     ReplaceChatHistory(Vec<ConversationItem>),
     CurrentModel {
         model_id: acp::ModelId,
+        /// Provider contract for this model. This is persisted as a sticky
+        /// boundary bit so xAI-only exports cannot resume after Codex content
+        /// has entered the session.
+        provider: ModelProvider,
         /// The active agent definition name (e.g. `"grok-build"`).
         /// Persisted in `summary.agent_name` so session resume doesn't depend
         /// on the mutable model catalog.
         agent_name: Option<String>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+    },
+    /// Observe provider use without changing the parent session's active
+    /// model. Codex-backed subagents use this to close and persist the parent
+    /// tree's cumulative xAI export boundary.
+    ObserveProvider(ModelProvider),
+    /// Bind an idle Codex-backed title client's existing OAuth resolver after
+    /// a session that started logged out adopts its first identity. This is
+    /// runtime-only state; model and endpoint selection stay unchanged.
+    RefreshCodexSummaryAuth {
+        bearer_resolver: xai_grok_sampler::SharedBearerResolver,
     },
     PlanState(TodoState),
     /// Plan mode lifecycle state to persist
@@ -793,6 +808,11 @@ pub struct Summary {
     #[serde(default)]
     pub num_chat_messages: usize,
     pub current_model_id: acp::ModelId,
+    /// Once true, this session has carried Codex-backed content. The flag is
+    /// monotonic and prevents cumulative session data from later being sent
+    /// to xAI-only persistence, relay, feedback, or trace services.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ever_used_codex: bool,
     /// Parent session ID if this session was forked from another session
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
@@ -917,6 +937,7 @@ impl Summary {
             num_messages: 0,
             num_chat_messages: 0,
             current_model_id: model_id,
+            ever_used_codex: false,
             parent_session_id: None,
             forked_at: None,
             collection_id: None,
@@ -1027,6 +1048,27 @@ mod is_hidden_tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Summary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Xhigh));
+    }
+
+    #[test]
+    fn provider_boundary_and_summary_marker_are_sticky() {
+        let boundary = ProviderBoundary::default();
+        assert!(boundary.allows_xai_export());
+        assert!(boundary.observe(ModelProvider::Codex));
+        assert!(!boundary.allows_xai_export());
+        assert!(!boundary.observe(ModelProvider::Xai));
+        assert!(!boundary.allows_xai_export());
+
+        let mut summary = summary_with_kind(None);
+        let patch = crate::session::storage::summary_write::SummaryPatch {
+            ever_used_codex: true,
+            ..Default::default()
+        };
+        summary.apply_patch(&patch, chrono::Utc::now());
+        summary.apply_patch(&Default::default(), chrono::Utc::now());
+        assert!(summary.ever_used_codex);
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("ever_used_codex"));
     }
 
     #[test]
@@ -1363,8 +1405,43 @@ mod generated_title_tests {
     }
 }
 
+/// Shared, monotonic guard for xAI-only session exports.
+///
+/// Clones intentionally share one atomic so the persistence actor, feedback
+/// manager, and trace path observe a provider switch immediately.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProviderBoundary {
+    ever_used_codex: Arc<AtomicBool>,
+}
+
+impl ProviderBoundary {
+    pub(crate) fn new(ever_used_codex: bool) -> Self {
+        Self {
+            ever_used_codex: Arc::new(AtomicBool::new(ever_used_codex)),
+        }
+    }
+
+    /// Observe a provider and return true only for the first Codex transition.
+    pub(crate) fn observe(&self, provider: ModelProvider) -> bool {
+        provider == ModelProvider::Codex
+            && self
+                .ever_used_codex
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    pub(crate) fn ever_used_codex(&self) -> bool {
+        self.ever_used_codex.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn allows_xai_export(&self) -> bool {
+        !self.ever_used_codex()
+    }
+}
+
 pub struct PersistenceHandle {
     pub tx: mpsc::UnboundedSender<PersistenceMsg>,
+    pub(crate) provider_boundary: ProviderBoundary,
     /// Explicit flag set only by [`Self::noop`]. Do not treat a closed sender
     /// alone as noop — a real persistence actor may exit and drop its receiver.
     noop: bool,
@@ -1376,8 +1453,18 @@ impl PersistenceHandle {
     /// Used for subagent child sessions that don't need disk persistence
     /// (their results are captured by the parent via the oneshot channel).
     pub fn noop() -> Self {
+        Self::noop_for_provider(ModelProvider::Xai)
+    }
+
+    pub(crate) fn noop_for_provider(provider: ModelProvider) -> Self {
         let (tx, _rx) = mpsc::unbounded_channel();
-        Self { tx, noop: true }
+        let provider_boundary = ProviderBoundary::default();
+        provider_boundary.observe(provider);
+        Self {
+            tx,
+            provider_boundary,
+            noop: true,
+        }
     }
 
     /// `true` only for handles created via [`Self::noop`].
@@ -1392,6 +1479,8 @@ struct SessionPersistence {
     /// Pending ACP notification for merging consecutive text chunks
     pending_notification: Option<acp::SessionNotification>,
     rx: mpsc::UnboundedReceiver<PersistenceMsg>,
+    provider_boundary: ProviderBoundary,
+    current_provider: ModelProvider,
     remote_sync: Option<RemoteSync>,
     /// WebSocket-based relay sync for real-time session sharing.
     /// This streams updates to the relay backend in addition to local persistence.
@@ -1408,6 +1497,20 @@ struct SessionPersistence {
 }
 
 impl SessionPersistence {
+    async fn observe_provider(&mut self, provider: ModelProvider) {
+        self.provider_boundary.observe(provider);
+        if !self.provider_boundary.allows_xai_export() {
+            self.remote_sync.take();
+            self.relay_sync.take();
+            self.registry_title_sync.take();
+        }
+        if provider == ModelProvider::Codex
+            && let Err(e) = self.storage.mark_ever_used_codex(&self.info).await
+        {
+            tracing::warn!(?e, "failed to persist Codex provider boundary");
+        }
+    }
+
     fn try_merge_text(prev: &mut acp::ContentBlock, new: &acp::ContentBlock) -> bool {
         match (prev, new) {
             (acp::ContentBlock::Text(prev_text), acp::ContentBlock::Text(new_text))
@@ -1507,20 +1610,28 @@ impl SessionPersistence {
             self.write_update(&SessionUpdate::Acp(Box::new(notification.clone())))
                 .await;
             // HTTP-based remote sync (Writeback mode)
-            if let Some(sync) = &self.remote_sync {
+            if self.provider_boundary.allows_xai_export()
+                && let Some(sync) = &self.remote_sync
+            {
                 sync.queue(notification.clone());
             }
             // WebSocket-based relay sync (real-time sharing)
-            if let Some(relay) = &self.relay_sync {
+            if self.provider_boundary.allows_xai_export()
+                && let Some(relay) = &self.relay_sync
+            {
                 relay.queue(notification);
             }
         }
         // Flush HTTP sync
-        if let Some(sync) = &self.remote_sync {
+        if self.provider_boundary.allows_xai_export()
+            && let Some(sync) = &self.remote_sync
+        {
             sync.flush();
         }
         // Flush WebSocket relay
-        if let Some(relay) = &self.relay_sync {
+        if self.provider_boundary.allows_xai_export()
+            && let Some(relay) = &self.relay_sync
+        {
             relay.flush();
         }
     }
@@ -1563,11 +1674,15 @@ impl SessionPersistence {
                                 self.write_update(&SessionUpdate::Acp(Box::new(to_write.clone())))
                                     .await;
                                 // HTTP-based remote sync (Writeback mode)
-                                if let Some(sync) = &self.remote_sync {
+                                if self.provider_boundary.allows_xai_export()
+                                    && let Some(sync) = &self.remote_sync
+                                {
                                     sync.queue(to_write.clone());
                                 }
                                 // WebSocket-based relay sync (real-time sharing)
-                                if let Some(relay) = &self.relay_sync {
+                                if self.provider_boundary.allows_xai_export()
+                                    && let Some(relay) = &self.relay_sync
+                                {
                                     relay.queue(to_write);
                                 }
                             }
@@ -1602,9 +1717,12 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::CurrentModel {
                     model_id,
+                    provider,
                     agent_name,
                     reasoning_effort,
                 } => {
+                    self.current_provider = provider;
+                    self.observe_provider(provider).await;
                     if let Err(e) = self
                         .storage
                         .update_current_model_and_agent(
@@ -1617,9 +1735,17 @@ impl SessionPersistence {
                     {
                         tracing::warn!(?e, "failed to update current model");
                     }
-                    if let Some(sync) = &self.remote_sync {
+                    if self.provider_boundary.allows_xai_export()
+                        && let Some(sync) = &self.remote_sync
+                    {
                         sync.set_model_id(model_id.0.to_string());
                     }
+                }
+                PersistenceMsg::ObserveProvider(provider) => {
+                    self.observe_provider(provider).await;
+                }
+                PersistenceMsg::RefreshCodexSummaryAuth { bearer_resolver } => {
+                    self.summary.refresh_codex_bearer_resolver(bearer_resolver);
                 }
                 PersistenceMsg::PlanState(state) => {
                     if let Err(e) = self.storage.write_plan_state(&self.info, &state).await {
@@ -1646,7 +1772,15 @@ impl SessionPersistence {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    self.summary.update(content_part);
+                    if self.summary.provider() == self.current_provider {
+                        self.summary.update(content_part);
+                    } else {
+                        tracing::debug!(
+                            active_provider = ?self.current_provider,
+                            summary_provider = ?self.summary.provider(),
+                            "session title generation skipped across provider boundary"
+                        );
+                    }
 
                     // Notify session search index so this turn becomes searchable
                     crate::session::storage::search::notify_session_updated(
@@ -1675,16 +1809,23 @@ impl SessionPersistence {
                                 &self.info,
                                 &title,
                             );
-                            if let Some(sync) = &self.remote_sync {
+                            if self.provider_boundary.allows_xai_export()
+                                && let Some(sync) = &self.remote_sync
+                            {
                                 sync.set_title(title.clone());
                             }
-                            if let Some(reg) = self.registry_title_sync.as_ref()
+                            if self.provider_boundary.allows_xai_export()
+                                && let Some(reg) = self.registry_title_sync.as_ref()
                                 && !reg.suppress_for_zdr
                             {
                                 let client = reg.client.clone();
+                                let provider_boundary = self.provider_boundary.clone();
                                 let sid = self.info.id.to_string();
                                 let t = title;
                                 tokio::spawn(async move {
+                                    if !provider_boundary.allows_xai_export() {
+                                        return;
+                                    }
                                     let req =
                                         crate::agent::session_registry_client::UpdateRequest {
                                             summary: Some(t),
@@ -2057,6 +2198,21 @@ async fn touch_worktree_for_session(info: &Info) {
 /// Floor between activity-driven worktree touches from the persistence actor.
 const WORKTREE_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+async fn initialize_provider_boundary(
+    storage: &dyn StorageAdapter,
+    info: &Info,
+    summary: &mut Summary,
+    provider: ModelProvider,
+) -> io::Result<ProviderBoundary> {
+    let boundary = ProviderBoundary::new(summary.ever_used_codex);
+    boundary.observe(provider);
+    if provider == ModelProvider::Codex && !summary.ever_used_codex {
+        storage.mark_ever_used_codex(info).await?;
+        summary.ever_used_codex = true;
+    }
+    Ok(boundary)
+}
+
 pub(crate) async fn new(
     info: &Info,
     model_id: acp::ModelId,
@@ -2081,13 +2237,30 @@ pub(crate) async fn new(
         summary.current_model_id = model_id;
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
-
-    let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let remote_sync = init_remote_sync(&summary, storage_mode, auth_manager)?;
+    let current_provider = sampling_client.provider();
+    let provider_boundary =
+        initialize_provider_boundary(storage.as_ref(), info, &mut summary, current_provider)
+            .await?;
+    let remote_sync = if provider_boundary.allows_xai_export() {
+        init_remote_sync(&summary, storage_mode, auth_manager)?
+    } else {
+        None
+    };
+    let relay_sync = provider_boundary
+        .allows_xai_export()
+        .then_some(relay_sync)
+        .flatten();
+    let registry_title_sync = provider_boundary
+        .allows_xai_export()
+        .then_some(registry_title_sync)
+        .flatten();
+
+    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let info_clone = info.clone();
     let handle = PersistenceHandle {
         tx: tx.clone(),
+        provider_boundary: provider_boundary.clone(),
         noop: false,
     };
 
@@ -2097,6 +2270,8 @@ pub(crate) async fn new(
             storage: storage.clone(),
             pending_notification: None,
             rx,
+            provider_boundary,
+            current_provider,
             remote_sync: remote_sync.clone(),
             relay_sync,
             summary: crate::session::summary::SummaryGenerator::new(
@@ -2152,12 +2327,17 @@ pub async fn new_with_explicit_dir(
         summary.current_model_id = model_id;
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
-
-    let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
+    let current_provider = sampling_client.provider();
+    let provider_boundary =
+        initialize_provider_boundary(storage.as_ref(), info, &mut summary, current_provider)
+            .await?;
+
+    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let info_clone = info.clone();
     let handle = PersistenceHandle {
         tx: tx.clone(),
+        provider_boundary: provider_boundary.clone(),
         noop: false,
     };
 
@@ -2167,6 +2347,8 @@ pub async fn new_with_explicit_dir(
             storage: storage.clone(),
             pending_notification: None,
             rx,
+            provider_boundary,
+            current_provider,
             remote_sync: None,
             relay_sync: None,
             summary: crate::session::summary::SummaryGenerator::new(
@@ -2257,7 +2439,7 @@ pub(crate) async fn load(
     // Touch on load too: resuming must reset the worktree's gc expiry clock.
     touch_worktree_for_session(&loaded_info).await;
 
-    let persisted_info = PersistedInfo {
+    let mut persisted_info = PersistedInfo {
         summary: persisted.summary,
         chat_history: persisted.chat_history,
         updates: persisted.updates,
@@ -2266,14 +2448,35 @@ pub(crate) async fn load(
         signals: persisted.signals,
     };
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
-
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
+    let current_provider = sampling_client.provider();
+    let provider_boundary = initialize_provider_boundary(
+        storage.as_ref(),
+        &loaded_info,
+        &mut persisted_info.summary,
+        current_provider,
+    )
+    .await?;
+    let remote_sync = if provider_boundary.allows_xai_export() {
+        init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?
+    } else {
+        None
+    };
+    let relay_sync = provider_boundary
+        .allows_xai_export()
+        .then_some(relay_sync)
+        .flatten();
+    let registry_title_sync = provider_boundary
+        .allows_xai_export()
+        .then_some(registry_title_sync)
+        .flatten();
+
+    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
 
     let has_title = !persisted_info.summary.display_title().is_empty();
     let handle = PersistenceHandle {
         tx: tx.clone(),
+        provider_boundary: provider_boundary.clone(),
         noop: false,
     };
     tokio::task::spawn(async move {
@@ -2292,6 +2495,8 @@ pub(crate) async fn load(
             storage: storage.clone(),
             pending_notification: None,
             rx,
+            provider_boundary,
+            current_provider,
             remote_sync: remote_sync.clone(),
             relay_sync,
             summary: summary_gen,
@@ -2339,7 +2544,7 @@ pub(crate) async fn load_light(
     let updates_file_path = storage.updates_file_path(&loaded_info);
     let rewind_points_file_path = storage.rewind_points_file_path(&loaded_info);
 
-    let persisted_info = PersistedInfoLight {
+    let mut persisted_info = PersistedInfoLight {
         summary: persisted.summary,
         chat_history: persisted.chat_history,
         plan_state: persisted.plan_state,
@@ -2351,14 +2556,35 @@ pub(crate) async fn load_light(
         goal_mode_state: persisted.goal_mode_state,
     };
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
-
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
+    let current_provider = sampling_client.provider();
+    let provider_boundary = initialize_provider_boundary(
+        storage.as_ref(),
+        &loaded_info,
+        &mut persisted_info.summary,
+        current_provider,
+    )
+    .await?;
+    let remote_sync = if provider_boundary.allows_xai_export() {
+        init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?
+    } else {
+        None
+    };
+    let relay_sync = provider_boundary
+        .allows_xai_export()
+        .then_some(relay_sync)
+        .flatten();
+    let registry_title_sync = provider_boundary
+        .allows_xai_export()
+        .then_some(registry_title_sync)
+        .flatten();
+
+    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
 
     let has_title = !persisted_info.summary.display_title().is_empty();
     let handle = PersistenceHandle {
         tx: tx.clone(),
+        provider_boundary: provider_boundary.clone(),
         noop: false,
     };
     tokio::task::spawn(async move {
@@ -2377,6 +2603,8 @@ pub(crate) async fn load_light(
             storage: storage.clone(),
             pending_notification: None,
             rx,
+            provider_boundary,
+            current_provider,
             remote_sync: remote_sync.clone(),
             relay_sync,
             summary: summary_gen,
