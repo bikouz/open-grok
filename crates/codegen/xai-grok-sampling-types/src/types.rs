@@ -774,6 +774,33 @@ pub enum ReasoningEffort {
     Ultra,
 }
 
+/// Reasoning-summary detail requested from a Responses API model.
+///
+/// This mirrors the Codex model-catalog contract. `None` is a local sentinel:
+/// callers omit `reasoning.summary` rather than serializing the string
+/// `"none"` on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningSummary {
+    #[default]
+    Auto,
+    Concise,
+    Detailed,
+    None,
+}
+
+impl ReasoningSummary {
+    /// Responses API wire value, or `None` when summaries are disabled.
+    pub const fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => Some("auto"),
+            Self::Concise => Some("concise"),
+            Self::Detailed => Some("detailed"),
+            Self::None => None,
+        }
+    }
+}
+
 impl ReasoningEffort {
     /// Convert to the newest effort variant modeled by async-openai 0.33.1.
     ///
@@ -1609,6 +1636,28 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_string(&mode).unwrap(), wire);
             assert_eq!(serde_json::from_str::<ToolMode>(wire).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn reasoning_summary_serde_default_and_wire_omission_are_stable() {
+        assert_eq!(ReasoningSummary::default(), ReasoningSummary::Auto);
+        for (summary, wire, value) in [
+            (ReasoningSummary::Auto, r#""auto""#, Some("auto")),
+            (ReasoningSummary::Concise, r#""concise""#, Some("concise")),
+            (
+                ReasoningSummary::Detailed,
+                r#""detailed""#,
+                Some("detailed"),
+            ),
+            (ReasoningSummary::None, r#""none""#, None),
+        ] {
+            assert_eq!(serde_json::to_string(&summary).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<ReasoningSummary>(wire).unwrap(),
+                summary
+            );
+            assert_eq!(summary.wire_value(), value);
         }
     }
 }

@@ -958,6 +958,9 @@ async fn read_parent_sampling_config(
                 context_window: cfg.context_window.get(),
                 client_version: creds.client_version,
                 reasoning_effort: cfg.reasoning_effort,
+                reasoning_summary: ctx
+                    .models_manager
+                    .model_reasoning_summary(ctx.model_id.0.as_ref()),
                 force_http1: false,
                 max_retries: None,
                 stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
@@ -1025,6 +1028,9 @@ async fn read_parent_sampling_config(
     fallback.supports_backend_search = ctx
         .models_manager
         .model_supports_backend_search(ctx.model_id.0.as_ref());
+    fallback.reasoning_summary = ctx
+        .models_manager
+        .model_reasoning_summary(ctx.model_id.0.as_ref());
     fallback.compactions_remaining = ctx
         .models_manager
         .model_compactions_remaining(ctx.model_id.0.as_ref());

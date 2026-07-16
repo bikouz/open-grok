@@ -12,7 +12,7 @@ use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_sampler::{AuthScheme, SamplerConfig};
 use xai_grok_sampling_types::{
     CompactionAtTokens, CompactionsRemaining, ModelProvider, REASONING_EFFORT_META_KEY,
-    REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption, ToolMode,
+    REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption, ReasoningSummary, ToolMode,
     reasoning_effort_meta_value, reasoning_efforts_meta_value,
 };
 use xai_grok_tools::types::compat::{
@@ -3571,6 +3571,12 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 reasoning_effort: m.reasoning_effort,
                 supports_reasoning_effort: m.supports_reasoning_effort,
                 reasoning_efforts: m.reasoning_efforts,
+                supports_reasoning_summary_parameter: m.provider == ModelProvider::Codex,
+                default_reasoning_summary: if m.provider == ModelProvider::Codex {
+                    ReasoningSummary::Auto
+                } else {
+                    ReasoningSummary::None
+                },
                 supports_backend_search: m.supports_backend_search,
                 compactions_remaining: m.compactions_remaining,
                 compaction_at_tokens: m.compaction_at_tokens,
@@ -3637,6 +3643,12 @@ pub struct ModelEntryConfig {
     /// above are derived from this list when it is non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    /// Whether this model accepts the Responses `reasoning.summary` member.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_reasoning_summary_parameter: bool,
+    /// Catalog-selected reasoning-summary detail.
+    #[serde(default)]
+    pub default_reasoning_summary: ReasoningSummary,
     /// Extra headers to send with requests to this model's endpoint.
     /// Useful for BYOK (Bring Your Own Key) scenarios.
     /// Example: { "x-anthropic-api-key" = "sk-ant-..." }
@@ -3945,6 +3957,12 @@ pub struct ModelInfo {
     /// Per-model reasoning-effort menu (source of truth); legacy fields derived from it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    /// Whether this model accepts the Responses `reasoning.summary` member.
+    #[serde(default)]
+    pub supports_reasoning_summary_parameter: bool,
+    /// Catalog-selected reasoning-summary detail.
+    #[serde(default)]
+    pub default_reasoning_summary: ReasoningSummary,
     pub supports_backend_search: bool,
     /// Per-model config for the `x-compactions-remaining` header; `None` disables it.
     pub compactions_remaining: Option<CompactionsRemaining>,
@@ -3992,6 +4010,8 @@ impl ModelInfo {
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            supports_reasoning_summary_parameter: false,
+            default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
@@ -4030,6 +4050,8 @@ impl ModelInfo {
             reasoning_effort: entry.reasoning_effort,
             supports_reasoning_effort: entry.supports_reasoning_effort,
             reasoning_efforts: entry.reasoning_efforts.clone(),
+            supports_reasoning_summary_parameter: entry.supports_reasoning_summary_parameter,
+            default_reasoning_summary: entry.default_reasoning_summary,
             supports_backend_search: entry.supports_backend_search,
             compactions_remaining: entry.compactions_remaining,
             compaction_at_tokens: entry.compaction_at_tokens,
@@ -4765,6 +4787,8 @@ pub fn resolve_aux_model_sampling_config(
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                supports_reasoning_summary_parameter: false,
+                default_reasoning_summary: ReasoningSummary::None,
                 supports_backend_search: false,
                 compactions_remaining: None,
                 compaction_at_tokens: None,
@@ -4970,6 +4994,7 @@ pub fn sampling_config_for_model(
             .then_some(client_version)
             .flatten(),
         reasoning_effort: info.reasoning_effort,
+        reasoning_summary: model_reasoning_summary(info),
         force_http1: false,
         max_retries: info.max_retries,
         stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
@@ -5004,6 +5029,17 @@ pub fn sampling_config_for_model(
 /// the model's reasoning-effort menu.
 pub fn supports_codex_multi_agent_v2(info: &ModelInfo) -> bool {
     info.provider == ModelProvider::Codex && info.codex_multi_agent_v2
+}
+
+/// Effective Responses reasoning-summary mode derived from model metadata.
+///
+/// xAI keeps its existing typed `concise` default. Codex only forwards the
+/// catalog value when the selected model advertises parameter support; an
+/// explicit catalog `none` is represented by omission on the wire.
+pub fn model_reasoning_summary(info: &ModelInfo) -> Option<ReasoningSummary> {
+    (info.provider == ModelProvider::Codex && info.supports_reasoning_summary_parameter)
+        .then_some(info.default_reasoning_summary)
+        .filter(|summary| *summary != ReasoningSummary::None)
 }
 /// Fold URL-derived headers into `extra_headers`.
 ///
@@ -5095,6 +5131,8 @@ fn resolve_hidden_default_web_search_sampling_config(
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            supports_reasoning_summary_parameter: false,
+            default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
@@ -5900,6 +5938,8 @@ reasoning_effort = "low"
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                supports_reasoning_summary_parameter: false,
+                default_reasoning_summary: ReasoningSummary::None,
                 supports_backend_search: false,
                 compactions_remaining: None,
                 compaction_at_tokens: None,
@@ -7038,6 +7078,8 @@ reasoning_effort = "low"
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            supports_reasoning_summary_parameter: false,
+            default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
@@ -7200,6 +7242,8 @@ reasoning_effort = "low"
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            supports_reasoning_summary_parameter: false,
+            default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
@@ -7654,6 +7698,8 @@ reasoning_effort = "low"
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            supports_reasoning_summary_parameter: false,
+            default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
@@ -11218,6 +11264,8 @@ default = "grok-4.5"
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                supports_reasoning_summary_parameter: false,
+                default_reasoning_summary: ReasoningSummary::None,
                 supports_backend_search: false,
                 compactions_remaining: None,
                 compaction_at_tokens: None,
@@ -11655,6 +11703,12 @@ default = "grok-4.5"
             assert_eq!(entry.info.agent_type, "codex");
             assert_eq!(entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
             assert_eq!(entry.info.api_backend, ApiBackend::Responses);
+            assert!(entry.info.supports_reasoning_summary_parameter);
+            assert_eq!(entry.info.default_reasoning_summary, ReasoningSummary::Auto);
+            assert_eq!(
+                model_reasoning_summary(entry.info()),
+                Some(ReasoningSummary::Auto)
+            );
             assert!(
                 !entry.info.supported_in_api,
                 "embedded Codex fallbacks require a Codex OAuth session"

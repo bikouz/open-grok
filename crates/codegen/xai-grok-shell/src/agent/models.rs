@@ -672,6 +672,18 @@ impl ModelsManager {
             .is_some_and(|entry| config::supports_codex_multi_agent_v2(entry.info()))
     }
 
+    /// Resolve the effective Codex reasoning-summary mode by catalog key or
+    /// routing slug. The authenticated models.json snapshot remains
+    /// authoritative across client rebuilds and subagent inheritance.
+    pub fn model_reasoning_summary(
+        &self,
+        model_id: &str,
+    ) -> Option<xai_grok_sampling_types::ReasoningSummary> {
+        let models = self.inner.models.read();
+        config::find_model_by_id(&models, model_id)
+            .and_then(|entry| config::model_reasoning_summary(entry.info()))
+    }
+
     /// Live Codex compaction metadata for a catalog key or routing slug.
     /// Embedded/offline models deliberately return `None`, retaining the
     /// historical 90%-of-raw fallback and no hash-triggered compaction.
@@ -3735,6 +3747,8 @@ mod tests {
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            supports_reasoning_summary_parameter: false,
+            default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,

@@ -915,6 +915,8 @@ pub fn parse_remote_model_value(
             .and_then(|v| v.as_array())
             .map(|arr| xai_grok_sampling_types::parse_reasoning_effort_options(arr))
             .unwrap_or_default(),
+        supports_reasoning_summary_parameter: false,
+        default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
         supports_backend_search: obj
             .get("supportsBackendSearch")
             .or_else(|| obj.get("supports_backend_search"))

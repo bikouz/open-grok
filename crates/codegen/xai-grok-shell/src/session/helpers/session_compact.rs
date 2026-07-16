@@ -1604,6 +1604,7 @@ mod reasoning_compaction_regression_tests {
             idle_timeout_secs: None,
             client_identifier: None,
             reasoning_effort: None,
+            reasoning_summary: None,
             deployment_id: None,
             user_id: None,
             origin_client: None,

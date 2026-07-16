@@ -1179,6 +1179,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,
+                reasoning_summary: None,
                 deployment_id: None,
                 user_id: None,
                 origin_client: None,

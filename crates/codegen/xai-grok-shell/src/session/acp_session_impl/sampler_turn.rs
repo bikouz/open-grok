@@ -372,6 +372,7 @@ impl SessionActor {
         let codex_multi_agent_v2 = self
             .models_manager
             .model_supports_codex_multi_agent_v2(&cfg.model);
+        let reasoning_summary = self.models_manager.model_reasoning_summary(&cfg.model);
         SamplingConfig {
             api_key: creds.api_key,
             base_url: cfg.base_url,
@@ -386,6 +387,7 @@ impl SessionActor {
             context_window: cfg.context_window.get(),
             client_version: creds.client_version,
             reasoning_effort: cfg.reasoning_effort,
+            reasoning_summary,
             force_http1: false,
             max_retries: Some(self.max_retries),
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),

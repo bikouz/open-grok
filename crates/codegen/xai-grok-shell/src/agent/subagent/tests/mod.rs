@@ -3112,6 +3112,8 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            supports_reasoning_summary_parameter: false,
+            default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,

@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
     ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ModelProvider,
-    ReasoningEffort,
+    ReasoningEffort, ReasoningSummary,
 };
 
 use crate::attribution::SharedAttributionCallback;
@@ -75,6 +75,11 @@ pub struct SamplerConfig {
 
     // Reasoning effort
     pub reasoning_effort: Option<ReasoningEffort>,
+
+    /// Effective Responses API reasoning-summary mode for this model.
+    /// `None` omits the parameter (unsupported or explicitly disabled).
+    #[serde(default)]
+    pub reasoning_summary: Option<ReasoningSummary>,
 
     // Client identity
     pub origin_client: Option<OriginClientInfo>,
@@ -158,6 +163,7 @@ impl Default for SamplerConfig {
             stream_tool_calls: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
+            reasoning_summary: None,
             origin_client: None,
             client_identifier: None,
             deployment_id: None,

@@ -477,6 +477,7 @@ fn patch_codex_request_compat(
     provider: ModelProvider,
     multi_agent_v2: bool,
     local_effort: Option<ReasoningEffort>,
+    reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
 ) {
     if provider != ModelProvider::Codex {
         return;
@@ -484,14 +485,27 @@ fn patch_codex_request_compat(
 
     patch_codex_instruction_roles(request_body);
 
-    // GPT-5.6 Codex models default to automatic reasoning summaries. The
-    // shared typed conversion uses `concise` for xAI, so project the Codex
-    // request to the same value codex-rs obtains from models.json.
-    if request_body
-        .get("reasoning")
-        .is_some_and(serde_json::Value::is_object)
-    {
-        request_body["reasoning"]["summary"] = serde_json::Value::String("auto".to_owned());
+    // The typed conversation conversion defaults to `concise` for xAI. For
+    // Codex, models.json is authoritative: project its effective value or
+    // remove the field when the model does not support it / selects `none`.
+    match reasoning_summary.and_then(|summary| summary.wire_value()) {
+        Some(summary) => {
+            if !request_body
+                .get("reasoning")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                request_body["reasoning"] = serde_json::json!({});
+            }
+            request_body["reasoning"]["summary"] = serde_json::Value::String(summary.to_owned());
+        }
+        None => {
+            if let Some(reasoning) = request_body
+                .get_mut("reasoning")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                reasoning.remove("summary");
+            }
+        }
     }
 
     if matches!(
@@ -958,6 +972,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
+    reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
 
@@ -1203,6 +1218,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
+            reasoning_summary: config.reasoning_summary,
             doom_loop_recovery: config.doom_loop_recovery,
         };
 
@@ -1896,6 +1912,7 @@ impl SamplingClient {
             self.defaults.provider,
             self.defaults.codex_multi_agent_v2,
             local_reasoning_effort,
+            self.defaults.reasoning_summary,
         );
         retain_codex_compact_request_fields(&mut request_body)?;
 
@@ -2063,6 +2080,7 @@ impl SamplingClient {
             self.defaults.provider,
             self.defaults.codex_multi_agent_v2,
             request.local_reasoning_effort,
+            self.defaults.reasoning_summary,
         );
         let http_request = grok_headers
             .apply_for_provider(
@@ -2231,6 +2249,7 @@ impl SamplingClient {
             self.defaults.provider,
             self.defaults.codex_multi_agent_v2,
             request.local_reasoning_effort,
+            self.defaults.reasoning_summary,
         );
         // Fresh per attempt so signals never leak across retries; `None`
         // disables collection. The opt-in wire header is xAI-only below.
@@ -3048,6 +3067,7 @@ mod tests {
             stream_tool_calls: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
+            reasoning_summary: None,
             origin_client: None,
             client_identifier: None,
             deployment_id: None,
@@ -3968,7 +3988,13 @@ mod tests {
                 "input": [{ "type": "message", "role": "user", "content": "hello" }],
                 "reasoning": { "effort": "xhigh" },
             });
-            patch_codex_request_compat(&mut body, ModelProvider::Codex, false, Some(effort));
+            patch_codex_request_compat(
+                &mut body,
+                ModelProvider::Codex,
+                false,
+                Some(effort),
+                Some(xai_grok_sampling_types::ReasoningSummary::Auto),
+            );
             assert_eq!(
                 body.pointer("/reasoning/effort")
                     .and_then(serde_json::Value::as_str),
@@ -3983,22 +4009,35 @@ mod tests {
     }
 
     #[test]
-    fn codex_uses_auto_reasoning_summaries_without_changing_xai() {
-        let mut codex = serde_json::json!({
-            "input": [],
-            "reasoning": {"effort": "high", "summary": "concise"}
-        });
-        patch_codex_request_compat(&mut codex, ModelProvider::Codex, false, None);
-        assert_eq!(
-            codex.pointer("/reasoning/summary"),
-            Some(&serde_json::json!("auto"))
-        );
+    fn codex_uses_catalog_reasoning_summary_without_changing_xai() {
+        use xai_grok_sampling_types::ReasoningSummary;
+
+        for (summary, expected) in [
+            (Some(ReasoningSummary::Auto), Some("auto")),
+            (Some(ReasoningSummary::Concise), Some("concise")),
+            (Some(ReasoningSummary::Detailed), Some("detailed")),
+            (Some(ReasoningSummary::None), None),
+            (None, None),
+        ] {
+            let mut codex = serde_json::json!({
+                "input": [],
+                "reasoning": {"effort": "high", "summary": "concise"}
+            });
+            patch_codex_request_compat(&mut codex, ModelProvider::Codex, false, None, summary);
+            assert_eq!(
+                codex
+                    .pointer("/reasoning/summary")
+                    .and_then(serde_json::Value::as_str),
+                expected,
+                "summary mode {summary:?}: {codex}",
+            );
+        }
 
         let mut xai = serde_json::json!({
             "input": [],
             "reasoning": {"effort": "high", "summary": "concise"}
         });
-        patch_codex_request_compat(&mut xai, ModelProvider::Xai, false, None);
+        patch_codex_request_compat(&mut xai, ModelProvider::Xai, false, None, None);
         assert_eq!(
             xai.pointer("/reasoning/summary"),
             Some(&serde_json::json!("concise"))
@@ -4021,7 +4060,7 @@ mod tests {
             "instructions": null
         });
 
-        patch_codex_request_compat(&mut body, ModelProvider::Codex, false, None);
+        patch_codex_request_compat(&mut body, ModelProvider::Codex, false, None, None);
 
         assert_eq!(body["instructions"], "base one\n\nbase two");
         let input = body["input"].as_array().unwrap();
@@ -4041,7 +4080,7 @@ mod tests {
             "instructions": null
         });
 
-        patch_codex_request_compat(&mut body, ModelProvider::Xai, false, None);
+        patch_codex_request_compat(&mut body, ModelProvider::Xai, false, None, None);
 
         assert_eq!(body["input"][0]["role"], "system");
         assert!(body["instructions"].is_null());
@@ -4057,7 +4096,7 @@ mod tests {
             "instructions": "authoritative compact instructions"
         });
 
-        patch_codex_request_compat(&mut body, ModelProvider::Codex, false, None);
+        patch_codex_request_compat(&mut body, ModelProvider::Codex, false, None, None);
 
         assert_eq!(body["instructions"], "authoritative compact instructions");
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
@@ -4075,12 +4114,14 @@ mod tests {
             ModelProvider::Codex,
             true,
             Some(ReasoningEffort::Ultra),
+            None,
         );
         patch_codex_request_compat(
             &mut body,
             ModelProvider::Codex,
             true,
             Some(ReasoningEffort::Ultra),
+            None,
         );
 
         let input = body["input"].as_array().unwrap();
@@ -4111,6 +4152,7 @@ mod tests {
             ModelProvider::Codex,
             true,
             Some(ReasoningEffort::Max),
+            None,
         );
         let policy = body["input"]
             .as_array()
@@ -4140,6 +4182,7 @@ mod tests {
                 provider,
                 multi_agent_v2,
                 Some(ReasoningEffort::Ultra),
+                None,
             );
             assert!(
                 body["input"]
@@ -4162,6 +4205,7 @@ mod tests {
             ModelProvider::Codex,
             true,
             Some(ReasoningEffort::Ultra),
+            None,
         );
         let policy = body["input"]
             .as_array()

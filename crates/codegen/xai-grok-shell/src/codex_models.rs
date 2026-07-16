@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 use xai_grok_sampling_types::{
-    ApiBackend, ModelProvider, ReasoningEffort, ReasoningEffortOption, ToolMode,
+    ApiBackend, ModelProvider, ReasoningEffort, ReasoningEffortOption, ReasoningSummary, ToolMode,
 };
 
 pub(crate) const CODEX_MODELS_CACHE_FILE: &str = "codex_models_cache.json";
@@ -33,6 +33,10 @@ pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.144.5";
 const CODEX_MODELS_CACHE_TTL: Duration = Duration::from_secs(300);
 const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
+
+const fn default_true() -> bool {
+    true
+}
 
 /// Resolve the Codex compatibility version advertised to `/models`.
 /// Prerelease/build suffixes are deliberately removed, matching codex-rs's
@@ -201,6 +205,14 @@ struct CodexWireModel {
     default_reasoning_level: Option<String>,
     #[serde(default)]
     supported_reasoning_levels: Vec<CodexWireReasoningLevel>,
+    /// Whether the model accepts the Responses `reasoning.summary` member.
+    /// Older catalogs omitted this field and Codex defaults it to supported.
+    #[serde(default = "default_true")]
+    supports_reasoning_summary_parameter: bool,
+    /// Model-selected summary detail. Missing values default to `auto`, matching
+    /// codex-rs's forward-compatible model contract.
+    #[serde(default)]
+    default_reasoning_summary: ReasoningSummary,
     #[serde(default)]
     visibility: CodexModelVisibility,
     #[serde(default)]
@@ -567,6 +579,8 @@ impl CodexModelsClient {
         }
         info.supported_in_api = false;
         info.supports_backend_search = wire.supports_search_tool;
+        info.supports_reasoning_summary_parameter = wire.supports_reasoning_summary_parameter;
+        info.default_reasoning_summary = wire.default_reasoning_summary;
 
         let resolved_context_window = wire.context_window.or(wire.max_context_window);
         if let Some(context_window) = effective_context_window(
@@ -900,6 +914,8 @@ mod tests {
                     "display_name": "GPT-5.6 Sol Live",
                     "description": "Live catalog description",
                     "default_reasoning_level": "medium",
+                    "supports_reasoning_summary_parameter": true,
+                    "default_reasoning_summary": "detailed",
                     "supported_reasoning_levels": [
                         {"effort": "low", "description": "Fast"},
                         {"effort": "medium", "description": "Balanced"},
@@ -1110,6 +1126,11 @@ mod tests {
         assert_eq!(live.entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
         assert!(live.entry.info.codex_multi_agent_v2);
         assert!(live.entry.info.supports_backend_search);
+        assert!(live.entry.info.supports_reasoning_summary_parameter);
+        assert_eq!(
+            live.entry.info.default_reasoning_summary,
+            ReasoningSummary::Detailed
+        );
         assert_eq!(live.entry.info.agent_type, "codex");
         assert!(
             !live.entry.info.supported_in_api,
@@ -1256,6 +1277,16 @@ mod tests {
         assert_eq!(observed.lock().unwrap().len(), 1);
         assert_eq!(cached.etag.as_deref(), Some("cached-etag"));
         assert_eq!(cached.models[0].entry.info.context_window.get(), 353_400);
+        assert!(
+            cached.models[0]
+                .entry
+                .info
+                .supports_reasoning_summary_parameter
+        );
+        assert_eq!(
+            cached.models[0].entry.info.default_reasoning_summary,
+            ReasoningSummary::Detailed,
+        );
     }
 
     #[tokio::test]
@@ -1451,6 +1482,59 @@ mod tests {
         assert_eq!(
             v1_with_ultra.info.reasoning_efforts[0].value,
             ReasoningEffort::Ultra
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_metadata_defaults_and_explicit_modes_match_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = test_client(
+            &temp,
+            "https://chatgpt.example/codex".to_owned(),
+            "1.2.3",
+            Duration::from_secs(300),
+            auth_source(credentials("token", "workspace-1", false)),
+        );
+
+        let convert = |supports: Option<bool>, summary: Option<ReasoningSummary>| {
+            let mut value = json!({
+                "slug": "summary-model",
+                "display_name": "Summary Model",
+                "visibility": "list",
+                "context_window": 100000
+            });
+            if let Some(supports) = supports {
+                value["supports_reasoning_summary_parameter"] = json!(supports);
+            }
+            if let Some(summary) = summary {
+                value["default_reasoning_summary"] = serde_json::to_value(summary).unwrap();
+            }
+            let wire: CodexWireModel = serde_json::from_value(value).unwrap();
+            client.convert_model(wire).unwrap().entry.info
+        };
+
+        let defaults = convert(None, None);
+        assert!(defaults.supports_reasoning_summary_parameter);
+        assert_eq!(defaults.default_reasoning_summary, ReasoningSummary::Auto);
+
+        for summary in [
+            ReasoningSummary::Auto,
+            ReasoningSummary::Concise,
+            ReasoningSummary::Detailed,
+            ReasoningSummary::None,
+        ] {
+            let info = convert(Some(true), Some(summary));
+            assert_eq!(info.default_reasoning_summary, summary);
+            assert_eq!(
+                crate::agent::config::model_reasoning_summary(&info),
+                (summary != ReasoningSummary::None).then_some(summary),
+            );
+        }
+
+        let unsupported = convert(Some(false), Some(ReasoningSummary::Detailed));
+        assert_eq!(
+            crate::agent::config::model_reasoning_summary(&unsupported),
+            None
         );
     }
 

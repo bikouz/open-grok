@@ -27,7 +27,7 @@ use xai_grok_sampler::{
 };
 use xai_grok_sampling_types::{
     ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, HostedTool, ModelProvider,
-    UserItem,
+    ReasoningSummary, UserItem,
 };
 use xai_grok_test_support::{SseEvent, sse};
 
@@ -89,6 +89,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         stream_tool_calls: false,
         idle_timeout_secs: Some(30),
         reasoning_effort: None,
+        reasoning_summary: None,
         origin_client: None,
         client_identifier: None,
         deployment_id: None,
@@ -832,6 +833,7 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let mut config = responses_config(server.base_url(), None);
     config.provider = ModelProvider::Codex;
+    config.reasoning_summary = Some(ReasoningSummary::Auto);
     config.client_identifier = Some("must-not-leak".into());
     config.client_version = Some("must-not-leak".into());
     config.deployment_id = Some("must-not-leak".into());
@@ -1014,6 +1016,7 @@ async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
     let mut config = responses_config(server.base_url(), None);
     config.provider = ModelProvider::Codex;
     config.model = "gpt-5.6-sol".into();
+    config.reasoning_summary = Some(ReasoningSummary::Auto);
     config
         .extra_headers
         .insert("originator".into(), "codex_cli_rs".into());
