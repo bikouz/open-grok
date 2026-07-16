@@ -43,6 +43,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "multiline_mode",
     "permission_mode",
     "default_model",
+    "kimi_api_key",
     "recap_model",
     "memory_model",
     "max_thoughts_width",
@@ -394,6 +395,25 @@ fn code_mode_registry_contract_is_restart_required_and_off_by_default() {
     assert!(matches!(meta.kind, SettingKind::Bool { default: false }));
 }
 
+#[test]
+fn enter_on_kimi_api_key_opens_empty_secret_editor() {
+    let mut s = make_state();
+    navigate_to(&mut s, "kimi_api_key");
+
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        s.mode,
+        SettingsModalMode::EditingSecret {
+            key: "kimi_api_key",
+            ref buffer,
+            cursor_byte: 0,
+            validation_error: None,
+        } if buffer.is_empty()
+    ));
+}
+
 /// The Ask-Question timeout row renders in Agent & Approval directly above
 /// Plan Mode, reads the resolved default ON, and Space dispatches the typed
 /// setter toggling it off.
@@ -622,6 +642,31 @@ fn mouse_click_on_code_mode_indicator_toggles_in_one_click() {
         row_y,
     );
     assert_set_bool_action(outcome, "code_mode", true);
+}
+
+#[test]
+fn mouse_click_on_kimi_api_key_value_opens_secret_editor() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "kimi_api_key") as u16;
+
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        s.mode,
+        SettingsModalMode::EditingSecret {
+            key: "kimi_api_key",
+            ref buffer,
+            cursor_byte: 0,
+            validation_error: None,
+        } if buffer.is_empty()
+    ));
 }
 
 /// Value-column click toggles the Ask-Question timeout in one click.
@@ -1567,6 +1612,7 @@ fn registry_kind_membership_through_pr_14() {
 
             SettingKind::DynamicEnum { .. } => "DynamicEnum",
             SettingKind::Group { .. } => "Group",
+            SettingKind::Secret => "Secret",
             other => panic!(
                 "registry_kind_membership: setting `{}` has unknown kind {:?} — \
                  add an arm here AND a kind-membership assertion below",
@@ -1672,6 +1718,13 @@ fn registry_kind_membership_through_pr_14() {
         "Group kind membership drift",
     );
 
+    let secret_keys = by_kind.remove("Secret").unwrap_or_default();
+    assert_eq!(
+        secret_keys,
+        vec!["kimi_api_key"],
+        "Secret kind membership drift",
+    );
+
     // No unexpected kinds.
     assert!(
         by_kind.is_empty(),
@@ -1752,6 +1805,9 @@ fn defaults_round_trip_through_registry() {
             "multiline_mode" => SettingValue::Bool(false),
             "permission_mode" => SettingValue::Enum("ask"),
             "default_model" => SettingValue::String(String::new()),
+            "kimi_api_key" => {
+                SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
+            }
             "recap_model" => SettingValue::String(String::new()),
             "memory_model" => SettingValue::String(String::new()),
             "max_thoughts_width" => SettingValue::Int(120),
@@ -3987,6 +4043,12 @@ fn reset_confirm_prompt_helper_builds_well_formed_string_for_every_setting() {
             "prompt for `{}` must be phrased as a question, got: {prompt:?}",
             meta.key,
         );
+        if meta.key == "kimi_api_key" {
+            assert!(
+                prompt.contains("UI-stored") && prompt.contains("MOONSHOT_API_KEY"),
+                "Kimi reset must distinguish UI storage from the environment override: {prompt:?}",
+            );
+        }
     }
 }
 

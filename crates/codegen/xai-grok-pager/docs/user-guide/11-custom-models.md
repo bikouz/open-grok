@@ -6,7 +6,10 @@ Grok connects to custom model endpoints for alternative providers, self-hosted m
 
 ## Default Models
 
-By default, Grok uses models hosted by SpaceXAI, and new sessions start with `grok-build`. Default models require no configuration. Authenticate with `open-grok login` or an API key, then start a session.
+New sessions start with `grok-build`. The built-in catalog also includes
+provider-specific fallbacks such as OpenAI Codex and Kimi; each provider keeps
+its own authentication. Authenticate the provider you want to use, then select
+its model.
 
 List all available models:
 
@@ -159,6 +162,30 @@ When you override a built-in model, Grok starts with the default configuration (
 ---
 
 ## Provider Examples
+
+### Kimi coding models
+
+Open **Settings → Models → Kimi API key** and paste a Kimi Platform API key.
+Grok stores only the provider-scoped credential, queries Kimi's `/v1/models`
+endpoint, and refreshes the model picker. `MOONSHOT_API_KEY` remains available
+as an environment override. The built-in `kimi-k3` entry works without a model
+config block.
+
+For an explicit config-only setup:
+
+```toml
+[model.kimi-k3]
+model = "kimi-k3"
+name = "Kimi K3"
+provider = "kimi"
+base_url = "https://api.moonshot.ai/v1"
+api_backend = "chat_completions"
+env_key = "MOONSHOT_API_KEY"
+context_window = 1048576
+```
+
+Kimi uses standard client-side function tools. Grok does not add
+Kimi-platform-hosted tools to this provider profile.
 
 ### Anthropic (Claude)
 

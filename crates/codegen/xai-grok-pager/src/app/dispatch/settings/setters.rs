@@ -3,7 +3,24 @@
 use super::ui::{refresh_open_settings_modals, save_success_toast};
 use crate::app::actions::Effect;
 use crate::app::app_view::{ActiveView, AppView};
+use crate::settings::SecretInput;
 use agent_client_protocol as acp;
+
+/// Start the dedicated Kimi credential save flow. The secret remains wrapped
+/// until the async effect writes it to the provider-scoped credential store.
+pub(in crate::app::dispatch) fn set_kimi_api_key(
+    app: &mut AppView,
+    key: SecretInput,
+) -> Vec<Effect> {
+    app.show_toast("Saving Kimi API key and querying models…");
+    vec![Effect::UpdateKimiApiKey { key: Some(key) }]
+}
+
+/// Remove the UI-stored Kimi key and clear only Kimi's queried catalog.
+pub(in crate::app::dispatch) fn clear_kimi_api_key(app: &mut AppView) -> Vec<Effect> {
+    app.show_toast("Removing Kimi API key…");
+    vec![Effect::UpdateKimiApiKey { key: None }]
+}
 
 /// Set multiline input mode — swap Enter and Shift+Enter behavior.
 ///

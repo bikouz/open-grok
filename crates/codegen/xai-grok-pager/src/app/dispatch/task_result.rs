@@ -214,6 +214,89 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
 /// Handle a completed async task result.
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
     match result {
+        TaskResult::KimiApiKeyUpdated {
+            configured,
+            warning,
+            error,
+        } => {
+            let storage_succeeded = error.is_none();
+            super::settings::ui::refresh_open_settings_modals(app);
+            let credential_status = super::settings::ui::kimi_api_key_status();
+            if let Some(error) = error {
+                app.show_toast(&format!(
+                    "✗ Could not {} Kimi API key: {}",
+                    if configured { "save" } else { "remove" },
+                    scrub_error_for_toast(&error),
+                ));
+            } else {
+                let message = if configured {
+                    if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
+                        "✓ Kimi API key saved to UI storage; MOONSHOT_API_KEY remains active"
+                            .to_owned()
+                    } else if warning.is_some() {
+                        "✓ Kimi API key saved".to_owned()
+                    } else {
+                        "✓ Kimi API key saved; models refreshed".to_owned()
+                    }
+                } else if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
+                    "✓ UI-stored Kimi API key cleared; MOONSHOT_API_KEY remains active".to_owned()
+                } else {
+                    "✓ UI-stored Kimi API key cleared".to_owned()
+                };
+                if let Some(warning) = warning {
+                    let operation = if configured
+                        || credential_status == crate::settings::SecretStatus::EnvironmentOverride
+                    {
+                        "model query"
+                    } else {
+                        "catalog clear"
+                    };
+                    app.show_toast(&format!(
+                        "{message}; {operation} warning: {}",
+                        scrub_error_for_toast(&warning),
+                    ));
+                } else {
+                    app.show_toast(&message);
+                }
+            }
+
+            if !storage_succeeded {
+                return vec![];
+            }
+
+            // A loaded Kimi session owns a sampler whose credential was
+            // resolved when the session was created. Re-selecting the same
+            // model rebuilds that sampler immediately after a save or clear,
+            // so callers never have to restart the pager for the credential
+            // change to take effect.
+            let mut effects = Vec::new();
+            for (&agent_id, agent) in &mut app.agents {
+                if agent.session.model_switch_pending {
+                    continue;
+                }
+                let Some(session_id) = agent.session.session_id.clone() else {
+                    continue;
+                };
+                let Some(model_id) = agent.session.models.current.clone() else {
+                    continue;
+                };
+                if PrimaryProvider::for_model(&agent.session.models, &model_id)
+                    != Some(PrimaryProvider::Kimi)
+                {
+                    continue;
+                }
+
+                agent.session.model_switch_pending = true;
+                effects.push(Effect::SwitchModel {
+                    agent_id,
+                    session_id,
+                    model_id,
+                    effort: agent.session.models.reasoning_effort,
+                    prev_model_id: None,
+                });
+            }
+            effects
+        }
         TaskResult::SessionCreated {
             agent_id,
             session_id,

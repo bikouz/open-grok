@@ -552,6 +552,11 @@ pub enum Action {
     /// session and persists via `Effect::PersistSetting`. Does not
     /// carry effort — use `Action::SwitchModel` for that.
     SetDefaultModel(acp::ModelId),
+    /// Save a Kimi API key from the dedicated masked settings editor.
+    /// `SecretInput` redacts `Debug` and zeroizes its allocation on drop.
+    SetKimiApiKey(crate::settings::SecretInput),
+    /// Remove only the UI-stored Kimi provider credential.
+    ClearKimiApiKey,
     /// Clear the persisted default model (`cfg.models.default = None`).
     /// Active session's model is unchanged; next session resolves
     /// via the shell's default-resolution chain.
@@ -1379,6 +1384,11 @@ pub enum Effect {
         /// process-wide mode.
         chat_kind: bool,
     },
+    /// Update the provider-scoped Kimi credential, then refresh (save) or
+    /// clear (remove) Kimi's queried model-catalog partition.
+    UpdateKimiApiKey {
+        key: Option<crate::settings::SecretInput>,
+    },
     /// Change the process working directory (project-picker selection).
     SetWorkingDir { path: std::path::PathBuf },
     /// Create a git worktree and then create or load an ACP session in it.
@@ -2119,6 +2129,13 @@ pub enum SubagentKillOutcome {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    /// Completion of the dedicated Kimi credential workflow. Contains only
+    /// status and scrubbed diagnostics, never credential material.
+    KimiApiKeyUpdated {
+        configured: bool,
+        warning: Option<String>,
+        error: Option<String>,
+    },
     /// Session was created successfully.
     SessionCreated {
         agent_id: AgentId,

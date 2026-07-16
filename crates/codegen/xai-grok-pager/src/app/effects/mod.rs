@@ -114,6 +114,41 @@ async fn clear_codex_models(tx: &AcpAgentTx) -> Result<(), String> {
         .map_err(|error| sanitize_user_error(&format!("{error}")))
 }
 
+/// Ask the shell to query Kimi's provider-owned model endpoint after a key is
+/// saved. The key itself is never part of the ACP request.
+async fn query_kimi_models(tx: &AcpAgentTx) -> Result<Option<String>, String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/kimi/models/query",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize Kimi model query params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("Kimi model query returned invalid JSON: {error}"))?;
+    let result = envelope.get("result").unwrap_or(&envelope);
+    Ok(result
+        .get("warning")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_user_error))
+}
+
+/// Drop Kimi's queried catalog partition after its UI-stored key is removed.
+async fn clear_kimi_models(tx: &AcpAgentTx) -> Result<(), String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/kimi/models/clear",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize Kimi model clear params")
+            .into(),
+    );
+    acp_send(request, tx)
+        .await
+        .map(|_| ())
+        .map_err(|error| sanitize_user_error(&format!("{error}")))
+}
+
 pub(crate) fn execute(
     effect: Effect,
     tasks: &mut JoinSet<TaskResult>,
@@ -125,6 +160,49 @@ pub(crate) fn execute(
     let mut meta = EffectMeta::default();
     let effect_is_send_now = matches!(effect, Effect::SendPromptNow { .. });
     match effect {
+        Effect::UpdateKimiApiKey { key } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                let provider = xai_grok_shell::sampling::types::ModelProvider::Kimi;
+                let configured = key.is_some();
+                let storage_result = match key.as_ref() {
+                    Some(secret) => xai_grok_shell::auth::store_provider_api_key(
+                        &grok_home,
+                        provider,
+                        secret.expose(),
+                    ),
+                    None => xai_grok_shell::auth::clear_provider_api_key(&grok_home, provider),
+                };
+                if let Err(error) = storage_result {
+                    return TaskResult::KimiApiKeyUpdated {
+                        configured,
+                        warning: None,
+                        error: Some(sanitize_user_error(&error.to_string())),
+                    };
+                }
+                let environment_override = std::env::var("MOONSHOT_API_KEY")
+                    .ok()
+                    .is_some_and(|key| !key.trim().is_empty());
+                let catalog_result = if configured || environment_override {
+                    query_kimi_models(&tx).await
+                } else {
+                    clear_kimi_models(&tx).await.map(|()| None)
+                };
+                match catalog_result {
+                    Ok(warning) => TaskResult::KimiApiKeyUpdated {
+                        configured,
+                        warning,
+                        error: None,
+                    },
+                    Err(warning) => TaskResult::KimiApiKeyUpdated {
+                        configured,
+                        warning: Some(warning),
+                        error: None,
+                    },
+                }
+            });
+        }
         Effect::RegisterActiveSession { session_id, cwd } => {
             crate::app::signal_handler::set_current_session_id(Some(session_id.clone()));
             if let Err(e) = xai_grok_shell::active_sessions::register(xai_grok_shell::active_sessions::ActiveSession {

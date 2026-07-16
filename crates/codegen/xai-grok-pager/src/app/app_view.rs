@@ -355,13 +355,15 @@ pub enum AuthState {
 
 /// Provider that owns startup authentication and access gating for this run.
 ///
-/// Codex credentials are intentionally independent from xAI credentials. In
-/// particular, an xAI subscription gate must never prevent a Codex-backed
-/// session from starting.
+/// Non-xAI credentials are intentionally independent from xAI credentials. In
+/// particular, an xAI subscription gate must never prevent a Codex- or
+/// Kimi-backed session from starting. Kimi uses an API key and therefore never
+/// participates in the interactive startup login chooser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimaryProvider {
     Xai,
     Codex,
+    Kimi,
 }
 
 pub const CODEX_STARTUP_MODEL_ID: &str = "gpt-5.6-sol";
@@ -370,6 +372,18 @@ pub const XAI_STARTUP_MODEL_ID: &str = "grok-build";
 impl PrimaryProvider {
     fn from_models(models: &ModelState) -> Self {
         Self::for_current_model(models).unwrap_or(Self::Xai)
+    }
+
+    pub(crate) fn from_provider_name(provider: &str) -> Option<Self> {
+        if provider.eq_ignore_ascii_case("codex") {
+            Some(Self::Codex)
+        } else if provider.eq_ignore_ascii_case("xai") {
+            Some(Self::Xai)
+        } else if provider.eq_ignore_ascii_case("kimi") {
+            Some(Self::Kimi)
+        } else {
+            None
+        }
     }
 
     /// Resolve the provider of the catalog's actual current model.
@@ -392,13 +406,7 @@ impl PrimaryProvider {
             .and_then(|info| info.meta.as_ref())
             .and_then(|meta| meta.get("provider"))
             .and_then(|value| value.as_str())?;
-        if provider.eq_ignore_ascii_case("codex") {
-            Some(Self::Codex)
-        } else if provider.eq_ignore_ascii_case("xai") {
-            Some(Self::Xai)
-        } else {
-            None
-        }
+        Self::from_provider_name(provider)
     }
 
     /// Pick a provider-owned model from the already-filtered ACP catalog.
@@ -1186,18 +1194,23 @@ impl AppView {
     }
     /// Transition the active session between provider-specific access domains.
     ///
-    /// xAI auth remains independently available while a Codex model is active,
-    /// but its subscription and ZDR state must not gate that Codex session. A
+    /// xAI auth remains independently available while a non-xAI model is
+    /// active, but its subscription and ZDR state must not gate that session. A
     /// compact auth snapshot lets a later switch back to xAI restore the same
-    /// controls without treating Codex as authenticated xAI.
+    /// controls without treating another provider as authenticated xAI.
     pub fn switch_primary_provider(&mut self, provider: PrimaryProvider) -> bool {
         if provider == self.primary_provider {
             return false;
         }
         match provider {
-            PrimaryProvider::Codex => {
-                self.remember_xai_access_controls();
-                self.primary_provider = PrimaryProvider::Codex;
+            PrimaryProvider::Codex | PrimaryProvider::Kimi => {
+                // Preserve the xAI snapshot only when crossing out of xAI.
+                // A Codex <-> Kimi transition sees already-cleared controls and
+                // must not overwrite the saved xAI state with that projection.
+                if self.primary_provider == PrimaryProvider::Xai {
+                    self.remember_xai_access_controls();
+                }
+                self.primary_provider = provider;
                 self.clear_xai_access_controls();
             }
             PrimaryProvider::Xai => {
@@ -1221,7 +1234,7 @@ impl AppView {
         if !self.switch_primary_provider(provider) {
             return Vec::new();
         }
-        if provider == PrimaryProvider::Codex {
+        if provider != PrimaryProvider::Xai {
             // Credits and polling are xAI-owned UI state. Discard the visible
             // projection at the provider boundary; a later xAI transition
             // performs a live billing refresh before repopulating it.
@@ -1302,7 +1315,7 @@ impl AppView {
             Err(error) => tracing::warn!(%error, "failed to restore xAI access metadata"),
         }
     }
-    /// Drop xAI-only access state when ChatGPT Codex owns startup. Account
+    /// Drop xAI-only access state when a non-xAI provider owns startup. Account
     /// credentials remain on disk and can still be viewed independently.
     pub fn clear_xai_access_controls(&mut self) {
         self.team_id = None;
@@ -2291,6 +2304,40 @@ impl AppView {
     }
 }
 impl AppView {
+    /// Route an event owned by the terminal loop. Secret-editor pastes are
+    /// moved out of the crossterm event before the regular borrowed routing
+    /// path, ensuring the original allocation is zeroized rather than later
+    /// dropping as an ordinary plaintext `String`.
+    pub(crate) fn handle_owned_input_with_paste_provenance(
+        &mut self,
+        ev: &mut Event,
+        paste_provenance: PasteProvenance,
+    ) -> InputOutcome {
+        let target_agent = match self.active_view {
+            ActiveView::Agent(agent_id) => Some(agent_id),
+            ActiveView::AgentDashboard => self
+                .dashboard
+                .as_ref()
+                .and_then(|dashboard| dashboard.attached_agent),
+            ActiveView::Welcome => None,
+        };
+        if let Event::Paste(text) = ev
+            && let Some(agent_id) = target_agent
+            && self
+                .agents
+                .get(&agent_id)
+                .is_some_and(|agent| agent.settings_secret_editor_active())
+        {
+            let pasted = crate::settings::SecretInput::new(std::mem::take(text));
+            return self
+                .agents
+                .get_mut(&agent_id)
+                .expect("secret paste target disappeared during synchronous routing")
+                .handle_settings_secret_paste(pasted);
+        }
+        self.handle_input_with_paste_provenance(ev, paste_provenance)
+    }
+
     /// Handle a terminal event. Routes through the input layer stack:
     ///
     /// 1. Pending action check (double-press confirmation)
@@ -2622,12 +2669,13 @@ impl AppView {
                 let prompt_paging = !overlay_active && !self.screen_mode.is_minimal();
                 match self.agents.get_mut(&id) {
                     Some(agent) => {
+                        let secret_input = agent.settings_secret_editor_active();
                         let outcome = if prompt_paging {
                             agent.handle_input_with_prompt_paging(ev, &self.registry)
                         } else {
                             agent.handle_input(ev, &self.registry)
                         };
-                        if let Event::Key(key) = ev {
+                        if !secret_input && let Event::Key(key) = ev {
                             agent.record_input(key, &outcome);
                         }
                         self.pending_effects.append(&mut agent.pending_effects);
@@ -2728,8 +2776,9 @@ impl AppView {
                     }
                     match self.agents.get_mut(&agent_id) {
                         Some(agent) => {
+                            let secret_input = agent.settings_secret_editor_active();
                             let outcome = agent.handle_input(ev, &self.registry);
-                            if let Event::Key(key) = ev {
+                            if !secret_input && let Event::Key(key) = ev {
                                 agent.record_input(key, &outcome);
                             }
                             self.pending_effects.append(&mut agent.pending_effects);
@@ -5306,6 +5355,47 @@ pub(crate) mod tests {
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+
+    #[test]
+    fn primary_provider_resolves_kimi_from_catalog_metadata() {
+        let model_id = acp::ModelId::new("kimi-k3");
+        let mut meta = acp::Meta::new();
+        meta.insert("provider".to_string(), serde_json::json!("kimi"));
+        let mut models = ModelState::default();
+        models.available.insert(
+            model_id.clone(),
+            acp::ModelInfo::new(model_id.clone(), "Kimi K3".to_string()).meta(Some(meta)),
+        );
+        models.current = Some(model_id);
+
+        assert_eq!(
+            PrimaryProvider::for_current_model(&models),
+            Some(PrimaryProvider::Kimi)
+        );
+        assert_eq!(PrimaryProvider::from_models(&models), PrimaryProvider::Kimi);
+    }
+
+    #[test]
+    fn kimi_clears_xai_controls_without_losing_the_xai_snapshot() {
+        let mut app = test_app();
+        app.primary_provider = PrimaryProvider::Xai;
+        app.team_id = Some("team-xai".to_string());
+        app.is_zdr = true;
+
+        let effects = app.switch_primary_provider_with_effects(PrimaryProvider::Kimi, None);
+        assert!(effects.is_empty(), "Kimi must not trigger xAI refreshes");
+        assert_eq!(app.primary_provider, PrimaryProvider::Kimi);
+        assert!(!app.uses_xai_access_controls());
+        assert_eq!(app.team_id, None);
+        assert!(!app.is_zdr);
+
+        assert!(app.switch_primary_provider(PrimaryProvider::Codex));
+        assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+        assert!(app.switch_primary_provider(PrimaryProvider::Xai));
+        assert_eq!(app.team_id.as_deref(), Some("team-xai"));
+        assert!(app.is_zdr);
+    }
+
     #[test]
     fn parse_esc_ttl_bounds() {
         let default = PendingAction::ESC_DOUBLE_PRESS_TTL;
@@ -5610,6 +5700,42 @@ pub(crate) mod tests {
             super::super::dispatch::SwitchCause::Load,
         );
         app
+    }
+    #[test]
+    fn owned_secret_paste_moves_text_out_of_terminal_event() {
+        let mut app = test_app_with_agent();
+        let id = super::super::agent::AgentId(0);
+        let mut settings = crate::views::settings_modal::SettingsModalState::new(
+            app.settings_registry.clone(),
+            app.current_ui.clone(),
+            crate::settings::PagerLocalSnapshot::default(),
+        );
+        settings.mode = crate::views::settings_modal::SettingsModalMode::EditingSecret {
+            key: "kimi_api_key",
+            buffer: crate::settings::SecretInput::default(),
+            cursor_byte: 0,
+            validation_error: None,
+        };
+        app.agents.get_mut(&id).unwrap().active_modal =
+            Some(crate::views::modal::ActiveModal::Settings {
+                state: Box::new(settings),
+            });
+
+        let mut event = Event::Paste("sk-owned-secret".to_owned());
+        let outcome =
+            app.handle_owned_input_with_paste_provenance(&mut event, PasteProvenance::Terminal);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(matches!(&event, Event::Paste(text) if text.is_empty()));
+        let Some(crate::views::modal::ActiveModal::Settings { state }) =
+            &app.agents[&id].active_modal
+        else {
+            panic!("settings modal should remain open");
+        };
+        assert!(matches!(
+            &state.mode,
+            crate::views::settings_modal::SettingsModalMode::EditingSecret { buffer, .. }
+                if buffer.expose() == "sk-owned-secret"
+        ));
     }
     #[test]
     fn dashboard_x11_primary_provenance_bypasses_unrelated_clipboard_image() {

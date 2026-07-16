@@ -11,6 +11,88 @@ fn provider_model_info(model_id: &acp::ModelId, name: &str, provider: &str) -> a
     acp::ModelInfo::new(model_id.clone(), name.to_string()).meta(Some(meta))
 }
 
+#[test]
+fn kimi_key_update_rebinds_loaded_kimi_session_to_same_model() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let model_id = acp::ModelId::new("kimi-coding");
+    {
+        let models = &mut app.agents[&agent_id].session.models;
+        models.available.insert(
+            model_id.clone(),
+            provider_model_info(&model_id, "Kimi Coding", "kimi"),
+        );
+        models.current = Some(model_id.clone());
+        models.reasoning_effort = Some(xai_grok_shell::sampling::types::ReasoningEffort::High);
+    }
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiKeyUpdated {
+            configured: true,
+            warning: None,
+            error: None,
+        }),
+        &mut app,
+    );
+
+    assert!(app.agents[&agent_id].session.model_switch_pending);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::SwitchModel {
+            agent_id: effect_agent,
+            model_id: effect_model,
+            effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
+            prev_model_id: None,
+            ..
+        }] if *effect_agent == agent_id && effect_model == &model_id
+    ));
+}
+
+#[test]
+fn failed_kimi_key_update_does_not_rebind_session() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let model_id = acp::ModelId::new("kimi-coding");
+    {
+        let models = &mut app.agents[&agent_id].session.models;
+        models.available.insert(
+            model_id.clone(),
+            provider_model_info(&model_id, "Kimi Coding", "kimi"),
+        );
+        models.current = Some(model_id);
+    }
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiKeyUpdated {
+            configured: true,
+            warning: None,
+            error: Some("credential store unavailable".to_owned()),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(!app.agents[&agent_id].session.model_switch_pending);
+}
+
+#[test]
+fn kimi_model_query_warning_does_not_claim_models_refreshed() {
+    let mut app = test_app_with_agent();
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiKeyUpdated {
+            configured: true,
+            warning: Some("catalog unavailable".to_owned()),
+            error: None,
+        }),
+        &mut app,
+    );
+
+    let toast = read_toast(&app);
+    assert!(toast.contains("model query warning"), "got: {toast}");
+    assert!(!toast.contains("models refreshed"), "got: {toast}");
+}
+
 fn foreign_resume_hint(
     tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool,
 ) -> xai_grok_workspace::foreign_sessions::RecentForeignSession {

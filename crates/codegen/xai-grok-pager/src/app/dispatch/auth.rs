@@ -103,6 +103,7 @@ fn select_startup_model(
         let provider_name = match provider {
             PrimaryProvider::Codex => "ChatGPT Codex",
             PrimaryProvider::Xai => "xAI Grok",
+            PrimaryProvider::Kimi => "Kimi",
         };
         return Err(if allow_provider_fallback {
             format!("No visible {provider_name} model is available. Check model filters and retry.")

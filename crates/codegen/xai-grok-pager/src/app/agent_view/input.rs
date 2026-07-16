@@ -8,7 +8,7 @@ use super::paste::paste_key_tests;
 use super::test_fixtures;
 use super::{
     AgentPane, AgentView, CtaPhase, InputMode, MULTI_CLICK_TIMEOUT_MS, PromptInputMode,
-    active_contexts_for_pane, format_key_for_log, is_link_modifier_for_key,
+    active_contexts_for_pane, apply_settings_outcome, format_key_for_log, is_link_modifier_for_key,
     is_mouse_reporting_toggle_chord, resolve_action,
 };
 use crate::actions::{ActionId, ActionRegistry, When};
@@ -22,6 +22,50 @@ use crossterm::event::{
 };
 use std::time::Instant;
 impl AgentView {
+    /// True while terminal text must be treated as credential material. The
+    /// app-level input recorder uses this to avoid retaining typed key bytes.
+    pub(crate) fn settings_secret_editor_active(&self) -> bool {
+        if let Some(child_id) = self.active_subagent.as_ref()
+            && self
+                .subagent_views
+                .get(child_id)
+                .is_some_and(|child| child.settings_secret_editor_active())
+        {
+            return true;
+        }
+        matches!(
+            self.active_modal,
+            Some(ActiveModal::Settings { ref state })
+                if matches!(
+                    state.mode,
+                    crate::views::settings_modal::SettingsModalMode::EditingSecret { .. }
+                )
+        )
+    }
+
+    /// Consume a terminal paste that has already been moved out of its
+    /// crossterm event. The wrapper is zeroized after its validated contents
+    /// are copied into the secret editor's own zeroizing buffer.
+    pub(crate) fn handle_settings_secret_paste(
+        &mut self,
+        pasted: crate::settings::SecretInput,
+    ) -> InputOutcome {
+        if let Some(child_id) = self.active_subagent.clone()
+            && self
+                .subagent_views
+                .get(&child_id)
+                .is_some_and(|child| child.settings_secret_editor_active())
+            && let Some(child) = self.subagent_views.get_mut(&child_id)
+        {
+            return child.handle_settings_secret_paste(pasted);
+        }
+        let Some(ActiveModal::Settings { state }) = self.active_modal.as_mut() else {
+            return InputOutcome::Unchanged;
+        };
+        let outcome = crate::views::settings_modal::handle_settings_paste(state, pasted);
+        apply_settings_outcome(self, outcome)
+    }
+
     /// True when the scrollback pane is focused with nothing layered on top —
     /// no viewer, modal, btw, or open search. This is the precise state in
     /// which a bare `q`/`Esc` should close the enclosing surface (the subagent

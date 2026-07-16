@@ -181,6 +181,9 @@ pub enum SettingKind {
         default: &'static str,
         validator: StringValidator,
     },
+    /// Provider credential. The registry and snapshots carry status only;
+    /// the secret itself lives exclusively in `SecretInput` while editing.
+    Secret,
     /// Stringly-typed choice from a static catalog.
     Enum {
         default: &'static str,
@@ -236,6 +239,27 @@ pub struct SettingMeta {
     pub hidden_in_minimal: bool,
 }
 
+/// Source of an API credential surfaced by a secret setting. Environment
+/// variables take precedence over UI-managed storage, so the UI retains the
+/// source instead of collapsing it to a misleading configured boolean.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SecretStatus {
+    #[default]
+    Missing,
+    Stored,
+    EnvironmentOverride,
+}
+
+impl SecretStatus {
+    pub const fn display(self) -> &'static str {
+        match self {
+            Self::Missing => "not configured",
+            Self::Stored => "stored in UI",
+            Self::EnvironmentOverride => "environment override",
+        }
+    }
+}
+
 /// A typed value carried by `Action::Set*` payloads, modal preview state,
 /// and the rollback path on persist failure.
 ///
@@ -244,6 +268,9 @@ pub struct SettingMeta {
 pub enum SettingValue {
     Bool(bool),
     String(String),
+    /// Status and precedence source for a provider credential. Never contains
+    /// credential material.
+    SecretStatus(SecretStatus),
     Enum(&'static str),
     Int(i64),
 }
@@ -273,6 +300,8 @@ pub struct PagerLocalSnapshot {
     pub recap_model: Option<String>,
     /// Explicit `[models].memory` pin. `None` means provider-aware Automatic.
     pub memory_model: Option<String>,
+    /// Status-only mirror for the effective Kimi API-key source.
+    pub kimi_api_key_status: SecretStatus,
     /// Whether the user has opted OUT of coding data sharing.
     /// Lives in auth metadata (no `UiConfig` field). Inverted mapping:
     /// `opt_out == false` → canonical "opt-in".
@@ -317,6 +346,7 @@ impl Default for PagerLocalSnapshot {
             available_models: Vec::new(),
             recap_model: None,
             memory_model: None,
+            kimi_api_key_status: SecretStatus::Missing,
             coding_data_sharing_opt_out: false,
             plan_mode_active: false,
             show_tips: None,
@@ -673,6 +703,7 @@ pub fn current_value_for(
         "memory_model" => Some(SettingValue::String(
             pager.memory_model.clone().unwrap_or_default(),
         )),
+        "kimi_api_key" => Some(SettingValue::SecretStatus(pager.kimi_api_key_status)),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
         // coding_data_sharing: inverts the `_opt_out` bool.
@@ -707,6 +738,7 @@ pub fn default_value_for(meta: &SettingMeta) -> SettingValue {
     match &meta.kind {
         SettingKind::Bool { default } => SettingValue::Bool(*default),
         SettingKind::String { default, .. } => SettingValue::String((*default).to_string()),
+        SettingKind::Secret => SettingValue::SecretStatus(SecretStatus::Missing),
         SettingKind::Enum { default, .. } => SettingValue::Enum(default),
         SettingKind::Int { default, .. } => SettingValue::Int(*default),
         // `DynamicEnum` widens to `String` for runtime catalog values.
@@ -1230,6 +1262,7 @@ mod tests {
                 (&meta.kind, &value),
                 (SettingKind::Bool { .. }, SettingValue::Bool(_))
                     | (SettingKind::String { .. }, SettingValue::String(_))
+                    | (SettingKind::Secret, SettingValue::SecretStatus(_))
                     | (SettingKind::Enum { .. }, SettingValue::Enum(_))
                     | (SettingKind::Int { .. }, SettingValue::Int(_))
                     // `DynamicEnum` uses `SettingValue::String`.
@@ -1507,6 +1540,9 @@ mod tests {
                 (SettingKind::Bool { default }, SettingValue::Bool(b)) => assert_eq!(b, default),
                 (SettingKind::String { default, .. }, SettingValue::String(s)) => {
                     assert_eq!(s, default);
+                }
+                (SettingKind::Secret, SettingValue::SecretStatus(status)) => {
+                    assert_eq!(*status, SecretStatus::Missing);
                 }
                 (SettingKind::Enum { default, .. }, SettingValue::Enum(e)) => {
                     assert_eq!(e, default);

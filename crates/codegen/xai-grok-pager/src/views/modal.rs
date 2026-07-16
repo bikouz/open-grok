@@ -658,6 +658,12 @@ pub fn reset_confirm_prompt(modal: &ActiveModal) -> Option<String> {
         return None;
     };
     let meta = settings_state.registry.find(key)?;
+    if meta.key == "kimi_api_key" {
+        return Some(format!(
+            "Reset '{}' by clearing any UI-stored key (MOONSHOT_API_KEY, if set, remains active)?",
+            meta.label,
+        ));
+    }
     let default = crate::settings::default_value_for(meta);
     Some(format!(
         "Reset '{}' to default ({})?",
@@ -698,6 +704,7 @@ fn format_default_for_prompt(
             (*canonical).to_owned()
         }
         SettingValue::String(s) => format!("\"{s}\""),
+        SettingValue::SecretStatus(status) => status.display().to_owned(),
         SettingValue::Int(i) => i.to_string(),
     }
 }

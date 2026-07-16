@@ -788,6 +788,28 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
+        // Provider credential stored in owner-only auth.json under the Kimi
+        // provider scope. The settings registry carries presence status only;
+        // key material never enters UiConfig or SettingValue.
+        SettingMeta {
+            key: "kimi_api_key",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Kimi API key",
+            description: "API key used for Kimi coding models. Saving queries Kimi's model catalog; resetting removes only the UI-stored Kimi key.",
+            keywords: &[
+                "kimi",
+                "moonshot",
+                "api",
+                "key",
+                "credential",
+                "coding",
+                "models",
+            ],
+            kind: SettingKind::Secret,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned auxiliary model pins. Empty-string default maps to
         // provider-aware Automatic; explicit IDs may intentionally select a
         // model from another authenticated provider.

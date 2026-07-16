@@ -69,6 +69,7 @@ tokio = { workspace = true, features = [
 tokio-util = { workspace = true, features = ["compat"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zeroize = "1"
 
 # Binary hardening: compile-time string obfuscation.
 # (cryptify / rustls / semver / tikv-jemallocator moved to the composition-root

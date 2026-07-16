@@ -10,6 +10,7 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
+use zeroize::Zeroize;
 
 use crate::appearance::ConfigWatcher;
 use crate::client_identity::{PAGER_CLIENT_TYPE, PAGER_CLIENT_VERSION};
@@ -69,13 +70,7 @@ fn requested_model_provider(
     let requested = requested?;
     PrimaryProvider::for_model(visible_models, requested).or_else(|| {
         let provider = configured_providers.get(requested.0.as_ref())?;
-        if provider.eq_ignore_ascii_case("codex") {
-            Some(PrimaryProvider::Codex)
-        } else if provider.eq_ignore_ascii_case("xai") {
-            Some(PrimaryProvider::Xai)
-        } else {
-            None
-        }
+        PrimaryProvider::from_provider_name(provider)
     })
 }
 
@@ -94,6 +89,25 @@ fn reusable_startup_codex_credential<'a, T>(
     if freshness_required { fresh } else { local }
 }
 
+fn startup_codex_freshness_required(
+    force_xai_login: bool,
+    selected_provider: PrimaryProvider,
+    xai_needs_login: bool,
+    required_provider: Option<PrimaryProvider>,
+) -> bool {
+    if force_xai_login {
+        return false;
+    }
+    match required_provider {
+        Some(provider) => provider == PrimaryProvider::Codex,
+        None => match selected_provider {
+            PrimaryProvider::Codex => true,
+            PrimaryProvider::Xai => xai_needs_login,
+            PrimaryProvider::Kimi => false,
+        },
+    }
+}
+
 fn plan_startup_auth(
     xai_needs_login: bool,
     force_xai_login: bool,
@@ -110,18 +124,14 @@ fn plan_startup_auth(
             PrimaryProvider::Codex => StartupAuthPlan::RequireCodexLogin,
             PrimaryProvider::Xai if xai_needs_login => StartupAuthPlan::RequireXaiLogin,
             PrimaryProvider::Xai => StartupAuthPlan::Ready,
+            PrimaryProvider::Kimi => StartupAuthPlan::Ready,
         };
     }
-    if selected_provider == PrimaryProvider::Codex {
-        if codex_credentials_ready {
-            StartupAuthPlan::ReadyWithCodex
-        } else {
-            StartupAuthPlan::ChooseProvider
-        }
-    } else if xai_needs_login {
-        StartupAuthPlan::ChooseProvider
-    } else {
-        StartupAuthPlan::Ready
+    match selected_provider {
+        PrimaryProvider::Codex if codex_credentials_ready => StartupAuthPlan::ReadyWithCodex,
+        PrimaryProvider::Codex => StartupAuthPlan::ChooseProvider,
+        PrimaryProvider::Xai if xai_needs_login => StartupAuthPlan::ChooseProvider,
+        PrimaryProvider::Xai | PrimaryProvider::Kimi => StartupAuthPlan::Ready,
     }
 }
 
@@ -749,8 +759,12 @@ pub(crate) async fn run(
             None
         }
     };
-    let codex_required_for_startup =
-        !force_login && (app.primary_provider == PrimaryProvider::Codex || connection.needs_login);
+    let codex_required_for_startup = startup_codex_freshness_required(
+        force_login,
+        app.primary_provider,
+        connection.needs_login,
+        required_startup_provider,
+    );
     let fresh_codex_credentials = if codex_required_for_startup {
         match xai_grok_shell::codex_auth::fresh_credentials().await {
             Ok(credentials) => credentials,
@@ -822,7 +836,12 @@ pub(crate) async fn run(
     }
 
     let mut post_render_effects = match auth_plan {
-        StartupAuthPlan::Ready => vec![],
+        StartupAuthPlan::Ready => {
+            if !app.uses_xai_access_controls() {
+                app.clear_xai_access_controls();
+            }
+            vec![]
+        }
         StartupAuthPlan::ReadyWithCodex => {
             app.primary_provider = PrimaryProvider::Codex;
             app.clear_xai_access_controls();
@@ -2841,12 +2860,12 @@ async fn drain_and_process(
         coalesce_rapid_keys(raw_events)
     };
     let coalesced = csi_filter.filter(coalesced);
-    let coalesced = coalesced
+    let mut coalesced = coalesced
         .into_iter()
         .map(normalize_input_event)
         .collect::<Vec<_>>();
 
-    let mut handle_one = |routed: &RoutedInputEvent| -> bool {
+    let mut handle_one = |routed: &mut RoutedInputEvent| -> bool {
         let ev = &routed.event;
         match ev {
             Event::FocusGained => {
@@ -2979,7 +2998,9 @@ async fn drain_and_process(
             return false;
         }
         let is_resize = matches!(ev, Event::Resize(_, _));
-        match app.handle_input_with_paste_provenance(ev, routed.paste_provenance) {
+        match app
+            .handle_owned_input_with_paste_provenance(&mut routed.event, routed.paste_provenance)
+        {
             InputOutcome::Action(action) => {
                 let effs = dispatch::dispatch(action, app);
                 if process_effects(effs, tasks, app, progress_tx) {
@@ -2996,8 +3017,11 @@ async fn drain_and_process(
                 if process_effects(effs, tasks, app, progress_tx) {
                     return true;
                 }
-                if let InputOutcome::Action(follow_up) =
-                    app.handle_input_with_paste_provenance(ev, routed.paste_provenance)
+                if let InputOutcome::Action(follow_up) = app
+                    .handle_owned_input_with_paste_provenance(
+                        &mut routed.event,
+                        routed.paste_provenance,
+                    )
                 {
                     let effs = dispatch::dispatch(follow_up, app);
                     if process_effects(effs, tasks, app, progress_tx) {
@@ -3039,7 +3063,7 @@ async fn drain_and_process(
         false
     };
 
-    for routed in &coalesced {
+    for routed in &mut coalesced {
         if handle_one(routed) {
             return DrainResult {
                 needs_draw,
@@ -3333,14 +3357,22 @@ pub(super) fn is_bare_esc_press(ev: &Event) -> bool {
 /// Merge `Event::Paste` fragments and interleaved key events into a
 /// single `Event::Paste`.  Non-paste, non-key events (Resize, Mouse,
 /// Focus) are preserved in order around the merged paste.
+fn append_and_zeroize_paste_fragment(merged: &mut String, fragment: &mut String) {
+    merged.push_str(fragment);
+    fragment.zeroize();
+}
+
 fn merge_paste_fragments(events: Vec<Event>) -> Vec<Event> {
     let mut result = Vec::new();
     let mut merged_text = String::new();
 
     for ev in events {
-        match &ev {
-            Event::Paste(text) => merged_text.push_str(text),
-            Event::Key(ke) if is_pasteable_key_event(&ev) => match ke.code {
+        let pasteable_key = is_pasteable_key_event(&ev);
+        match ev {
+            Event::Paste(mut text) => {
+                append_and_zeroize_paste_fragment(&mut merged_text, &mut text);
+            }
+            Event::Key(ke) if pasteable_key => match ke.code {
                 KeyCode::Char(c) => merged_text.push(c),
                 KeyCode::Enter => merged_text.push('\n'),
                 KeyCode::Tab => merged_text.push('\t'),
@@ -3349,11 +3381,11 @@ fn merge_paste_fragments(events: Vec<Event>) -> Vec<Event> {
             // Non-pasteable keys (Ctrl+C, Backspace, arrows, Release
             // events, etc.) are artifacts of paste fragmentation — drop.
             Event::Key(_) => {}
-            _ => {
+            other => {
                 if !merged_text.is_empty() {
                     result.push(Event::Paste(std::mem::take(&mut merged_text)));
                 }
-                result.push(ev);
+                result.push(other);
             }
         }
     }
@@ -3441,6 +3473,36 @@ mod tests {
         assert_eq!(
             plan_startup_auth(true, false, PrimaryProvider::Codex, true, None),
             StartupAuthPlan::ReadyWithCodex
+        );
+    }
+
+    #[test]
+    fn kimi_startup_is_ready_without_interactive_provider_login() {
+        assert_eq!(
+            plan_startup_auth(true, false, PrimaryProvider::Kimi, false, None),
+            StartupAuthPlan::Ready
+        );
+        assert!(!startup_codex_freshness_required(
+            false,
+            PrimaryProvider::Kimi,
+            true,
+            None,
+        ));
+    }
+
+    #[test]
+    fn auth_hidden_kimi_model_uses_the_non_interactive_api_key_path() {
+        let requested = acp::ModelId::new("kimi-k3");
+        let visible = crate::acp::model_state::ModelState::default();
+        let configured =
+            std::collections::HashMap::from([("kimi-k3".to_string(), "kimi".to_string())]);
+
+        let provider = requested_model_provider(Some(&requested), &visible, &configured);
+        assert_eq!(provider, Some(PrimaryProvider::Kimi));
+        assert_eq!(
+            plan_startup_auth(true, false, PrimaryProvider::Kimi, false, provider),
+            StartupAuthPlan::Ready,
+            "Kimi credentials are API-key based and must not enter either OAuth chooser"
         );
     }
 
@@ -4140,6 +4202,17 @@ mod tests {
     }
 
     // ── merge_paste_fragments tests ─────────────────────────────────
+
+    #[test]
+    fn merged_paste_fragment_source_is_zeroized_after_copy() {
+        let mut merged = "prefix:".to_owned();
+        let mut fragment = "secret-fragment".to_owned();
+
+        append_and_zeroize_paste_fragment(&mut merged, &mut fragment);
+
+        assert_eq!(merged, "prefix:secret-fragment");
+        assert!(fragment.is_empty(), "source allocation must be zeroized");
+    }
 
     #[test]
     fn merge_paste_and_key_fragments() {

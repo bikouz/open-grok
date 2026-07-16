@@ -13594,6 +13594,7 @@ dependencies = [
  "xai-ratatui-textarea",
  "xai-token-estimation",
  "xai-tty-utils",
+ "zeroize",
 ]
 
 [[package]]

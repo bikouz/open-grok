@@ -35,8 +35,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::actions::Action;
 use crate::render::line_utils::truncate_str;
 use crate::settings::{
-    EnumChoice, OwnedEnumChoice, PagerLocalSnapshot, SettingCategory, SettingKey, SettingKind,
-    SettingMeta, SettingValue, SettingsRegistry, StringValidator, current_value_for,
+    EnumChoice, OwnedEnumChoice, PagerLocalSnapshot, SecretInput, SettingCategory, SettingKey,
+    SettingKind, SettingMeta, SettingValue, SettingsRegistry, StringValidator, current_value_for,
     dynamic_enum_choices,
 };
 use crate::theme::Theme;
@@ -104,7 +104,7 @@ pub enum RowEntry {
 }
 
 /// Mode state for the modal.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum SettingsModalMode {
     Browse,
     /// `/` was pressed; chars filter the visible rows.
@@ -132,6 +132,14 @@ pub enum SettingsModalMode {
     EditingValue {
         key: SettingKey,
         buffer: String,
+        cursor_byte: usize,
+        validation_error: Option<String>,
+    },
+    /// Dedicated credential editor. It always starts empty and carries key
+    /// material only in a redacting, zeroizing wrapper.
+    EditingSecret {
+        key: SettingKey,
+        buffer: SecretInput,
         cursor_byte: usize,
         validation_error: Option<String>,
     },
@@ -486,6 +494,16 @@ impl SettingsModalState {
         let Some((key, meta)) = self.focused_setting() else {
             return false;
         };
+        if matches!(meta.kind, SettingKind::Secret) {
+            self.mode = SettingsModalMode::EditingSecret {
+                key,
+                buffer: SecretInput::default(),
+                cursor_byte: 0,
+                validation_error: None,
+            };
+            self.hover_row = None;
+            return true;
+        }
         let buffer = match (&meta.kind, self.value_for(key)) {
             (SettingKind::String { .. }, Some(SettingValue::String(s))) => s,
             (SettingKind::Int { .. }, Some(SettingValue::Int(i))) => i.to_string(),
@@ -918,6 +936,15 @@ pub fn render_settings_modal(
                     MODAL_TITLE
                 }
             }
+            SettingsModalMode::EditingSecret { key, .. } => {
+                if let Some(meta) = state.registry.find(key) {
+                    breadcrumb_owned =
+                        format!("{MODAL_TITLE} {} {}", crate::glyphs::chevron(), meta.label);
+                    &breadcrumb_owned
+                } else {
+                    MODAL_TITLE
+                }
+            }
             SettingsModalMode::PickingGroup { key, .. } => {
                 if let Some(meta) = state.registry.find(key) {
                     breadcrumb_owned =
@@ -959,7 +986,10 @@ pub fn render_settings_modal(
         footer_lines: 2,
     }
     .with_compact(compact);
-    let has_tip_footer = !matches!(state.mode, SettingsModalMode::EditingValue { .. });
+    let has_tip_footer = !matches!(
+        state.mode,
+        SettingsModalMode::EditingValue { .. } | SettingsModalMode::EditingSecret { .. }
+    );
     let footer_lines = if has_tip_footer {
         modal_window::footer_lines_with_tip_gap(full_area, &sizing, shortcuts)
     } else {
@@ -1003,7 +1033,9 @@ pub fn render_settings_modal(
     }
 
     let (inner_area, docs_footer_area) = match state.mode {
-        SettingsModalMode::EditingValue { .. } => (content_area, None),
+        SettingsModalMode::EditingValue { .. } | SettingsModalMode::EditingSecret { .. } => {
+            (content_area, None)
+        }
         _ => modal_window::split_content_for_tip_footer(content_area),
     };
 
@@ -1013,6 +1045,7 @@ pub fn render_settings_modal(
         SettingsModalMode::PickingEnum { .. }
             | SettingsModalMode::PickingGroup { .. }
             | SettingsModalMode::EditingValue { .. }
+            | SettingsModalMode::EditingSecret { .. }
     );
     match state.mode {
         SettingsModalMode::PickingEnum { .. } => {
@@ -1026,6 +1059,10 @@ pub fn render_settings_modal(
             state.picker_choice_rects = rects;
         }
         SettingsModalMode::EditingValue { .. } => {
+            state.reset_hit_rects();
+            render_editing_value(buf, inner_area, state, &theme);
+        }
+        SettingsModalMode::EditingSecret { .. } => {
             state.reset_hit_rects();
             render_editing_value(buf, inner_area, state, &theme);
         }
@@ -1510,6 +1547,7 @@ fn render_rows(buf: &mut Buffer, area: Rect, state: &mut SettingsModalState, the
                     SettingValue::String(s) => {
                         display_for_dynamic_canonical(&meta.kind, s, &state.pager_snapshot)
                     }
+                    SettingValue::SecretStatus(status) => status.display().to_owned(),
                     SettingValue::Enum(e) => display_for_enum_canonical(&meta.kind, e).to_string(),
                     SettingValue::Int(i) => i.to_string(),
                 };
@@ -1681,6 +1719,7 @@ fn compute_filtered_row_heights(state: &SettingsModalState, area_width: u16) -> 
                     SettingValue::String(s) => {
                         display_for_dynamic_canonical(&meta.kind, s, &state.pager_snapshot)
                     }
+                    SettingValue::SecretStatus(status) => status.display().to_owned(),
                     SettingValue::Enum(e) => display_for_enum_canonical(&meta.kind, e).to_string(),
                     SettingValue::Int(i) => i.to_string(),
                 };
@@ -2430,6 +2469,21 @@ fn render_editing_value(
                 cursor_byte,
                 validation_error,
             } => (*key, buffer.clone(), *cursor_byte, validation_error.clone()),
+            SettingsModalMode::EditingSecret {
+                key,
+                buffer,
+                cursor_byte,
+                validation_error,
+            } => {
+                let raw = buffer.expose();
+                let chars_before_cursor = raw.get(..*cursor_byte).unwrap_or(raw).chars().count();
+                (
+                    *key,
+                    "*".repeat(raw.chars().count()),
+                    chars_before_cursor,
+                    validation_error.clone(),
+                )
+            }
             _ => return,
         };
         let kind_is_int = state
@@ -2524,6 +2578,7 @@ fn render_editing_value(
                 StringValidator::NonEmptyToken => "<type a value>",
                 StringValidator::Any => "<type a value>",
             },
+            SettingKind::Secret => "<paste or type a key>",
             _ => "",
         };
         if !placeholder.is_empty() && visible_buffer_w > 0 {
@@ -3261,6 +3316,7 @@ fn render_setting_row(
                 s.as_str()
             }
         }
+        SettingValue::SecretStatus(status) => status.display(),
         SettingValue::Enum(e) => display_for_enum_canonical(&meta.kind, e),
         SettingValue::Int(i) => {
             value_text_owned = i.to_string();
@@ -3268,7 +3324,11 @@ fn render_setting_row(
         }
     };
 
-    let value_style = if matches!(value, SettingValue::Bool(false)) {
+    let value_style = if matches!(
+        value,
+        SettingValue::Bool(false)
+            | SettingValue::SecretStatus(crate::settings::SecretStatus::Missing)
+    ) {
         Style::default().fg(theme.gray).bg(bg)
     } else {
         value_style
@@ -3279,6 +3339,7 @@ fn render_setting_row(
         (&meta.kind, value),
         (SettingKind::Enum { .. }, _)
             | (SettingKind::String { .. }, _)
+            | (SettingKind::Secret, _)
             | (SettingKind::DynamicEnum { .. }, _)
     );
     let chevron_str = format!(" {}", crate::glyphs::chevron()); // › → > on legacy ConHost
@@ -3811,6 +3872,23 @@ fn build_shortcuts(state: &SettingsModalState) -> Vec<Shortcut<'static>> {
                 },
             ]
         }
+        SettingsModalMode::EditingSecret { .. } => vec![
+            Shortcut {
+                label: "type/paste key",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "Enter save",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "Esc cancel",
+                clickable: false,
+                id: 0,
+            },
+        ],
         SettingsModalMode::PickingGroup { .. } => vec![
             Shortcut {
                 label: "\u{2191}/\u{2193}/j/k nav",
@@ -3863,6 +3941,7 @@ pub fn handle_settings_key(state: &mut SettingsModalState, key: &KeyEvent) -> Se
         SettingsModalMode::PickingEnum { .. } => handle_picking_enum(state, key),
         SettingsModalMode::PickingGroup { .. } => handle_picking_group(state, key),
         SettingsModalMode::EditingValue { .. } => handle_editing_value(state, key),
+        SettingsModalMode::EditingSecret { .. } => handle_editing_secret(state, key),
     }
 }
 
@@ -4244,6 +4323,244 @@ fn handle_editing_value(state: &mut SettingsModalState, key: &KeyEvent) -> Setti
         }
         _ => SettingsKeyOutcome::Unchanged,
     }
+}
+
+const MAX_SECRET_INPUT_BYTES: usize = 4096;
+
+fn validate_secret(buffer: &str) -> Option<String> {
+    if buffer.len() > MAX_SECRET_INPUT_BYTES {
+        Some(format!(
+            "Key is too long (maximum {MAX_SECRET_INPUT_BYTES} bytes)"
+        ))
+    } else if buffer.chars().any(char::is_whitespace) {
+        Some("Key cannot contain whitespace".to_owned())
+    } else if buffer
+        .chars()
+        .any(crate::render::line_utils::is_unsafe_display_char)
+    {
+        Some("Key contains unsupported control characters".to_owned())
+    } else {
+        None
+    }
+}
+
+fn update_secret_validation(state: &mut SettingsModalState, error: Option<String>) {
+    if let SettingsModalMode::EditingSecret {
+        validation_error, ..
+    } = &mut state.mode
+    {
+        *validation_error = error;
+    }
+}
+
+/// Dedicated secret editor routing. Unlike the generic String path, an empty
+/// Enter is a preserve/no-op and the committed value remains wrapped.
+fn handle_editing_secret(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyOutcome {
+    let (setting_key, cursor_byte) = match &state.mode {
+        SettingsModalMode::EditingSecret {
+            key, cursor_byte, ..
+        } => (*key, *cursor_byte),
+        _ => return SettingsKeyOutcome::Unchanged,
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            state.transition_to_browse();
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::Enter => {
+            let error = match &state.mode {
+                SettingsModalMode::EditingSecret { buffer, .. } if buffer.is_empty() => {
+                    state.transition_to_browse();
+                    return SettingsKeyOutcome::Changed;
+                }
+                SettingsModalMode::EditingSecret { buffer, .. } => validate_secret(buffer.expose()),
+                _ => return SettingsKeyOutcome::Unchanged,
+            };
+            if error.is_some() {
+                update_secret_validation(state, error);
+                return SettingsKeyOutcome::Unchanged;
+            }
+            let secret = match &mut state.mode {
+                SettingsModalMode::EditingSecret { buffer, .. } => std::mem::take(buffer),
+                _ => return SettingsKeyOutcome::Unchanged,
+            };
+            state.transition_to_browse();
+            if setting_key == "kimi_api_key" {
+                SettingsKeyOutcome::Action(Action::SetKimiApiKey(secret))
+            } else {
+                tracing::error!(
+                    target: "settings",
+                    key = setting_key,
+                    "Secret editor commit has no typed action — registry skew",
+                );
+                SettingsKeyOutcome::Changed
+            }
+        }
+        KeyCode::Backspace => {
+            if cursor_byte == 0 {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            let SettingsModalMode::EditingSecret {
+                buffer,
+                cursor_byte: cursor,
+                validation_error,
+                ..
+            } = &mut state.mode
+            else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            let previous = (0..*cursor)
+                .rev()
+                .find(|&index| buffer.expose().is_char_boundary(index))
+                .unwrap_or(0);
+            buffer.expose_mut().replace_range(previous..*cursor, "");
+            *cursor = previous;
+            *validation_error = validate_secret(buffer.expose());
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::Delete => {
+            let SettingsModalMode::EditingSecret {
+                buffer,
+                cursor_byte: cursor,
+                validation_error,
+                ..
+            } = &mut state.mode
+            else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            if *cursor >= buffer.len() {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            let next = (*cursor + 1..=buffer.len())
+                .find(|&index| buffer.expose().is_char_boundary(index))
+                .unwrap_or(buffer.len());
+            buffer.expose_mut().replace_range(*cursor..next, "");
+            *validation_error = validate_secret(buffer.expose());
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::Left => {
+            if cursor_byte == 0 {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            let SettingsModalMode::EditingSecret {
+                buffer,
+                cursor_byte: cursor,
+                ..
+            } = &mut state.mode
+            else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            *cursor = (0..*cursor)
+                .rev()
+                .find(|&index| buffer.expose().is_char_boundary(index))
+                .unwrap_or(0);
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::Right => {
+            let SettingsModalMode::EditingSecret {
+                buffer,
+                cursor_byte: cursor,
+                ..
+            } = &mut state.mode
+            else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            if *cursor >= buffer.len() {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            *cursor = (*cursor + 1..=buffer.len())
+                .find(|&index| buffer.expose().is_char_boundary(index))
+                .unwrap_or(buffer.len());
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::Home => {
+            if let SettingsModalMode::EditingSecret { cursor_byte, .. } = &mut state.mode {
+                *cursor_byte = 0;
+                SettingsKeyOutcome::Changed
+            } else {
+                SettingsKeyOutcome::Unchanged
+            }
+        }
+        KeyCode::End => {
+            if let SettingsModalMode::EditingSecret {
+                buffer,
+                cursor_byte,
+                ..
+            } = &mut state.mode
+            {
+                *cursor_byte = buffer.len();
+                SettingsKeyOutcome::Changed
+            } else {
+                SettingsKeyOutcome::Unchanged
+            }
+        }
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            if c.is_whitespace() || crate::render::line_utils::is_unsafe_display_char(c) {
+                update_secret_validation(state, validate_secret(&c.to_string()));
+                return SettingsKeyOutcome::Unchanged;
+            }
+            let SettingsModalMode::EditingSecret {
+                buffer,
+                cursor_byte,
+                validation_error,
+                ..
+            } = &mut state.mode
+            else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            if buffer.len().saturating_add(c.len_utf8()) > MAX_SECRET_INPUT_BYTES {
+                *validation_error = Some(format!(
+                    "Key is too long (maximum {MAX_SECRET_INPUT_BYTES} bytes)"
+                ));
+                return SettingsKeyOutcome::Unchanged;
+            }
+            buffer.expose_mut().insert(*cursor_byte, c);
+            *cursor_byte += c.len_utf8();
+            *validation_error = None;
+            SettingsKeyOutcome::Changed
+        }
+        _ => SettingsKeyOutcome::Unchanged,
+    }
+}
+
+/// Insert bracketed-paste content into the dedicated secret editor. Newlines
+/// copied by password managers are trimmed at the boundary; internal
+/// whitespace/control characters are rejected without echoing the payload.
+pub fn handle_settings_paste(
+    state: &mut SettingsModalState,
+    pasted: SecretInput,
+) -> SettingsKeyOutcome {
+    if !matches!(state.mode, SettingsModalMode::EditingSecret { .. }) {
+        return SettingsKeyOutcome::Unchanged;
+    }
+    let pasted = pasted.expose().trim();
+    if pasted.is_empty() {
+        return SettingsKeyOutcome::Unchanged;
+    }
+    if let Some(error) = validate_secret(pasted) {
+        update_secret_validation(state, Some(error));
+        return SettingsKeyOutcome::Changed;
+    }
+    let SettingsModalMode::EditingSecret {
+        buffer,
+        cursor_byte,
+        validation_error,
+        ..
+    } = &mut state.mode
+    else {
+        return SettingsKeyOutcome::Unchanged;
+    };
+    if buffer.len().saturating_add(pasted.len()) > MAX_SECRET_INPUT_BYTES {
+        *validation_error = Some(format!(
+            "Key is too long (maximum {MAX_SECRET_INPUT_BYTES} bytes)"
+        ));
+        return SettingsKeyOutcome::Changed;
+    }
+    buffer.expose_mut().insert_str(*cursor_byte, pasted);
+    *cursor_byte += pasted.len();
+    *validation_error = None;
+    SettingsKeyOutcome::Changed
 }
 
 /// Int stepper handler. Steps by range-aware small (Up/Down) or large
@@ -4819,6 +5136,9 @@ pub fn handle_settings_mouse(
             SettingsModalMode::EditingValue { .. } => {
                 return handle_editing_value(state, &synthetic);
             }
+            SettingsModalMode::EditingSecret { .. } => {
+                return handle_editing_secret(state, &synthetic);
+            }
             _ => {}
         }
     }
@@ -4853,7 +5173,10 @@ pub fn handle_settings_mouse(
     // when in EditingValue mode AND the row is an Int. All other
     // events in EditingValue (scrolls, off-adornment clicks) are
     // no-ops.
-    if matches!(state.mode, SettingsModalMode::EditingValue { .. }) {
+    if matches!(
+        state.mode,
+        SettingsModalMode::EditingValue { .. } | SettingsModalMode::EditingSecret { .. }
+    ) {
         let outcome = handle_editor_mouse(state, kind, column, row);
         return upgrade_if_breadcrumb_flipped(outcome, breadcrumb_hover_flipped);
     }
@@ -5194,6 +5517,109 @@ mod tests {
             UiConfig::default(),
             PagerLocalSnapshot::default(),
         )
+    }
+
+    fn kimi_secret_state(status: crate::settings::SecretStatus) -> SettingsModalState {
+        let mut state = SettingsModalState::new(
+            Arc::new(SettingsRegistry::defaults()),
+            UiConfig::default(),
+            PagerLocalSnapshot {
+                kimi_api_key_status: status,
+                ..PagerLocalSnapshot::default()
+            },
+        );
+        state.selected = state
+            .rows
+            .iter()
+            .position(|row| matches!(row, RowEntry::Setting { key, .. } if *key == "kimi_api_key"))
+            .expect("Kimi API key setting is registered");
+        state
+    }
+
+    #[test]
+    fn kimi_secret_editor_is_always_empty_and_empty_enter_preserves() {
+        for status in [
+            crate::settings::SecretStatus::Stored,
+            crate::settings::SecretStatus::EnvironmentOverride,
+        ] {
+            let mut state = kimi_secret_state(status);
+            let entered = handle_settings_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
+            assert!(matches!(entered, SettingsKeyOutcome::Changed));
+            assert!(matches!(
+                &state.mode,
+                SettingsModalMode::EditingSecret { buffer, cursor_byte: 0, .. }
+                    if buffer.is_empty()
+            ));
+
+            let committed = handle_settings_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
+            assert!(matches!(committed, SettingsKeyOutcome::Changed));
+            assert!(matches!(state.mode, SettingsModalMode::Browse));
+        }
+    }
+
+    #[test]
+    fn kimi_secret_paste_is_masked_redacted_and_commits_typed_action() {
+        let secret = "sk-live-secret-42";
+        let mut state = kimi_secret_state(crate::settings::SecretStatus::Missing);
+        let _ = handle_settings_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            handle_settings_paste(&mut state, SecretInput::new(format!("  {secret}\n")),),
+            SettingsKeyOutcome::Changed
+        ));
+
+        let area = Rect::new(0, 0, 100, 8);
+        let mut buffer = Buffer::empty(area);
+        render_editing_value(&mut buffer, area, &mut state, &Theme::current());
+        let mut rendered = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    rendered.push_str(cell.symbol());
+                }
+            }
+        }
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("*****************"));
+
+        let outcome = handle_settings_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!format!("{outcome:?}").contains(secret));
+        let SettingsKeyOutcome::Action(Action::SetKimiApiKey(secret_input)) = outcome else {
+            panic!("expected typed Kimi key action");
+        };
+        assert_eq!(secret_input.expose(), secret);
+    }
+
+    #[test]
+    fn kimi_secret_rejects_internal_whitespace_without_retaining_payload() {
+        let mut state = kimi_secret_state(crate::settings::SecretStatus::Missing);
+        let _ = handle_settings_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            handle_settings_paste(&mut state, SecretInput::new("secret with-space".to_owned()),),
+            SettingsKeyOutcome::Changed
+        ));
+        assert!(matches!(
+            &state.mode,
+            SettingsModalMode::EditingSecret {
+                buffer,
+                validation_error: Some(error),
+                ..
+            } if buffer.is_empty() && error.contains("whitespace")
+        ));
     }
 
     /// The contextual-hints group renders as a single top-level row (children

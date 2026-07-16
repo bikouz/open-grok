@@ -398,6 +398,7 @@ impl AgentView {
                     | crate::views::settings_modal::SettingsModalMode::PickingEnum { .. }
                     | crate::views::settings_modal::SettingsModalMode::PickingGroup { .. }
                     | crate::views::settings_modal::SettingsModalMode::EditingValue { .. }
+                    | crate::views::settings_modal::SettingsModalMode::EditingSecret { .. }
             ) {
                 let out = crate::views::settings_modal::handle_settings_key(state, key);
                 return apply_settings_outcome(self, out);
