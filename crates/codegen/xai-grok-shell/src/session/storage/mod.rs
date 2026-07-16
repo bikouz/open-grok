@@ -1108,7 +1108,12 @@ fn line_has_event_id(line: &str, cursor_id: &str) -> bool {
 
 /// Decode an ACP tool update from a persisted envelope. The substring guard
 /// keeps ordinary text and xAI-extension lines off the typed serde path.
-fn persisted_acp_tool_update(line: &str) -> Option<acp::SessionUpdate> {
+struct PersistedAcpToolUpdate {
+    update: acp::SessionUpdate,
+    meta: Option<acp::Meta>,
+}
+
+fn persisted_acp_tool_update(line: &str) -> Option<PersistedAcpToolUpdate> {
     if !line.contains("tool_call") {
         return None;
     }
@@ -1120,37 +1125,120 @@ fn persisted_acp_tool_update(line: &str) -> Option<acp::SessionUpdate> {
     let notification = serde_json::from_str::<acp::SessionNotification>(raw).ok()?;
     match notification.update {
         update @ (acp::SessionUpdate::ToolCall(_) | acp::SessionUpdate::ToolCallUpdate(_)) => {
-            Some(update)
+            Some(PersistedAcpToolUpdate {
+                update,
+                meta: notification.meta,
+            })
         }
         _ => None,
     }
 }
 
-/// Find legacy Code Mode transport call ids across the complete surviving
-/// timeline. `exec` and `wait` remain model-history items, but—matching
-/// codex-rs—must never become typed user-facing tool cards.
+fn raw_cell_id(value: Option<&serde_json::Value>) -> Option<&str> {
+    value?
+        .as_object()?
+        .get("cell_id")?
+        .as_str()
+        .filter(|cell_id| !cell_id.is_empty())
+}
+
+/// Find Code Mode transport call ids across the complete surviving timeline.
+///
+/// New updates carry an explicit marker and current sessions contribute exact
+/// model call ids. Pre-marker `exec` cards can still be recognized without a
+/// title-only guess: Code Mode's reserved custom tool is the only harness path
+/// that persisted an `Other`-kind `exec` with a string `rawInput`; ordinary
+/// plugin and MCP function tools persist object input. A legacy `wait` is
+/// accepted only when its `cell_id` was produced by one of those recognized
+/// exec calls. This covers two-pass, remote, or lossy compactions whose request
+/// artifact cannot supply the removed model call IDs.
 fn code_mode_transport_call_ids<'a>(
     lines: impl IntoIterator<Item = &'a str>,
+    known_transport_ids: &std::collections::HashSet<acp::ToolCallId>,
 ) -> std::collections::HashSet<acp::ToolCallId> {
-    lines
+    let persisted = lines
         .into_iter()
         .filter_map(persisted_acp_tool_update)
-        .filter_map(|update| match update {
+        .collect::<Vec<_>>();
+    let mut transport_ids = known_transport_ids.clone();
+
+    for persisted in &persisted {
+        if let acp::SessionUpdate::ToolCall(call) = &persisted.update
+            && crate::session::code_mode::is_code_mode_transport_tool(&call.title)
+            && crate::session::code_mode::is_code_mode_transport_meta(persisted.meta.as_ref())
+        {
+            transport_ids.insert(call.tool_call_id.clone());
+        }
+    }
+
+    let mut recognized_exec_ids = persisted
+        .iter()
+        .filter_map(|persisted| match &persisted.update {
             acp::SessionUpdate::ToolCall(call)
-                if crate::session::code_mode::is_code_mode_transport_tool(&call.title) =>
+                if call.title == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
+                    && transport_ids.contains(&call.tool_call_id) =>
             {
-                Some(call.tool_call_id)
+                Some(call.tool_call_id.clone())
             }
             _ => None,
         })
-        .collect()
+        .collect::<std::collections::HashSet<_>>();
+    let legacy_exec_ids = persisted
+        .iter()
+        .filter_map(|persisted| match &persisted.update {
+            acp::SessionUpdate::ToolCall(call)
+                if call.title == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
+                    && call.kind == acp::ToolKind::Other
+                    && call
+                        .raw_input
+                        .as_ref()
+                        .is_some_and(serde_json::Value::is_string) =>
+            {
+                Some(call.tool_call_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    transport_ids.extend(legacy_exec_ids.iter().cloned());
+    recognized_exec_ids.extend(legacy_exec_ids);
+
+    let legacy_cell_ids = persisted
+        .iter()
+        .filter_map(|persisted| match &persisted.update {
+            acp::SessionUpdate::ToolCall(call)
+                if recognized_exec_ids.contains(&call.tool_call_id) =>
+            {
+                raw_cell_id(call.raw_output.as_ref())
+            }
+            acp::SessionUpdate::ToolCallUpdate(update)
+                if recognized_exec_ids.contains(&update.tool_call_id) =>
+            {
+                raw_cell_id(update.fields.raw_output.as_ref())
+            }
+            _ => None,
+        })
+        .map(str::to_owned)
+        .collect::<std::collections::HashSet<_>>();
+
+    for persisted in &persisted {
+        if let acp::SessionUpdate::ToolCall(call) = &persisted.update
+            && call.title == xai_grok_code_mode_protocol::WAIT_TOOL_NAME
+            && call.kind == acp::ToolKind::Other
+            && raw_cell_id(call.raw_input.as_ref())
+                .is_some_and(|cell_id| legacy_cell_ids.contains(cell_id))
+        {
+            transport_ids.insert(call.tool_call_id.clone());
+        }
+    }
+
+    transport_ids
 }
 
 fn line_is_code_mode_transport_update(
     line: &str,
     transport_ids: &std::collections::HashSet<acp::ToolCallId>,
 ) -> bool {
-    match persisted_acp_tool_update(line) {
+    match persisted_acp_tool_update(line).map(|persisted| persisted.update) {
         Some(acp::SessionUpdate::ToolCall(call)) => transport_ids.contains(&call.tool_call_id),
         Some(acp::SessionUpdate::ToolCallUpdate(update)) => {
             transport_ids.contains(&update.tool_call_id)
@@ -1170,13 +1258,25 @@ pub(crate) fn prepare_replay_lines<'a>(
     raw_contents: &'a str,
     cursor: Option<&str>,
 ) -> PreparedReplay<'a> {
+    prepare_replay_lines_with_transport_ids(raw_contents, cursor, &std::collections::HashSet::new())
+}
+
+/// Replay preparation with transport call ids recovered from persisted model
+/// history. This lets pre-marker Code Mode sessions hide their wrappers
+/// without guessing from display titles.
+pub(crate) fn prepare_replay_lines_with_transport_ids<'a>(
+    raw_contents: &'a str,
+    cursor: Option<&str>,
+    known_transport_ids: &std::collections::HashSet<acp::ToolCallId>,
+) -> PreparedReplay<'a> {
     let filtered = filter_rewind_lines(
         raw_contents
             .lines()
             .filter(|l| !l.trim().is_empty())
             .collect(),
     );
-    let code_mode_transport_ids = code_mode_transport_call_ids(filtered.iter().copied());
+    let code_mode_transport_ids =
+        code_mode_transport_call_ids(filtered.iter().copied(), known_transport_ids);
 
     // Highest `eventId` counter across all live (rewind-filtered) lines, used to
     // re-seed the process-global event counter on resume so post-load live events
@@ -1279,6 +1379,22 @@ pub(crate) fn filter_delta_replay_lines_with_prior<'a>(
     contents: &'a str,
     prior_contents: &str,
 ) -> Vec<&'a str> {
+    filter_delta_replay_lines_with_prior_and_transport_ids(
+        contents,
+        prior_contents,
+        &std::collections::HashSet::new(),
+    )
+}
+
+pub(crate) fn filter_delta_replay_lines_with_prior_and_transport_ids<'a>(
+    contents: &'a str,
+    prior_contents: &str,
+    known_transport_ids: &std::collections::HashSet<acp::ToolCallId>,
+) -> Vec<&'a str> {
+    // New sessions carry an explicit marker in `updates.jsonl`; older sessions
+    // contribute exact wrapper ids recovered from model conversation history.
+    // Combining both sources keeps reconnects backward-compatible without
+    // treating an arbitrary plugin tool named `exec` or `wait` as transport.
     let live: Vec<&str> = contents
         .lines()
         .filter(|l| !l.trim().is_empty() && !line_is_available_commands_update(l))
@@ -1289,6 +1405,7 @@ pub(crate) fn filter_delta_replay_lines_with_prior<'a>(
             .lines()
             .filter(|line| !line.trim().is_empty())
             .chain(live.iter().copied()),
+        known_transport_ids,
     );
     live.into_iter()
         .filter(|line| !line_is_code_mode_transport_update(line, &transport_ids))
@@ -3049,7 +3166,7 @@ mod tests {
     fn replay_hides_code_mode_transport_but_keeps_nested_tool_cards() {
         let outer = acp_envelope_with_meta(
             r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":"tools.exec_command({cmd:'echo RAW_MARKER'})"}"#,
-            r#"{"eventId":"ev1"}"#,
+            r#"{"eventId":"ev1","open-grok/codeModeTransport":true}"#,
         );
         let nested = acp_envelope_with_meta(
             r#"{"sessionUpdate":"tool_call","toolCallId":"nested","title":"exec_command","kind":"execute","status":"in_progress","rawInput":{"cmd":"echo hello"}}"#,
@@ -3065,7 +3182,7 @@ mod tests {
         );
         let wait = acp_envelope_with_meta(
             r#"{"sessionUpdate":"tool_call","toolCallId":"wait-1","title":"wait","kind":"other","status":"completed","rawInput":{"cell_id":"7"},"rawOutput":{"text":"RAW_WAIT"}}"#,
-            r#"{"eventId":"ev5"}"#,
+            r#"{"eventId":"ev5","open-grok/codeModeTransport":true}"#,
         );
         let raw = format!("{outer}\n{nested}\n{nested_done}\n{outer_done}\n{wait}\n");
 
@@ -3082,6 +3199,112 @@ mod tests {
         assert!(!cursor.mark_replay);
         assert_eq!(cursor.lines.len(), 2);
         assert!(cursor.lines.iter().all(|line| line.contains("nested")));
+    }
+
+    #[test]
+    fn replay_preserves_unmarked_plugin_tools_named_exec_or_wait() {
+        let exec = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"plugin-exec","title":"exec","kind":"other","status":"in_progress","rawInput":{"command":"safe"}}"#,
+            r#"{"eventId":"ev1"}"#,
+        );
+        let exec_done = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"plugin-exec","status":"completed","rawOutput":{"text":"plugin exec result"}}"#,
+            r#"{"eventId":"ev2"}"#,
+        );
+        let wait = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"mcp-wait","title":"wait","kind":"other","status":"completed","rawInput":{"job":"42"},"rawOutput":{"text":"plugin wait result"}}"#,
+            r#"{"eventId":"ev3"}"#,
+        );
+        let raw = format!("{exec}\n{exec_done}\n{wait}\n");
+
+        let full = prepare_replay_lines(&raw, None);
+        assert_eq!(full.lines.len(), 3);
+        assert!(full.lines.iter().any(|line| line.contains("plugin-exec")));
+        assert!(full.lines.iter().any(|line| line.contains("mcp-wait")));
+        assert!(
+            full.lines
+                .iter()
+                .any(|line| line.contains("plugin exec result"))
+        );
+        assert!(
+            full.lines
+                .iter()
+                .any(|line| line.contains("plugin wait result"))
+        );
+    }
+
+    #[test]
+    fn replay_recovers_unmarked_legacy_transport_after_compaction() {
+        let legacy_outer = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"legacy-outer","title":"exec","kind":"other","status":"in_progress","rawInput":"tools.exec_command({cmd:'echo RAW'})"}"#,
+            r#"{"eventId":"ev1"}"#,
+        );
+        let nested = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"nested","title":"exec_command","kind":"execute","status":"completed","rawInput":{"cmd":"echo visible"},"rawOutput":{"output":"visible"}}"#,
+            r#"{"eventId":"ev2"}"#,
+        );
+        let legacy_outer_done = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"legacy-outer","status":"completed","rawOutput":{"cell_id":"7","success":true,"text":"RAW","content":[]}}"#,
+            r#"{"eventId":"ev3"}"#,
+        );
+        let legacy_wait = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"legacy-wait","title":"wait","kind":"other","status":"completed","rawInput":{"cell_id":"7"},"rawOutput":{"text":"RAW_WAIT"}}"#,
+            r#"{"eventId":"ev4"}"#,
+        );
+        let plugin_wait = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"plugin-wait","title":"wait","kind":"other","status":"completed","rawInput":{"cell_id":"unrelated-plugin-cell"},"rawOutput":{"text":"visible plugin wait"}}"#,
+            r#"{"eventId":"ev5"}"#,
+        );
+        let raw = format!(
+            "{legacy_outer}\n{nested}\n{legacy_outer_done}\n{legacy_wait}\n{plugin_wait}\n"
+        );
+
+        // No marker and no current-conversation ids: this is the shape left by
+        // a pre-marker session whose model history was replaced by compaction.
+        let replay = prepare_replay_lines(&raw, None);
+        assert_eq!(replay.lines.len(), 2);
+        assert!(replay.lines.iter().any(|line| line.contains("nested")));
+        assert!(replay.lines.iter().any(|line| line.contains("plugin-wait")));
+        assert!(
+            replay
+                .lines
+                .iter()
+                .any(|line| line.contains("visible plugin wait"))
+        );
+        assert!(replay.lines.iter().all(|line| !line.contains("RAW")));
+        assert!(
+            replay
+                .lines
+                .iter()
+                .all(|line| !line.contains("legacy-outer") && !line.contains("legacy-wait"))
+        );
+    }
+
+    #[test]
+    fn replay_hides_only_authoritative_legacy_transport_ids() {
+        let legacy_outer = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"legacy-outer","title":"exec","kind":"other","status":"in_progress","rawInput":"tools.exec_command({cmd:'echo RAW'})"}"#,
+            r#"{"eventId":"ev1"}"#,
+        );
+        let legacy_outer_done = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"legacy-outer","status":"completed","rawOutput":{"cell_id":"7","text":"RAW"}}"#,
+            r#"{"eventId":"ev2"}"#,
+        );
+        let plugin_exec = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"plugin-exec","title":"exec","kind":"other","status":"completed","rawInput":{"command":"safe"},"rawOutput":{"text":"visible plugin output"}}"#,
+            r#"{"eventId":"ev3"}"#,
+        );
+        let raw = format!("{legacy_outer}\n{legacy_outer_done}\n{plugin_exec}\n");
+        let known_transport_ids = std::collections::HashSet::from([acp::ToolCallId::new(
+            std::sync::Arc::from("legacy-outer"),
+        )]);
+
+        let replay = prepare_replay_lines_with_transport_ids(&raw, None, &known_transport_ids);
+        assert_eq!(replay.lines.len(), 1);
+        assert!(replay.lines[0].contains("plugin-exec"));
+        assert!(replay.lines[0].contains("visible plugin output"));
+        assert!(!replay.lines[0].contains("legacy-outer"));
+        assert!(!replay.lines[0].contains("RAW"));
     }
 
     #[test]

@@ -1392,6 +1392,11 @@ impl ConversationRequest {
     }
 }
 
+/// Bounded provider-neutral context used until the selected transport restores
+/// a provider-native search item, if that provider supports one.
+const PROVIDER_NATIVE_SEARCH_REPLAY_SUMMARY: &str =
+    "[A provider-native search was completed earlier in the conversation.]";
+
 /// Reconstruct xAI's current provider-native hosted X-search item for replay.
 /// The typed dependency only knows the older CustomToolCall carrier, so the
 /// sampler splices this value back into the serialized input at the same index.
@@ -3444,9 +3449,20 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 BackendToolKind::WebSearch(ws) => {
                     rs::InputItem::Item(rs::Item::WebSearchCall(ws.clone()))
                 }
-                BackendToolKind::XSearch(ct) => {
-                    rs::InputItem::Item(rs::Item::CustomToolCall(ct.clone()))
-                }
+                // `CustomToolCall` is only a persistence carrier for xAI's
+                // backend-executed X Search. Letting that carrier serialize
+                // directly would create an orphan client custom-tool call on
+                // Codex, where neither an x_search tool definition nor a
+                // matching output exists. Keep the generic typed request
+                // provider-neutral and bounded; the xAI transport replaces
+                // this exact slot with the native `x_search_call` wire item.
+                BackendToolKind::XSearch(_) => rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                    r#type: rs::MessageType::Message,
+                    role: rs::Role::Assistant,
+                    content: rs::EasyInputContent::Text(
+                        PROVIDER_NATIVE_SEARCH_REPLAY_SUMMARY.to_owned(),
+                    ),
+                }),
                 BackendToolKind::CodeInterpreter(ci) => {
                     rs::InputItem::Item(rs::Item::CodeInterpreterCall(ci.clone()))
                 }
@@ -10861,6 +10877,24 @@ mod tests {
         body["input"].as_array().cloned().unwrap_or_default()
     }
 
+    /// Serialize the Responses request and apply the same provider-native input
+    /// replacements that the transport applies immediately before sending.
+    fn responses_body_json_for_provider(
+        req: &ConversationRequest,
+        provider: crate::ModelProvider,
+    ) -> serde_json::Value {
+        let cr: rs::CreateResponse = req.into();
+        let mut body = serde_json::to_value(&cr).unwrap();
+        patch_reasoning_text_types(&mut body);
+        let input = body["input"].as_array_mut().expect("Responses input array");
+        for replacement in req.raw_responses_input_replacements(provider) {
+            *input
+                .get_mut(replacement.input_item_index)
+                .expect("provider-native replacement index") = replacement.value;
+        }
+        body
+    }
+
     /// Helper: one-line "kind:identifier" summary for readable assertions.
     fn summarise_input(items: &[serde_json::Value]) -> Vec<String> {
         items
@@ -11437,12 +11471,65 @@ mod tests {
         assert_eq!(replacements[0].value["id"], "xs_123");
         assert_eq!(replacements[0].value["status"], "completed");
         assert_eq!(replacements[0].value["action"]["query"], "Open Grok");
+
+        let body = responses_body_json_for_provider(&request, crate::ModelProvider::Xai);
+        let replayed = &body["input"][1];
+        assert_eq!(replayed["type"], "x_search_call");
+        assert_eq!(replayed["id"], "xs_123");
+        assert_eq!(replayed["status"], "completed");
+        assert_eq!(replayed["action"]["query"], "Open Grok");
         assert!(
             request
                 .raw_responses_input_replacements(crate::ModelProvider::Codex)
                 .is_empty(),
             "xAI provider-native search history must never cross to Codex",
         );
+    }
+
+    #[test]
+    fn codex_x_search_history_replays_as_bounded_provider_neutral_context() {
+        let input = serde_json::json!({
+            "type": "search",
+            "query": "provider-private query that must not cross"
+        })
+        .to_string();
+        let call = serde_json::from_value::<rs::CustomToolCall>(serde_json::json!({
+            "call_id": "xs_private_call",
+            "input": input,
+            "name": "x_search",
+            "id": "xs_private_item"
+        }))
+        .unwrap();
+        let request = ConversationRequest::from_items(vec![
+            ConversationItem::assistant("visible answer based on earlier search"),
+            ConversationItem::BackendToolCall(BackendToolCallItem {
+                kind: BackendToolKind::XSearch(call),
+            }),
+        ]);
+
+        let body = responses_body_json_for_provider(&request, crate::ModelProvider::Codex);
+        let replayed = &body["input"][1];
+        assert_eq!(replayed["type"], "message");
+        assert_eq!(replayed["role"], "assistant");
+        assert_eq!(replayed["content"], PROVIDER_NATIVE_SEARCH_REPLAY_SUMMARY);
+        assert!(
+            replayed["content"].as_str().unwrap().chars().count() < 128,
+            "cross-provider search context must remain bounded"
+        );
+
+        let wire = serde_json::to_string(&body).unwrap();
+        for provider_native_detail in [
+            "custom_tool_call",
+            "x_search",
+            "xs_private_call",
+            "xs_private_item",
+            "provider-private query",
+        ] {
+            assert!(
+                !wire.contains(provider_native_detail),
+                "Codex Responses input leaked {provider_native_detail:?}: {wire}"
+            );
+        }
     }
 
     #[test]

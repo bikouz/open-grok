@@ -63,6 +63,7 @@ async fn rebuild_reinjects_goal_update_handle() {
             actor
                 .handle_rebuild_agent_for_definition(
                     xai_grok_agent::AgentDefinition::default_grok_build(),
+                    false,
                 )
                 .await
                 .expect("zero-turn rebuild should succeed");

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use agent_client_protocol as acp;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use tokio::sync::{OnceCell, mpsc, oneshot};
@@ -29,6 +30,7 @@ use crate::sampling::rs::{CustomGrammarFormatParam, CustomToolParamFormat, Gramm
 use crate::sampling::{ClientTool, CustomToolOutputContent, CustomToolOutputImageDetail, ToolSpec};
 
 pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
+pub(crate) const CODE_MODE_TRANSPORT_META_KEY: &str = "open-grok/codeModeTransport";
 
 /// The model uses these tools as an implementation detail for the persistent
 /// JavaScript runtime. They must remain in the model conversation, but they are
@@ -39,6 +41,15 @@ pub(crate) fn is_code_mode_transport_tool(name: &str) -> bool {
         name,
         xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME | xai_grok_code_mode_protocol::WAIT_TOOL_NAME
     )
+}
+
+/// Whether a persisted ACP update was explicitly emitted as a Code Mode
+/// transport wrapper. Tool names alone are not sufficient: plugins and MCP
+/// servers are allowed to expose ordinary tools named `exec` or `wait`.
+pub(crate) fn is_code_mode_transport_meta(meta: Option<&acp::Meta>) -> bool {
+    meta.and_then(|meta| meta.get(CODE_MODE_TRANSPORT_META_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 /// Human-interaction tools must remain model-visible in Code Mode Only: a
@@ -808,6 +819,29 @@ mod tests {
         assert!(!is_code_mode_transport_tool("exec_command"));
         assert!(!is_code_mode_transport_tool("apply_patch"));
         assert!(!is_code_mode_transport_tool("web_search"));
+    }
+
+    #[test]
+    fn replay_transport_marker_must_be_explicitly_true() {
+        let mut marked = serde_json::Map::new();
+        marked.insert(
+            CODE_MODE_TRANSPORT_META_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let mut false_marker = serde_json::Map::new();
+        false_marker.insert(
+            CODE_MODE_TRANSPORT_META_KEY.to_string(),
+            serde_json::Value::Bool(false),
+        );
+        let unrelated = json!({ "x.ai/tool": { "name": "exec" } })
+            .as_object()
+            .cloned()
+            .unwrap();
+
+        assert!(is_code_mode_transport_meta(Some(&marked)));
+        assert!(!is_code_mode_transport_meta(Some(&false_marker)));
+        assert!(!is_code_mode_transport_meta(Some(&unrelated)));
+        assert!(!is_code_mode_transport_meta(None));
     }
 
     #[test]

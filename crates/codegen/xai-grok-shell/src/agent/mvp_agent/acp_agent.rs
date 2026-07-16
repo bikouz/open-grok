@@ -1609,6 +1609,12 @@ impl acp::Agent for MvpAgent {
                 Vec::new(),
             )
         } else {
+            let code_mode_transport_ids = self
+                .persisted_code_mode_transport_ids(
+                    &chat_history,
+                    updates_file_path.as_deref(),
+                )
+                .await;
             let (tokens, replay_end_offset, unfinished_subagents) = self
                 .replay_session_updates(
                     &session_id,
@@ -1617,6 +1623,7 @@ impl acp::Agent for MvpAgent {
                     persist_data.as_ref(),
                     target_client_id.as_ref(),
                     cursor.as_deref(),
+                    &code_mode_transport_ids,
                 )
                 .await?;
             let cursor_mark_replay = cursor.is_none();
@@ -1630,6 +1637,7 @@ impl acp::Agent for MvpAgent {
                         persist_data.as_ref(),
                         target_client_id.as_ref(),
                         cursor_mark_replay,
+                        &code_mode_transport_ids,
                     )
                 }
                 Err(reason) => {

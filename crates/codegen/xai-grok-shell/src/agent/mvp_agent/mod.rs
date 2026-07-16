@@ -1321,6 +1321,142 @@ pub(crate) struct OrphanedTask {
     cwd: String,
 }
 impl MvpAgent {
+    fn collect_code_mode_transport_ids(
+        models: &IndexMap<String, ModelEntry>,
+        conversation: &[xai_grok_sampling_types::ConversationItem],
+        ids: &mut std::collections::HashSet<acp::ToolCallId>,
+    ) {
+        let mut code_mode_turn = false;
+        for item in conversation {
+            match item {
+                xai_grok_sampling_types::ConversationItem::User(user)
+                    if user.synthetic_reason.is_none() =>
+                {
+                    code_mode_turn = false;
+                }
+                xai_grok_sampling_types::ConversationItem::Assistant(assistant) => {
+                    let model_uses_code_mode = assistant.model_id.as_deref().is_some_and(|id| {
+                        matches!(
+                            crate::agent::models::resolve_model_tool_mode(
+                                models,
+                                &acp::ModelId::new(id.to_string()),
+                            ),
+                            Some(
+                                xai_grok_sampling_types::ToolMode::CodeMode
+                                    | xai_grok_sampling_types::ToolMode::CodeModeOnly
+                            )
+                        )
+                    });
+                    let has_custom_exec = assistant.tool_calls.iter().any(|call| {
+                        call.is_custom()
+                            && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
+                    });
+                    code_mode_turn |= model_uses_code_mode || has_custom_exec;
+
+                    for call in &assistant.tool_calls {
+                        let is_exec = call.is_custom()
+                            && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME;
+                        let is_wait = code_mode_turn
+                            && !call.is_custom()
+                            && call.name == xai_grok_code_mode_protocol::WAIT_TOOL_NAME
+                            && serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                .ok()
+                                .and_then(|value| {
+                                    value
+                                        .get("cell_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned)
+                                })
+                                .is_some();
+                        if is_exec || is_wait {
+                            ids.insert(acp::ToolCallId::new(Arc::from(
+                                call.call_id().to_string(),
+                            )));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn code_mode_transport_ids_from_compaction_requests(
+        session_dir: &std::path::Path,
+        models: &IndexMap<String, ModelEntry>,
+    ) -> std::collections::HashSet<acp::ToolCallId> {
+        #[derive(serde::Deserialize)]
+        struct CompactionRequestHistory {
+            #[serde(default)]
+            chat_history: Vec<xai_grok_sampling_types::ConversationItem>,
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        let requests_dir = session_dir.join("compaction_requests");
+        let Ok(entries) = std::fs::read_dir(&requests_dir) else {
+            return ids;
+        };
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            let is_regular_json = entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_file())
+                && path.extension().is_some_and(|extension| extension == "json");
+            if !is_regular_json {
+                continue;
+            }
+            let request = std::fs::File::open(&path)
+                .ok()
+                .and_then(|file| {
+                    serde_json::from_reader::<_, CompactionRequestHistory>(
+                        std::io::BufReader::new(file),
+                    )
+                    .ok()
+                });
+            let Some(request) = request else {
+                tracing::warn!(
+                    path = %path.display(),
+                    "could not read compaction request while recovering Code Mode replay ids"
+                );
+                continue;
+            };
+            Self::collect_code_mode_transport_ids(models, &request.chat_history, &mut ids);
+        }
+        ids
+    }
+
+    /// Recover Code Mode wrapper ids from current and pre-compaction model
+    /// history for sessions written before the explicit ACP marker existed.
+    /// `load_session` calls this before a cold session is registered, so it
+    /// deliberately uses the already-loaded history rather than `self.sessions`.
+    async fn persisted_code_mode_transport_ids(
+        &self,
+        chat_history: &[xai_grok_sampling_types::ConversationItem],
+        updates_file_path: Option<&std::path::Path>,
+    ) -> std::collections::HashSet<acp::ToolCallId> {
+        let models = self.models_manager.models();
+        let mut ids = std::collections::HashSet::new();
+        Self::collect_code_mode_transport_ids(&models, chat_history, &mut ids);
+
+        let Some(session_dir) = updates_file_path.and_then(std::path::Path::parent).map(PathBuf::from)
+        else {
+            return ids;
+        };
+        let artifact_ids = tokio::task::spawn_blocking(move || {
+            Self::code_mode_transport_ids_from_compaction_requests(&session_dir, &models)
+        })
+        .await;
+        match artifact_ids {
+            Ok(artifact_ids) => ids.extend(artifact_ids),
+            Err(error) => tracing::warn!(
+                %error,
+                "failed to recover Code Mode replay ids from compaction requests"
+            ),
+        }
+        ids
+    }
+
     /// Forward one raw JSONL replay line and collect its completion receiver.
     ///
     /// Dispatches by on-disk method name:
@@ -1429,11 +1565,7 @@ impl MvpAgent {
                         tc.status, acp::ToolCallStatus::Completed |
                         acp::ToolCallStatus::Failed
                     );
-                    if is_pre_completed {
-                        if crate::session::code_mode::is_code_mode_transport_tool(&tc.title) {
-                            return;
-                        }
-                    } else {
+                    if !is_pre_completed {
                         pending_tool_calls.insert(tc.tool_call_id.clone(), tc.clone());
                         return;
                     }
@@ -1445,11 +1577,6 @@ impl MvpAgent {
                             if let Some(mut base) = pending_tool_calls
                                 .remove(&u.tool_call_id)
                             {
-                                if crate::session::code_mode::is_code_mode_transport_tool(
-                                    &base.title,
-                                ) {
-                                    return;
-                                }
                                 base.update(std::mem::take(&mut u.fields));
                                 notification.update = acp::SessionUpdate::ToolCall(base);
                             }
@@ -1486,6 +1613,7 @@ impl MvpAgent {
         persist_data: Option<&serde_json::Value>,
         target_client_id: Option<&serde_json::Value>,
         cursor: Option<&str>,
+        code_mode_transport_ids: &std::collections::HashSet<acp::ToolCallId>,
     ) -> Result<(u64, u64, Vec<(String, String)>), acp::Error> {
         let mut replay_timer = crate::instrumentation_timer!(
             "session.load_session_replay"
@@ -1504,7 +1632,11 @@ impl MvpAgent {
         let end_offset = raw_contents.len() as u64;
         let mut prepared = {
             let _timer = crate::instrumentation_timer!("session.replay.read_and_filter");
-            crate::session::storage::prepare_replay_lines(&raw_contents, cursor)
+            crate::session::storage::prepare_replay_lines_with_transport_ids(
+                &raw_contents,
+                cursor,
+                code_mode_transport_ids,
+            )
         };
         let unfinished_subagents = std::mem::take(&mut prepared.unfinished_subagents);
         if cursor.is_some() {
@@ -1581,6 +1713,7 @@ impl MvpAgent {
         persist_data: Option<&serde_json::Value>,
         target_client_id: Option<&serde_json::Value>,
         mark_replay: bool,
+        code_mode_transport_ids: &std::collections::HashSet<acp::ToolCallId>,
     ) -> Vec<tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<()>>> {
         use std::io::Read;
         let Some(updates_path) = updates_file_path.clone() else {
@@ -1604,9 +1737,10 @@ impl MvpAgent {
         if contents.is_empty() {
             return Vec::new();
         }
-        let live_lines = crate::session::storage::filter_delta_replay_lines_with_prior(
+        let live_lines = crate::session::storage::filter_delta_replay_lines_with_prior_and_transport_ids(
             contents,
             prior_contents,
+            code_mode_transport_ids,
         );
         let delta_count = live_lines.len();
         let mut completions = Vec::with_capacity(live_lines.len());
