@@ -13,7 +13,7 @@ use std::process::Command;
 
 const GOOD_SCRIPT: &str = "#!/bin/sh\nexit 0\n";
 const GOOD_SHA256: &str = "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb";
-const VERSION: &str = "0.1.220-open-grok.2";
+const VERSION: &str = "0.1.220-open-grok.3";
 const INSTALLER_BLOCK_START: &str = "# >>> open-grok installer >>>";
 
 fn script_path(name: &str) -> Option<PathBuf> {

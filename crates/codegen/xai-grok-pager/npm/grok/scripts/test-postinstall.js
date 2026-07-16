@@ -156,7 +156,7 @@ test('fresh install creates open-grok and a versioned target', () => {
         const source = path.join(dir, 'source');
         const binDir = path.join(dir, '.opengrok', 'bin');
         fs.writeFileSync(source, 'open-grok-binary');
-        const result = installVersionedBinary(source, '0.1.220-open-grok.2', binDir);
+        const result = installVersionedBinary(source, '0.1.220-open-grok.3', binDir);
 
         assert.strictEqual(fs.readlinkSync(result.canonicalPath), result.versionedName);
         assert.strictEqual(fs.readFileSync(result.canonicalPath, 'utf8'), 'open-grok-binary');
@@ -176,7 +176,7 @@ test('upgrade is atomic and keeps the previous version', () => {
         fs.writeFileSync(source, 'first');
         installVersionedBinary(source, '0.1.219-open-grok.1', binDir);
         fs.writeFileSync(source, 'second');
-        const latest = installVersionedBinary(source, '0.1.220-open-grok.2', binDir);
+        const latest = installVersionedBinary(source, '0.1.220-open-grok.3', binDir);
 
         assert.strictEqual(fs.readlinkSync(latest.canonicalPath), latest.versionedName);
         assert.strictEqual(fs.readFileSync(latest.canonicalPath, 'utf8'), 'second');
@@ -198,16 +198,16 @@ test('cleanup handles fork prerelease versions and leaves upstream commands unto
         for (const version of [
             '0.1.218-open-grok.1',
             '0.1.219-open-grok.1',
-            '0.1.220-open-grok.2',
+            '0.1.220-open-grok.3',
         ]) {
             fs.writeFileSync(path.join(binDir, `open-grok-${version}`), version);
         }
         fs.writeFileSync(path.join(binDir, 'grok'), 'upstream-grok');
         fs.writeFileSync(path.join(binDir, 'agent'), 'upstream-agent');
 
-        cleanupOldVersions(binDir, '0.1.220-open-grok.2');
+        cleanupOldVersions(binDir, '0.1.220-open-grok.3');
 
-        assert.ok(fs.existsSync(path.join(binDir, 'open-grok-0.1.220-open-grok.2')));
+        assert.ok(fs.existsSync(path.join(binDir, 'open-grok-0.1.220-open-grok.3')));
         assert.ok(fs.existsSync(path.join(binDir, 'open-grok-0.1.219-open-grok.1')));
         assert.ok(!fs.existsSync(path.join(binDir, 'open-grok-0.1.218-open-grok.1')));
         assert.strictEqual(fs.readFileSync(path.join(binDir, 'grok'), 'utf8'), 'upstream-grok');

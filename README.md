@@ -83,7 +83,7 @@ leading `v`):
 
 ```sh
 curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh \
-  | bash -s -- v0.1.220-open-grok.2
+  | bash -s -- v0.1.220-open-grok.3
 ```
 
 For local installer testing, `OPEN_GROK_RELEASE_BASE_URL` may point directly to
