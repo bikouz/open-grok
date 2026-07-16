@@ -3,8 +3,6 @@
 
 use super::*;
 
-use crate::remote::DEFAULT_CONTEXT_WINDOW;
-
 impl SessionActor {
     /// Handle a /btw side question — single-turn model call using the
     /// parent session's full context.
@@ -188,8 +186,11 @@ impl SessionActor {
         // (not on failure/empty/cancel) so auto can retry later for this turn if needed.
         let clear_in_flight = || self.recap_in_flight.set(false);
 
-        let sampling_client = match self.prepare_chat_completion(false).await {
-            Ok(c) => c,
+        let auxiliary = match self
+            .prepare_auxiliary_sampling(AuxiliaryModelPurpose::Recap, None)
+            .await
+        {
+            Ok(route) => route,
             Err(e) => {
                 tracing::warn!(error = %e, "recap: failed to prepare sampling client");
                 clear_in_flight();
@@ -200,6 +201,13 @@ impl SessionActor {
                 return;
             }
         };
+        let PreparedAuxiliarySampling {
+            client: sampling_client,
+            model,
+            context_window,
+            reasoning_effort,
+            provider,
+        } = auxiliary;
 
         let tag = self.reminder_wrapper_tag();
         // Strip reasoning ONLY on the Anthropic Messages backend (it rejects
@@ -210,17 +218,12 @@ impl SessionActor {
         let strip_reasoning =
             sampling_client.api_backend() == crate::sampling::ApiBackend::Messages;
 
-        // Budget off the recap model's context window (today the session model).
-        // One read serves both the window and the model.
-        let sampling_config = self.chat_state_handle.get_sampling_config().await;
-        let context_window = sampling_config
-            .as_ref()
-            .map(|c| c.context_window.get())
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        // Budget against the independently selected recap model, not the
+        // primary chat model. This matters when a 353K Codex session delegates
+        // recap to a helper with a different context window (or vice versa).
+        let context_window = context_window.max(1);
         let items =
             session_recap::budget_recap_items(conversation, tag, strip_reasoning, context_window);
-
-        let model = sampling_config.map(|c| c.model).unwrap_or_default();
 
         // Leave BOTH temperature and max_output_tokens unset: the cli-chat-proxy
         // layer may inject a `thinking` budget for thinking-enabled models
@@ -240,12 +243,21 @@ impl SessionActor {
             tools: vec![],
             model: Some(model.clone()),
             temperature: None,
+            reasoning_effort,
             x_grok_conv_id: Some(x_grok_conv_id.clone()),
             x_grok_req_id: Some(x_grok_req_id.clone()),
             x_grok_session_id: Some(self.session_info.id.to_string()),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
             ..Default::default()
         };
+
+        tracing::debug!(
+            recap_model = %model,
+            recap_provider = ?provider,
+            recap_context_window = context_window,
+            recap_reasoning_effort = ?reasoning_effort,
+            "recap: dispatching auxiliary model call"
+        );
 
         let response = match sampling_client.conversation_collect(request).await {
             Ok(r) => r,

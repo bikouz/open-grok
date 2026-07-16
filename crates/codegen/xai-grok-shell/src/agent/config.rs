@@ -1003,6 +1003,16 @@ pub struct ModelsConfig {
     pub web_search: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_summary: Option<String>,
+    /// Model used for `/recap` and return-from-away recaps. `None` applies a
+    /// provider-aware automatic policy (Codex -> gpt-5.6-terra/medium; xAI ->
+    /// active model/low).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recap: Option<String>,
+    /// Model used for memory flush, Dream consolidation, and memory-note
+    /// rewriting. `None` applies the same provider-aware automatic policy as
+    /// recap. Explicit selections may cross providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
     /// Vision model used to transcribe user-supplied
     /// images via a separate endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4761,7 +4771,43 @@ pub fn resolve_aux_model_sampling_config(
 ) -> Option<SamplerConfig> {
     let catalog_entry = find_model_by_id(models, model_id).cloned();
     if let Some(entry) = &catalog_entry {
+        // Session/global xAI credentials are scoped to first-party xAI hosts.
+        // A custom/BYOK auxiliary endpoint must declare its own api_key or
+        // env_key; otherwise a cross-provider helper could disclose the xAI
+        // session bearer to an arbitrary configured URL.
+        let trusted_provider_endpoint = match entry.info().provider {
+            ModelProvider::Xai => crate::util::is_first_party_xai_url(&entry.info().base_url),
+            ModelProvider::Codex => {
+                let base = entry.info().base_url.trim().trim_end_matches('/');
+                base.is_empty() || base == crate::codex_auth::CODEX_INFERENCE_BASE_URL
+            }
+        };
+        if !trusted_provider_endpoint && !entry.has_own_credentials() {
+            tracing::warn!(
+                aux_model = %model_id,
+                provider = ?entry.info().provider,
+                base_url = %entry.info().base_url,
+                "custom auxiliary model endpoint has no endpoint-owned credentials"
+            );
+            return None;
+        }
         let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
+        let resolved_endpoint_is_trusted = match entry.info().provider {
+            ModelProvider::Xai => crate::util::is_first_party_xai_url(&credentials.base_url),
+            ModelProvider::Codex => {
+                credentials.base_url.trim().trim_end_matches('/')
+                    == crate::codex_auth::CODEX_INFERENCE_BASE_URL
+            }
+        };
+        if !resolved_endpoint_is_trusted && !entry.has_own_credentials() {
+            tracing::warn!(
+                aux_model = %model_id,
+                provider = ?entry.info().provider,
+                base_url = %credentials.base_url,
+                "resolved auxiliary endpoint has no endpoint-owned credentials"
+            );
+            return None;
+        }
         let sampler = sampling_config_for_model(
             entry,
             credentials,
@@ -5644,7 +5690,7 @@ reasoning_effort = "low"
         assert!(cfg.disable_web_search);
     }
     #[test]
-    fn new_from_toml_cfg_restores_web_search_and_session_summary_models() {
+    fn new_from_toml_cfg_restores_auxiliary_models() {
         let empty: toml::Value = toml::Value::Table(toml::map::Map::new());
         let cfg = Config::new_from_toml_cfg(&empty).expect("empty config should parse");
         assert_eq!(
@@ -5662,12 +5708,19 @@ reasoning_effort = "low"
             Some(crate::models::default_image_description_model().to_owned()),
             "empty config should produce compiled default image_description model"
         );
+        assert_eq!(cfg.models.recap, None, "recap should default to Automatic");
+        assert_eq!(
+            cfg.models.memory, None,
+            "memory should default to Automatic"
+        );
         let with_overrides: toml::Value = toml::from_str(
             r#"
             [models]
             web_search = "custom-ws-model"
             session_summary = "custom-ss-model"
             image_description = "custom-id-model"
+            recap = "gpt-5.6-terra"
+            memory = "grok-4.5"
             "#,
         )
         .unwrap();
@@ -5681,6 +5734,8 @@ reasoning_effort = "low"
             cfg2.image_description_model,
             Some("custom-id-model".to_owned())
         );
+        assert_eq!(cfg2.models.recap.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(cfg2.models.memory.as_deref(), Some("grok-4.5"));
     }
     #[test]
     fn hidden_default_web_search_resolution_is_explicit_and_responses_only() {

@@ -4,6 +4,37 @@
 #![allow(clippy::items_after_test_module)]
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
+
+/// Choose the endpoint and static credential used for memory embeddings.
+/// ChatGPT Codex credentials are never reused for xAI embeddings: a Codex
+/// session uses an independently resolved xAI route, or the configured xAI
+/// endpoint with no static key so the live xAI key provider can resolve one.
+fn select_memory_embedding_route(
+    active: &SamplingConfig,
+    resolved_xai: Option<&xai_grok_sampler::SamplerConfig>,
+    default_xai_base_url: &str,
+) -> (String, Option<String>) {
+    if let Some(route) = resolved_xai
+        && route.provider == xai_grok_sampling_types::ModelProvider::Xai
+    {
+        return (route.base_url.clone(), route.api_key.clone());
+    }
+    if active.provider == xai_grok_sampling_types::ModelProvider::Xai
+        && crate::util::is_first_party_xai_url(&active.base_url)
+    {
+        return (active.base_url.clone(), active.api_key.clone());
+    }
+    (default_xai_base_url.to_owned(), None)
+}
+
+fn memory_embedding_uses_live_xai_auth(
+    base_url: &str,
+    route_key: Option<&str>,
+    xai_auth_key: Option<&str>,
+) -> bool {
+    crate::util::is_first_party_xai_url(base_url)
+        && xai_auth_key.is_some_and(|xai_key| route_key.is_none_or(|key| key == xai_key))
+}
 /// Partition CLI `--allow` rules under the pin: blanket catch-all allows
 /// (`Allow(Any)` `*` / `**`, plus bare/match-all Bash/MCP/WebFetch grants — see
 /// `resolution::is_catchall_allow`) substitute for the blocked `--yolo`, so drop them when
@@ -32,7 +63,10 @@ fn drop_cli_catchall_allows(
 }
 #[cfg(test)]
 mod cli_catchall_drop_tests {
-    use super::drop_cli_catchall_allows;
+    use super::{
+        drop_cli_catchall_allows, memory_embedding_uses_live_xai_auth,
+        select_memory_embedding_route,
+    };
     use xai_grok_workspace::permission::resolution::YOLO_PIN_REASON_REQUIREMENTS;
     use xai_grok_workspace::permission::rules::parse_permission_rule;
     use xai_grok_workspace::permission::types::{PermissionRule, RuleAction, ToolFilter};
@@ -71,6 +105,62 @@ mod cli_catchall_drop_tests {
         let (kept, dropped) = drop_cli_catchall_allows(rules, None);
         assert_eq!(kept.len(), 3);
         assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn codex_memory_embeddings_use_an_independent_xai_route() {
+        let active = xai_grok_sampler::SamplerConfig {
+            provider: xai_grok_sampling_types::ModelProvider::Codex,
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            api_key: Some("codex-token-must-not-cross".into()),
+            ..Default::default()
+        };
+        let xai = xai_grok_sampler::SamplerConfig {
+            provider: xai_grok_sampling_types::ModelProvider::Xai,
+            base_url: "https://api.x.ai/v1".into(),
+            api_key: Some("xai-token".into()),
+            ..Default::default()
+        };
+
+        let (base_url, api_key) =
+            select_memory_embedding_route(&active, Some(&xai), "https://fallback.x.ai/v1");
+        assert_eq!(base_url, "https://api.x.ai/v1");
+        assert_eq!(api_key.as_deref(), Some("xai-token"));
+
+        let (base_url, api_key) =
+            select_memory_embedding_route(&active, None, "https://fallback.x.ai/v1");
+        assert_eq!(base_url, "https://fallback.x.ai/v1");
+        assert_eq!(api_key, None, "Codex token must never become an xAI key");
+    }
+
+    #[test]
+    fn custom_embedding_routes_keep_their_own_credential() {
+        assert!(!memory_embedding_uses_live_xai_auth(
+            "https://embeddings.example.test/v1",
+            Some("byok-key"),
+            Some("xai-session-key"),
+        ));
+        assert!(!memory_embedding_uses_live_xai_auth(
+            "https://api.x.ai/v1",
+            Some("deployment-key"),
+            Some("xai-session-key"),
+        ));
+        assert!(memory_embedding_uses_live_xai_auth(
+            "https://api.x.ai/v1",
+            Some("xai-session-key"),
+            Some("xai-session-key"),
+        ));
+
+        let active_custom = xai_grok_sampler::SamplerConfig {
+            provider: xai_grok_sampling_types::ModelProvider::Xai,
+            base_url: "https://custom.example.test/v1".into(),
+            api_key: Some("ambiguous-active-key".into()),
+            ..Default::default()
+        };
+        let (base_url, api_key) =
+            select_memory_embedding_route(&active_custom, None, "https://api.x.ai/v1");
+        assert_eq!(base_url, "https://api.x.ai/v1");
+        assert_eq!(api_key, None);
     }
 }
 /// Spawns a session actor and returns the session handle plus a receiver for permission events.
@@ -382,8 +472,55 @@ pub(crate) async fn spawn_session_actor(
         tracing::warn!("web_search disabled: configured model could not be resolved");
         xai_grok_tools::implementations::WebSearchConfig::Disabled
     };
-    let embed_base_url = sampling_config.base_url.clone();
-    let embed_api_key = sampling_config.api_key.clone();
+    // Memory embeddings are an independent xAI helper path. A Codex session
+    // must never send its ChatGPT bearer or backend URL to the embeddings API,
+    // but may use xAI credentials when the user has both providers connected.
+    let endpoints = models_manager.endpoints();
+    let embedding_alpha_test_key = credentials.alpha_test_key.clone();
+    let embedding_model = memory_config
+        .as_ref()
+        .and_then(|config| config.embedding.model.as_deref());
+    let xai_session_key = auth_manager
+        .as_ref()
+        .and_then(|manager| manager.current_or_expired())
+        .map(|auth| auth.key);
+    let resolved_xai_embedding = embedding_model
+        .and_then(|model| {
+            crate::agent::config::resolve_aux_model_sampling_config(
+                model,
+                &models_manager.models(),
+                &endpoints,
+                xai_session_key.as_deref(),
+                auth_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.grok_com_config().api_key_auth_disabled()),
+                embedding_alpha_test_key.clone(),
+                credentials.client_version.clone(),
+            )
+        })
+        .filter(|route| route.provider == xai_grok_sampling_types::ModelProvider::Xai);
+    let mut memory_embedding_config = memory_config
+        .as_ref()
+        .map(|config| config.embedding.clone());
+    if let Some(config) = memory_embedding_config.as_mut()
+        && let Some(route) = resolved_xai_embedding.as_ref()
+    {
+        // `[memory.embedding].model` may name a catalog alias. The embedding
+        // request must carry the resolved wire model, just like the endpoint
+        // and credential below.
+        config.model = Some(route.model.clone());
+    }
+    let (embed_base_url, embed_api_key) = select_memory_embedding_route(
+        &sampling_config,
+        resolved_xai_embedding.as_ref(),
+        &endpoints.resolve_inference_base_url(),
+    );
+    let embedding_route_is_first_party = crate::util::is_first_party_xai_url(&embed_base_url);
+    let embedding_uses_live_xai_auth = memory_embedding_uses_live_xai_auth(
+        &embed_base_url,
+        embed_api_key.as_deref(),
+        xai_session_key.as_deref(),
+    );
     let session_pruning_config: crate::config::PruningConfig = memory_config.as_ref().map_or_else(
         || crate::config::PruningConfig {
             enabled: false,
@@ -640,26 +777,23 @@ pub(crate) async fn spawn_session_actor(
             Some(session_info.id.0.to_string()),
         )
     });
-    let memory_provider_allowed = sampling_config.provider
-        == xai_grok_sampling_types::ModelProvider::Xai
-        && persistence.provider_boundary.allows_xai_export();
-    let memory_storage_for_session = memory_config
-        .as_ref()
-        .filter(|mc| mc.enabled && memory_provider_allowed)
-        .map(|mc| {
-            if mc.flat_memory_root
-                && let Some(ref root) = mc.root_dir_override
-            {
-                return crate::session::memory::MemoryStorage::new_flat(
-                    tool_context.cwd.as_path(),
-                    root,
-                );
-            }
-            crate::session::memory::MemoryStorage::new(
+    // Local storage/FTS is provider-neutral. The user may also keep xAI
+    // connected as the semantic embedding backend while chatting through
+    // Codex, so this path is intentionally independent of the chat provider.
+    let memory_storage_for_session = memory_config.as_ref().filter(|mc| mc.enabled).map(|mc| {
+        if mc.flat_memory_root
+            && let Some(ref root) = mc.root_dir_override
+        {
+            return crate::session::memory::MemoryStorage::new_flat(
                 tool_context.cwd.as_path(),
-                mc.root_dir_override.as_deref(),
-            )
-        });
+                root,
+            );
+        }
+        crate::session::memory::MemoryStorage::new(
+            tool_context.cwd.as_path(),
+            mc.root_dir_override.as_deref(),
+        )
+    });
     let memory_initial_injection_config = memory_config
         .as_ref()
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
@@ -707,7 +841,7 @@ pub(crate) async fn spawn_session_actor(
         };
         let params = crate::session::memory::MemoryBackendParams {
             session_id: session_info.id.to_string(),
-            embed_config: memory_config.as_ref().map(|mc| mc.embedding.clone()),
+            embed_config: memory_embedding_config.clone(),
             embed_base_url: embed_base_url.clone(),
             embed_api_key: embed_api_key.clone(),
             search_config: memory_config
@@ -716,12 +850,14 @@ pub(crate) async fn spawn_session_actor(
             watcher,
             stale_claim_secs: watcher_config.stale_claim_secs,
             search_source: "tool",
-            api_key_provider: (sampling_config.provider
-                == xai_grok_sampling_types::ModelProvider::Xai)
+            // Only first-party xAI routes may consult the shared xAI auth
+            // cell. Custom/BYOK endpoints retain their own resolved static
+            // credential and never receive the logged-in xAI bearer.
+            api_key_provider: (embedding_route_is_first_party
+                && (embed_api_key.is_none() || embedding_uses_live_xai_auth))
                 .then(|| api_key_provider.clone())
                 .flatten(),
-            auth_credentials: (sampling_config.provider
-                == xai_grok_sampling_types::ModelProvider::Xai)
+            auth_credentials: embedding_uses_live_xai_auth
                 .then(|| auth_manager.as_ref())
                 .flatten()
                 .map(|am| {
@@ -729,7 +865,7 @@ pub(crate) async fn spawn_session_actor(
                         crate::auth::credential_provider::ShellAuthCredentialProvider::new(
                             am.clone(),
                             None,
-                            None,
+                            embedding_alpha_test_key.clone(),
                         ),
                     )
                         as std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider>
@@ -1442,20 +1578,13 @@ pub(crate) async fn spawn_session_actor(
         let index_config = memory_config
             .as_ref()
             .map_or_else(Default::default, |mc| mc.index.clone());
-        let embed_config = memory_config
+        let embed_dims = memory_config
             .as_ref()
-            .map(|mc| mc.embedding.clone())
-            .unwrap_or_default();
-        let embed_dims = embed_config.dimensions;
-        let sampling_base_url = embed_base_url.clone();
-        let sampling_api_key = embed_api_key.clone();
+            .map_or(1024, |config| config.embedding.dimensions);
+        let embedding_params = session.memory.backend_params.clone();
         let session_id_for_reindex = session_info.id.to_string();
         let chunks_added_counter = session.memory.chunks_added.clone();
-        let provider_boundary = persistence.provider_boundary.clone();
         tokio::task::spawn_local(async move {
-            if !provider_boundary.allows_xai_export() {
-                return;
-            }
             let db_path = storage.workspace_dir().join("index.sqlite");
             if let Ok(mut index) = crate::session::memory::MemoryIndex::open_or_create(
                 &db_path,
@@ -1467,9 +1596,6 @@ pub(crate) async fn spawn_session_actor(
                 let reindex_start = std::time::Instant::now();
                 let (mut total_added, mut total_updated, mut total_removed) = (0, 0, 0);
                 for file in &files {
-                    if !provider_boundary.allows_xai_export() {
-                        return;
-                    }
                     let source = storage.classify_source(file);
                     if let Ok(stats) = index.reindex_file(file, source) {
                         total_added += stats.added;
@@ -1481,20 +1607,10 @@ pub(crate) async fn spawn_session_actor(
                     target : xai_grok_telemetry::memory_log::TARGET, files = files.len(),
                     "MEMORY_REINDEX: background reindex complete"
                 );
-                let embedded_count = if provider_boundary.allows_xai_export()
-                    && let Some(api_key) = sampling_api_key
+                let embedded_count = if let Some(params) = embedding_params
+                    && let Some(provider) = params.make_embedding_provider().await
                 {
-                    if let Some(provider) =
-                        crate::session::memory::embedding::ApiEmbeddingProvider::from_session(
-                            &embed_config,
-                            sampling_base_url,
-                            api_key,
-                        )
-                    {
-                        crate::session::memory::embed_missing_chunks(&index, &provider).await
-                    } else {
-                        0
-                    }
+                    crate::session::memory::embed_missing_chunks(&index, &provider).await
                 } else {
                     0
                 };

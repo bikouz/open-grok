@@ -172,6 +172,14 @@ version, endpoint, and Codex account identity; it never shares xAI's
 `models_cache.json`. Authenticated Codex sessions can use the embedded catalog as
 a fallback when the cache or network is unavailable.
 
+Recap and memory work can use independent models from either provider. In
+Settings, choose **Recap model** and **Memory model**, or leave them on
+**Automatic**: Codex chats use GPT-5.6 Terra at medium reasoning while xAI chats
+reuse their active Grok model at low reasoning. Explicit choices can mix
+providers—for example, GPT chat with Grok memory—using each provider's isolated
+credentials and endpoint. Codex reasoning summaries default to detailed when
+the selected model supports them.
+
 ## Codex Code Mode
 
 There are two related behaviors:

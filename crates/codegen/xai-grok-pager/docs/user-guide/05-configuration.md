@@ -33,6 +33,12 @@ auto_update = true                     # check for updates on launch
 [models]
 default = "grok-build"           # model used for new sessions
 web_search = "grok-4.20-multi-agent"   # model used by the web_search tool
+# Optional independent helper models. Leave either unset for Automatic:
+# Codex sessions use gpt-5.6-terra at medium reasoning; xAI sessions keep
+# their active model at low reasoning. An explicit choice may cross providers
+# when that provider is signed in.
+recap = "gpt-5.6-terra"                # /recap and return-from-away recaps
+memory = "grok-4.5"                    # flush, Dream, and memory-note rewrite
 
 # Defaults applied to every model; a per-model [model.<id>] value always wins.
 # See "Custom Models" for the per-model overrides and full details.
@@ -77,6 +83,12 @@ load_envrc = true                      # load .envrc environment variables
 [tools]
 respect_gitignore = false              # default: false; set true to make every tool skip gitignored files
 ```
+
+`recap` and `memory` are also available under `/settings` as **Recap model**
+and **Memory model**. Their **Automatic** choice clears the corresponding TOML
+key. Model selection, endpoint, context window, OAuth/API credentials, and
+reasoning effort are resolved together, so a Grok helper can safely serve a
+Codex chat (or the reverse) without sending a model slug to the wrong API.
 
 #### Input Mode
 

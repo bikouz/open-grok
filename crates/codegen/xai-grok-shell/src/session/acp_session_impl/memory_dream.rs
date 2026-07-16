@@ -318,15 +318,16 @@ impl SessionActor {
         );
     }
 
-    /// Make the dream model call using the session's sampling client.
+    /// Make the dream model call using the configured memory sampling route.
     async fn run_dream_model_call(&self, user_message: &str) -> Result<String, acp::Error> {
-        let sampling_client = self.prepare_chat_completion(false).await?;
-        let model = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
-            .unwrap_or_default();
+        let PreparedAuxiliarySampling {
+            client: sampling_client,
+            model,
+            reasoning_effort,
+            ..
+        } = self
+            .prepare_auxiliary_sampling(AuxiliaryModelPurpose::Memory, None)
+            .await?;
         let session_id = self.session_info.id.to_string();
         let request = ConversationRequest {
             items: vec![
@@ -334,6 +335,7 @@ impl SessionActor {
                 ConversationItem::user(user_message),
             ],
             model: Some(model),
+            reasoning_effort,
             x_grok_conv_id: Some(session_id.clone()),
             x_grok_req_id: Some(format!("xai-dream-{}", uuid::Uuid::new_v4())),
             x_grok_session_id: Some(session_id),
@@ -384,7 +386,19 @@ impl SessionActor {
             .await;
 
         let result = async {
-            let sampling_client = self.prepare_chat_completion(false).await?;
+            let flush_model_override = self.memory.flush_config.flush_model.as_deref();
+            let PreparedAuxiliarySampling {
+                client: sampling_client,
+                model,
+                context_window,
+                reasoning_effort,
+                provider,
+            } = self
+                .prepare_auxiliary_sampling(
+                    AuxiliaryModelPurpose::Memory,
+                    flush_model_override,
+                )
+                .await?;
             let MemoryFlushSnapshot {
                 counts,
                 chat_history,
@@ -408,8 +422,6 @@ impl SessionActor {
                 tool = counts.tool_result,
                 total = counts.total,
             );
-            let recent = super::helpers::memory_flush::select_flush_window(chat_history, 20);
-
             let flush_count = self.memory.flush_count.load(std::sync::atomic::Ordering::Relaxed);
             let system_prompt = if flush_count > 0 {
                 if let Some(prev) = self.memory.last_flush_content.borrow().as_deref() {
@@ -420,31 +432,51 @@ impl SessionActor {
             } else {
                 FLUSH_SYSTEM_PROMPT.to_owned()
             };
-            let mut items: Vec<ConversationItem> = vec![ConversationItem::system(system_prompt)];
-            tracing::info!(
-                target: xai_grok_telemetry::memory_log::TARGET,
-                "MEMORY_FLUSH: sending {n} recent messages to model (+ system prompt + user closer)",
-                n = recent.len(),
-            );
-            items.extend(recent.into_iter().map(ConversationItem::from));
-            items.push(ConversationItem::user(
+            let system_item = ConversationItem::system(system_prompt);
+            let closer = ConversationItem::user(
                 "Now write the memory summary as described in the system prompt.",
-            ));
-
-            let model = match self.memory.flush_config.flush_model.clone() {
-                Some(m) => m,
-                None => self.chat_state_handle.get_sampling_config().await
-                    .map(|c| c.model)
-                    .unwrap_or_default(),
-            };
+            );
+            let recent = super::helpers::memory_flush::select_flush_window(chat_history, 20);
+            let recent_count = recent.len();
+            let recent_items = recent
+                .into_iter()
+                .map(ConversationItem::from)
+                .collect::<Vec<_>>();
+            // Keep the complete helper request below 80% of that helper's own
+            // context window. `fit_conversation_to_budget` preserves the most
+            // recent turn and truncates an individually oversized item.
+            let prompt_budget = context_window.saturating_mul(80) / 100;
+            let reserved_tokens = xai_chat_state::estimate_item_tokens(&system_item)
+                .saturating_add(xai_chat_state::estimate_item_tokens(&closer));
+            let transcript_budget = prompt_budget.saturating_sub(reserved_tokens);
+            let recent_items = xai_chat_state::compaction_utils::fit_conversation_to_budget(
+                recent_items,
+                transcript_budget,
+            );
+            let mut items: Vec<ConversationItem> = vec![system_item];
             tracing::info!(
                 target: xai_grok_telemetry::memory_log::TARGET,
-                "MEMORY_FLUSH: using model={model}"
+                selected = recent_count,
+                sent = recent_items.len(),
+                context_window,
+                transcript_budget,
+                "MEMORY_FLUSH: prepared context-budgeted transcript"
+            );
+            items.extend(recent_items);
+            items.push(closer);
+
+            tracing::info!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                model = %model,
+                provider = ?provider,
+                reasoning_effort = ?reasoning_effort,
+                "MEMORY_FLUSH: using auxiliary model"
             );
             let session_id = self.session_info.id.to_string();
             let request = ConversationRequest {
                 items,
                 model: Some(model),
+                reasoning_effort,
                 x_grok_conv_id: Some(session_id.clone()),
                 x_grok_req_id: Some(format!("xai-flush-{}", uuid::Uuid::new_v4())),
                 x_grok_session_id: Some(session_id.clone()),
@@ -663,8 +695,8 @@ impl SessionActor {
         }
     }
 
-    /// Rewrite a raw memory note into well-structured markdown via a one-shot
-    /// LLM call using the `grok-build` model.
+    /// Rewrite a raw memory note into well-structured markdown via the
+    /// independently configured memory model.
     ///
     /// Follows the same streaming pattern as [`handle_ai_suggest`]: prepares
     /// a sampling client, builds a system+user prompt, streams the response,
@@ -676,6 +708,9 @@ impl SessionActor {
     ) -> Result<String, String> {
         // Upper-bound check to prevent unbounded LLM input.
         const MAX_INPUT_BYTES: usize = 32 * 1024; // 32 KB
+        const MAX_OUTPUT_BYTES: usize = 32 * 1024;
+        const OUTPUT_TRUNCATION_NOTICE: &str =
+            "\n\n<!-- Open Grok truncated an oversized memory rewrite. -->";
         let combined_len = raw_text.len() + context_summary.len();
         if combined_len > MAX_INPUT_BYTES {
             return Err(format!(
@@ -683,8 +718,13 @@ impl SessionActor {
             ));
         }
 
-        let sampling_client = self
-            .prepare_chat_completion(false)
+        let PreparedAuxiliarySampling {
+            client: sampling_client,
+            model,
+            reasoning_effort,
+            ..
+        } = self
+            .prepare_auxiliary_sampling(AuxiliaryModelPurpose::Memory, None)
             .await
             .map_err(|e| format!("failed to prepare client: {e}"))?;
 
@@ -711,9 +751,13 @@ impl SessionActor {
         let request = ConversationRequest {
             items,
             tools: vec![],
-            model: Some("grok-build".to_owned()),
-            temperature: Some(0.3),
-            max_output_tokens: Some(1024),
+            model: Some(model),
+            // Reasoning backends may reject non-default temperatures.
+            temperature: None,
+            // Leave the cap unset: medium-reasoning Codex helpers need room
+            // for hidden reasoning before emitting the rewritten note.
+            max_output_tokens: None,
+            reasoning_effort,
             ..Default::default()
         };
 
@@ -756,10 +800,25 @@ impl SessionActor {
 
         match result {
             Ok((response, _metrics)) => {
-                let text = response.assistant_text();
+                let mut text = response.assistant_text();
                 if text.is_empty() {
                     Err("LLM returned empty response".to_string())
                 } else {
+                    if text.len() > MAX_OUTPUT_BYTES {
+                        let original_output_bytes = text.len();
+                        let content_budget =
+                            MAX_OUTPUT_BYTES.saturating_sub(OUTPUT_TRUNCATION_NOTICE.len());
+                        text = format!(
+                            "{}{}",
+                            xai_grok_sampling_types::truncate_bytes(&text, content_budget),
+                            OUTPUT_TRUNCATION_NOTICE
+                        );
+                        tracing::warn!(
+                            original_output_bytes,
+                            max_output_bytes = MAX_OUTPUT_BYTES,
+                            "memory note rewrite output was truncated"
+                        );
+                    }
                     Ok(text)
                 }
             }

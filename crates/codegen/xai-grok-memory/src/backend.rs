@@ -439,7 +439,13 @@ impl MemoryBackend for MemoryBackendImpl {
         }
 
         let duration_ms = search_start.elapsed().as_millis() as u64;
-        let search_mode = if vec_available { "hybrid" } else { "fts_only" };
+        // A configured vector index is not enough to call this hybrid: if the
+        // query embedding request failed, scoring actually ran FTS-only.
+        let search_mode = if query_embedding.is_some() {
+            "hybrid"
+        } else {
+            "fts_only"
+        };
         let top_score = results.first().map_or(0.0, |r| r.score);
 
         if results.is_empty() {
@@ -870,7 +876,10 @@ mod factory_tests {
         drop(idx);
 
         let params = MemoryBackendParams {
-            embed_config: Some(MemoryEmbeddingConfig::default()),
+            embed_config: Some(MemoryEmbeddingConfig {
+                model: Some("embed-test".to_owned()),
+                ..Default::default()
+            }),
             embed_base_url: "http://localhost".to_string(),
             embed_api_key: None, // no key → provider cannot be created
             ..make_params_fts_only("test-embed-no-key")

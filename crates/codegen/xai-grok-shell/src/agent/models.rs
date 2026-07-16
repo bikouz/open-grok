@@ -510,6 +510,18 @@ impl ModelsManager {
         self.inner.cfg.read().endpoints.clone()
     }
 
+    /// Explicit recap helper-model override. `None` means apply the
+    /// provider-aware automatic policy at call time.
+    pub fn recap_model(&self) -> Option<String> {
+        self.inner.cfg.read().models.recap.clone()
+    }
+
+    /// Explicit memory helper-model override shared by flush, Dream, and note
+    /// rewriting. `None` means apply the provider-aware automatic policy.
+    pub fn memory_model(&self) -> Option<String> {
+        self.inner.cfg.read().models.memory.clone()
+    }
+
     /// Does the current credential grant access to OAuth-only models?
     fn is_session_auth(&self) -> bool {
         self.inner
@@ -639,6 +651,15 @@ impl ModelsManager {
             .get(model_id)
             .map(|e| e.info().reasoning_efforts.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether a concrete effort is accepted by this model's live catalog
+    /// entry. A non-empty server menu is authoritative; legacy entries fall
+    /// back to the standard reasoning menu.
+    pub fn model_accepts_reasoning_effort(&self, model_id: &str, effort: ReasoningEffort) -> bool {
+        let models = self.inner.models.read();
+        config::find_model_by_id(&models, model_id)
+            .is_some_and(|entry| model_offers_reasoning_effort(&entry.info, effort))
     }
 
     pub fn model_supports_backend_search(&self, model_id: &str) -> bool {

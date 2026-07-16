@@ -2,6 +2,82 @@
 //! facts/gates and retry, sampler config reconstruction, sampling-failure
 //! recovery, and per-response usage recording.
 use super::*;
+
+/// Independent model work that must not inherit the primary chat model's
+/// provider, credentials, or reasoning budget by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AuxiliaryModelPurpose {
+    Recap,
+    Memory,
+}
+
+/// Fully-resolved auxiliary sampling route. Keeping the client and all of the
+/// request metadata together prevents a model slug from being sent through a
+/// different provider's endpoint (the old memory-flush behavior).
+pub(super) struct PreparedAuxiliarySampling {
+    pub client: xai_grok_sampler::SamplingClient,
+    pub model: String,
+    pub context_window: u64,
+    pub reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+    pub provider: xai_grok_sampling_types::ModelProvider,
+}
+
+const AUTOMATIC_CODEX_AUX_MODEL: &str = "gpt-5.6-terra";
+
+fn automatic_auxiliary_model(
+    provider: xai_grok_sampling_types::ModelProvider,
+) -> Option<&'static str> {
+    (provider == xai_grok_sampling_types::ModelProvider::Codex).then_some(AUTOMATIC_CODEX_AUX_MODEL)
+}
+
+fn auxiliary_reasoning_effort(
+    provider: xai_grok_sampling_types::ModelProvider,
+    supported: bool,
+) -> Option<xai_grok_sampling_types::ReasoningEffort> {
+    supported.then_some(match provider {
+        xai_grok_sampling_types::ModelProvider::Codex => {
+            xai_grok_sampling_types::ReasoningEffort::Medium
+        }
+        xai_grok_sampling_types::ModelProvider::Xai => {
+            xai_grok_sampling_types::ReasoningEffort::Low
+        }
+    })
+}
+
+struct AuthManagerBearerResolver(std::sync::Arc<crate::auth::AuthManager>);
+
+impl std::fmt::Debug for AuthManagerBearerResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthManagerBearerResolver").finish()
+    }
+}
+
+impl xai_grok_sampler::BearerResolver for AuthManagerBearerResolver {
+    fn current_bearer(&self) -> Option<String> {
+        self.0.current_or_expired().map(|auth| auth.key)
+    }
+}
+
+/// Provider-owned resolver for an xAI auxiliary route selected from a Codex
+/// chat. Unlike the active-session resolver above, this one must fail closed
+/// rather than fall back to the static credential captured at construction.
+struct XaiAuxAuthManagerBearerResolver(std::sync::Arc<crate::auth::AuthManager>);
+
+impl std::fmt::Debug for XaiAuxAuthManagerBearerResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XaiAuxAuthManagerBearerResolver").finish()
+    }
+}
+
+impl xai_grok_sampler::BearerResolver for XaiAuxAuthManagerBearerResolver {
+    fn current_bearer(&self) -> Option<String> {
+        self.0.current_or_expired().map(|auth| auth.key)
+    }
+
+    fn fail_closed_on_missing(&self) -> bool {
+        true
+    }
+}
 /// Auth-failure detector for tool errors. Matches strictly on HTTP 401
 /// when the error carries a structured status code, mirroring
 /// `SamplingError::is_auth_error` in xai-grok-sampling-types: 403 is
@@ -189,7 +265,10 @@ impl SessionActor {
         match tool_name {
             "web_search" => !self.rebuild_spec.implicit_local_web_search,
             "image_gen" | "image_edit" | "image_to_video" | "reference_to_video" => false,
-            "memory_search" | "memory_get" => self.memory.provider_access_enabled(),
+            // Memory storage and FTS are local/provider-neutral. Semantic
+            // search may independently use the user's connected xAI embedding
+            // route while chat runs through Codex.
+            "memory_search" | "memory_get" => self.memory.is_enabled(),
             _ => true,
         }
     }
@@ -288,18 +367,6 @@ impl SessionActor {
                 {
                     headers.insert("traceparent", v);
                 }
-            }
-        }
-        #[allow(clippy::items_after_statements)]
-        struct AuthManagerBearerResolver(std::sync::Arc<crate::auth::AuthManager>);
-        impl std::fmt::Debug for AuthManagerBearerResolver {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_struct("AuthManagerBearerResolver").finish()
-            }
-        }
-        impl xai_grok_sampler::BearerResolver for AuthManagerBearerResolver {
-            fn current_bearer(&self) -> Option<String> {
-                self.0.current_or_expired().map(|a| a.key)
             }
         }
         let cfg = self
@@ -559,18 +626,29 @@ impl SessionActor {
         slug: &str,
     ) -> Option<xai_grok_sampler::SamplerConfig> {
         let creds = self.chat_state_handle.get_credentials().await;
-        let session_key = self
-            .auth_manager
-            .as_ref()
-            .and_then(|am| am.current_or_expired().map(|a| a.key.clone()));
         let models = self.models_manager.models();
+        let target_provider = crate::agent::config::find_model_by_id(&models, slug)
+            .map(|entry| entry.info().provider);
+        // Resolve and refresh xAI auth independently of the active chat
+        // provider. This keeps a long-lived Codex session's explicit xAI
+        // recap/memory helper alive without ever borrowing the Codex bearer.
+        // A known Codex helper skips xAI refresh entirely.
+        let xai_auth = (target_provider != Some(xai_grok_sampling_types::ModelProvider::Codex))
+            .then(|| self.auth_manager.as_ref())
+            .flatten()
+            .and_then(|manager| manager.current_or_expired().map(|auth| (manager, auth.key)));
+        let session_key = if let Some((manager, fallback)) = xai_auth {
+            manager.get_valid_token().await.ok().or(Some(fallback))
+        } else {
+            None
+        };
         let endpoints = self.models_manager.endpoints();
         let disable_api_key_auth = self
             .auth_manager
             .as_ref()
             .map(|am| am.grok_com_config().api_key_auth_disabled())
             .unwrap_or(false);
-        crate::agent::config::resolve_aux_model_sampling_config(
+        let mut resolved = crate::agent::config::resolve_aux_model_sampling_config(
             slug,
             &models,
             &endpoints,
@@ -578,7 +656,124 @@ impl SessionActor {
             disable_api_key_auth,
             creds.alpha_test_key.clone(),
             creds.client_version.clone(),
-        )
+        )?;
+        let uses_live_xai_credential = resolved.provider
+            == xai_grok_sampling_types::ModelProvider::Xai
+            && crate::util::is_first_party_xai_url(&resolved.base_url)
+            && session_key
+                .as_ref()
+                .zip(resolved.api_key.as_ref())
+                .is_some_and(|(live, resolved)| live == resolved);
+        if uses_live_xai_credential && let Some(manager) = self.auth_manager.as_ref() {
+            resolved.bearer_resolver = Some(std::sync::Arc::new(XaiAuxAuthManagerBearerResolver(
+                manager.clone(),
+            )));
+        }
+        Some(resolved)
+    }
+
+    /// Resolve a recap or memory model as an independent, provider-correct
+    /// sampling route.
+    ///
+    /// Automatic selection never crosses providers: Codex sessions prefer
+    /// `gpt-5.6-terra`, while xAI/BYOK sessions keep their active model. An
+    /// explicit Settings/config choice may cross providers, but only when the
+    /// selected catalog entry has credentials for its own provider.
+    pub(super) async fn prepare_auxiliary_sampling(
+        &self,
+        purpose: AuxiliaryModelPurpose,
+        call_override: Option<&str>,
+    ) -> Result<PreparedAuxiliarySampling, acp::Error> {
+        let active = self.reconstruct_full_config().await;
+        let configured = call_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| match purpose {
+                AuxiliaryModelPurpose::Recap => self.models_manager.recap_model(),
+                AuxiliaryModelPurpose::Memory => self.models_manager.memory_model(),
+            });
+        let models = self.models_manager.models();
+
+        let desired = configured
+            .clone()
+            .or_else(|| automatic_auxiliary_model(active.provider).map(str::to_owned));
+
+        let mut selected = None;
+        if let Some(slug) = desired.as_deref() {
+            let intended_provider = crate::agent::config::find_model_by_id(&models, slug)
+                .map(|entry| entry.info().provider);
+            if let Some(intended_provider) = intended_provider {
+                match self.resolve_aux_sampler_config(slug).await {
+                    Some(mut cfg) if cfg.provider == intended_provider => {
+                        crate::agent::config::stamp_session_local_sampler_fields(
+                            &mut cfg,
+                            &active,
+                            self.client_identifier.clone(),
+                            Some(self.max_retries),
+                        );
+                        // An automatic helper choice is provider-local by
+                        // contract. Explicit choices are the only opt-in to
+                        // sending recap/memory content to another provider.
+                        if configured.is_some() || cfg.provider == active.provider {
+                            selected = Some(cfg);
+                        }
+                    }
+                    Some(cfg) => tracing::warn!(
+                        auxiliary_purpose = ?purpose,
+                        auxiliary_model = %slug,
+                        intended_provider = ?intended_provider,
+                        resolved_provider = ?cfg.provider,
+                        "auxiliary model resolved through the wrong provider; using active model"
+                    ),
+                    None => tracing::warn!(
+                        auxiliary_purpose = ?purpose,
+                        auxiliary_model = %slug,
+                        "auxiliary model has no usable provider credentials; using active model"
+                    ),
+                }
+            } else {
+                tracing::warn!(
+                    auxiliary_purpose = ?purpose,
+                    auxiliary_model = %slug,
+                    "auxiliary model is not in the authenticated catalog; using active model"
+                );
+            }
+        }
+
+        let mut config = selected.unwrap_or(active);
+        let supports_reasoning_effort =
+            crate::agent::config::find_model_by_id(&models, &config.model)
+                .is_some_and(|entry| entry.info().supports_reasoning_effort);
+        let reasoning_effort =
+            auxiliary_reasoning_effort(config.provider, supports_reasoning_effort).filter(
+                |effort| {
+                    self.models_manager
+                        .model_accepts_reasoning_effort(&config.model, *effort)
+                },
+            );
+        config.reasoning_effort = reasoning_effort;
+
+        let model = config.model.clone();
+        let context_window = config.context_window;
+        let provider = config.provider;
+        let client = xai_grok_sampler::SamplingClient::new(config)
+            .map_err(|error| self.to_acp_error(error))?;
+        tracing::info!(
+            auxiliary_purpose = ?purpose,
+            auxiliary_model = %model,
+            auxiliary_provider = ?provider,
+            auxiliary_reasoning_effort = ?reasoning_effort,
+            explicit = configured.is_some(),
+            "prepared auxiliary sampling route"
+        );
+        Ok(PreparedAuxiliarySampling {
+            client,
+            model,
+            context_window,
+            reasoning_effort,
+            provider,
+        })
     }
     /// Resolve a dedicated sampler for the Auto-mode classifier model `slug`,
     /// stamping session-local auth/attribution like image-describe (which relies
@@ -1362,5 +1557,37 @@ impl SessionActor {
         }
         self.chat_state_handle
             .push_assistant_response(assistant_item);
+    }
+}
+
+#[cfg(test)]
+mod auxiliary_model_policy_tests {
+    use super::*;
+    use xai_grok_sampling_types::{ModelProvider, ReasoningEffort};
+
+    #[test]
+    fn automatic_helpers_stay_provider_local() {
+        assert_eq!(
+            automatic_auxiliary_model(ModelProvider::Codex),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(automatic_auxiliary_model(ModelProvider::Xai), None);
+    }
+
+    #[test]
+    fn auxiliary_reasoning_is_cheap_and_capability_gated() {
+        assert_eq!(
+            auxiliary_reasoning_effort(ModelProvider::Codex, true),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            auxiliary_reasoning_effort(ModelProvider::Xai, true),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            auxiliary_reasoning_effort(ModelProvider::Codex, false),
+            None
+        );
+        assert_eq!(auxiliary_reasoning_effort(ModelProvider::Xai, false), None);
     }
 }
