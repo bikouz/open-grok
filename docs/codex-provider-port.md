@@ -1,6 +1,6 @@
 # Codex provider integration
 
-This document records Grok Build's OpenAI Codex provider compatibility target.
+This document records Open Grok's OpenAI Codex provider compatibility target.
 The implementation is based on the Codex Rust workspace at the same pinned
 revision as the Code Mode port:
 
@@ -25,6 +25,10 @@ credentials available, the shell follows codex-rs' live catalog contract:
 - Use a nonempty list-visible ChatGPT response as authoritative for the Codex
   provider partition. Empty or hidden-only responses merge with the embedded
   fallback, matching codex-rs behavior.
+- Project each model's live context window, reasoning menu, hosted-search flag,
+  tool mode, and `multi_agent_version` into the TUI/session catalog. The version
+  field, independently from the effort menu, gates codex-rs's v2 proactive
+  multi-agent request policy.
 - Apply user `[model.*]` entries last, so explicit operator configuration remains
   the highest-priority layer.
 
@@ -71,8 +75,11 @@ ChatGPT OAuth requests use the Codex Responses endpoint, live bearer refresh,
 account and FedRAMP headers when present, and the Codex originator header. An
 explicit model API key remains authoritative and is never replaced by OAuth.
 
-GPT-5.6 Sol's compatibility entry uses the Responses API, a 353,000-token
-context window, `code_mode_only`, and backend-hosted search.
+GPT-5.6 Sol's fallback entry uses the Responses API, a 353,000-token effective
+context window, `code_mode_only`, and backend-hosted search. Max and Ultra stay
+distinct in local session state while both encode as Codex `max`; Ultra adds the
+same request-local proactive delegation policy used by codex-rs. Live catalog
+metadata replaces these fallback capabilities when OpenAI changes them.
 
 Implicit auxiliary requests stay on the active Codex provider. In particular,
 the compiled xAI defaults for session titles and image descriptions fall back

@@ -1,4 +1,35 @@
 use super::*;
+
+#[test]
+fn codex_refresh_failure_payload_keeps_auth_visible_fallback_models() {
+    let model_id = acp::ModelId::new("gpt-5.6-sol");
+    let models = acp::SessionModelState::new(
+        model_id.clone(),
+        vec![acp::ModelInfo::new(
+            model_id.clone(),
+            "GPT-5.6 Sol".to_string(),
+        )],
+    );
+
+    let payload = acp_agent::codex_models_refresh_payload(
+        Err("live catalog unavailable".to_string()),
+        models,
+    );
+    assert_eq!(
+        payload.get("warning").and_then(serde_json::Value::as_str),
+        Some("live catalog unavailable")
+    );
+    let returned: acp::SessionModelState =
+        serde_json::from_value(payload.get("models").cloned().unwrap()).unwrap();
+    assert!(
+        returned
+            .available_models
+            .iter()
+            .any(|model| model.model_id == model_id),
+        "OAuth success must retain the embedded Codex fallback when live refresh fails"
+    );
+}
+
 /// Build an unsigned JWT with a `tier` claim (header.payload.sig base64url).
 fn jwt_with_tier(tier: u64) -> String {
     use base64::Engine;
@@ -2095,6 +2126,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             api_backend: crate::sampling::ApiBackend::default(),
             provider: Default::default(),
             tool_mode: None,
+            codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             context_window: std::num::NonZeroU64::new(200_000).unwrap(),

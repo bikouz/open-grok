@@ -24,9 +24,9 @@ use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
-    ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
-    rs,
+    ModelProvider, NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
+    ReasoningEffort, ResponseModelMetadata, Result, SamplingError, build_messages_request,
+    is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
@@ -40,6 +40,10 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
+const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
+const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
+const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
+const PROACTIVE_MULTI_AGENT_MODE_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
 struct GrokRequestHeaders<'a> {
@@ -151,6 +155,8 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
 /// optional `status` and provider extension fields remain on the raw object for
 /// deserialization by newer dependency versions.
 fn normalize_response_event_compat(value: &mut serde_json::Value) {
+    normalize_response_reasoning_effort(value);
+
     let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
         return;
     };
@@ -185,6 +191,98 @@ fn normalize_response_event_compat(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// async-openai 0.33.1 stops at `xhigh`, while Codex may echo the accepted
+/// wire value `max`. Normalize only at the typed dependency boundary so the
+/// local Max/Ultra selection remains intact in session and picker state.
+fn normalize_response_reasoning_effort(value: &mut serde_json::Value) {
+    let path = if value.get("response").is_some() {
+        "/response/reasoning/effort"
+    } else {
+        "/reasoning/effort"
+    };
+    let Some(effort) = value.pointer_mut(path) else {
+        return;
+    };
+    if effort.as_str() == Some("max") {
+        *effort = serde_json::Value::String("xhigh".to_owned());
+    }
+}
+
+/// Apply Codex-only fields that async-openai 0.33.1 cannot represent.
+///
+/// Max and Ultra are distinct local choices, but Codex accepts `max` for both.
+/// On live Codex v2 models, Ultra opts into proactive multi-agent delegation.
+/// The policy item exists only in this request body and is never persisted to chat.
+fn patch_codex_request_compat(
+    request_body: &mut serde_json::Value,
+    provider: ModelProvider,
+    multi_agent_v2: bool,
+    local_effort: Option<ReasoningEffort>,
+) {
+    if provider != ModelProvider::Codex {
+        return;
+    }
+
+    if matches!(
+        local_effort,
+        Some(ReasoningEffort::Max | ReasoningEffort::Ultra)
+    ) {
+        if !request_body
+            .get("reasoning")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            request_body["reasoning"] = serde_json::json!({});
+        }
+        request_body["reasoning"]["effort"] = serde_json::Value::String("max".to_owned());
+    }
+
+    if !multi_agent_v2 {
+        return;
+    }
+
+    let mode_text = if local_effort == Some(ReasoningEffort::Ultra) {
+        PROACTIVE_MULTI_AGENT_MODE_TEXT
+    } else {
+        EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT
+    };
+    let rendered = format!("{MULTI_AGENT_MODE_OPEN_TAG}{mode_text}{MULTI_AGENT_MODE_CLOSE_TAG}");
+    let Some(input) = request_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    // Be idempotent if a future session layer starts supplying this same
+    // contextual item. Removal is request-local and does not mutate history.
+    input.retain(|item| !is_multi_agent_mode_item(item));
+    let mode_item = serde_json::json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{ "type": "input_text", "text": rendered }],
+    });
+    let insert_at = input
+        .last()
+        .filter(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .map_or(input.len(), |_| input.len() - 1);
+    input.insert(insert_at, mode_item);
+}
+
+fn is_multi_agent_mode_item(item: &serde_json::Value) -> bool {
+    if item.get("role").and_then(serde_json::Value::as_str) != Some("developer") {
+        return false;
+    }
+    match item.get("content") {
+        Some(serde_json::Value::String(text)) => text.contains(MULTI_AGENT_MODE_OPEN_TAG),
+        Some(serde_json::Value::Array(content)) => content.iter().any(|part| {
+            part.get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(MULTI_AGENT_MODE_OPEN_TAG))
+        }),
+        _ => false,
     }
 }
 
@@ -452,6 +550,7 @@ struct ClientDefaults {
     provider: xai_grok_sampling_types::ModelProvider,
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
+    codex_multi_agent_v2: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
 
@@ -673,6 +772,7 @@ impl SamplingClient {
             provider: config.provider,
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
+            codex_multi_agent_v2: config.codex_multi_agent_v2,
             doom_loop_recovery: config.doom_loop_recovery,
         };
 
@@ -1351,6 +1451,12 @@ impl SamplingClient {
             &request.named_custom_tool_outputs,
             &request.original_detail_custom_output_images,
         );
+        patch_codex_request_compat(
+            &mut request_body,
+            self.defaults.provider,
+            self.defaults.codex_multi_agent_v2,
+            request.local_reasoning_effort,
+        );
         let http_request = grok_headers
             .apply_for_provider(
                 self.post(self.endpoint("responses")),
@@ -1405,7 +1511,12 @@ impl SamplingClient {
             });
         }
 
-        let response_obj = serde_json::from_slice::<rs::Response>(&bytes).map_err(|e| {
+        let response_obj = (|| {
+            let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+            normalize_response_reasoning_effort(&mut value);
+            serde_json::from_value::<rs::Response>(value)
+        })()
+        .map_err(|e| {
             let raw_body = String::from_utf8_lossy(&bytes);
             tracing::error!(
                 error = %e,
@@ -1503,6 +1614,12 @@ impl SamplingClient {
             &mut request_body,
             &request.named_custom_tool_outputs,
             &request.original_detail_custom_output_images,
+        );
+        patch_codex_request_compat(
+            &mut request_body,
+            self.defaults.provider,
+            self.defaults.codex_multi_agent_v2,
+            request.local_reasoning_effort,
         );
         // Fresh per attempt so signals never leak across retries; `None`
         // disables collection. The opt-in wire header is xAI-only below.
@@ -2066,6 +2183,7 @@ impl SamplingClient {
         );
 
         let trace = request.trace.take();
+        let local_reasoning_effort = request.reasoning_effort;
         let x_grok_conv_id = request.x_grok_conv_id.clone();
         let x_grok_req_id = request.x_grok_req_id.clone();
         let x_grok_session_id = request.x_grok_session_id.clone();
@@ -2084,6 +2202,7 @@ impl SamplingClient {
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.local_reasoning_effort = local_reasoning_effort;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
@@ -2114,6 +2233,7 @@ impl SamplingClient {
         );
 
         let trace = request.trace.take();
+        let local_reasoning_effort = request.reasoning_effort;
         let x_grok_conv_id = request.x_grok_conv_id.clone();
         let x_grok_req_id = request.x_grok_req_id.clone();
         let x_grok_session_id = request.x_grok_session_id.clone();
@@ -2129,6 +2249,7 @@ impl SamplingClient {
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.local_reasoning_effort = local_reasoning_effort;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
@@ -2293,6 +2414,7 @@ mod tests {
             attribution_callback: None,
             bearer_resolver: None,
             supports_backend_search: false,
+            codex_multi_agent_v2: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,
@@ -3098,6 +3220,199 @@ mod tests {
         let client = SamplingClient::new(cfg).expect("client should build");
         // Must not panic.
         client.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletions);
+    }
+
+    #[test]
+    fn codex_max_and_ultra_both_use_max_wire_effort() {
+        for effort in [ReasoningEffort::Max, ReasoningEffort::Ultra] {
+            let mut body = serde_json::json!({
+                "input": [{ "type": "message", "role": "user", "content": "hello" }],
+                "reasoning": { "effort": "xhigh" },
+            });
+            patch_codex_request_compat(
+                &mut body,
+                ModelProvider::Codex,
+                false,
+                Some(effort),
+            );
+            assert_eq!(
+                body.pointer("/reasoning/effort")
+                    .and_then(serde_json::Value::as_str),
+                Some("max"),
+            );
+            assert_ne!(
+                body.pointer("/reasoning/effort")
+                    .and_then(serde_json::Value::as_str),
+                Some("ultra"),
+            );
+        }
+    }
+
+    #[test]
+    fn sol_ultra_injects_one_proactive_developer_policy() {
+        let mut body = serde_json::json!({
+            "input": [{ "type": "message", "role": "user", "content": "hello" }],
+            "reasoning": { "effort": "xhigh" },
+        });
+        patch_codex_request_compat(
+            &mut body,
+            ModelProvider::Codex,
+            true,
+            Some(ReasoningEffort::Ultra),
+        );
+        patch_codex_request_compat(
+            &mut body,
+            ModelProvider::Codex,
+            true,
+            Some(ReasoningEffort::Ultra),
+        );
+
+        let input = body["input"].as_array().unwrap();
+        let policies = input
+            .iter()
+            .filter(|item| is_multi_agent_mode_item(item))
+            .collect::<Vec<_>>();
+        assert_eq!(policies.len(), 1, "request patch must be idempotent");
+        assert_eq!(policies[0]["role"], "developer");
+        let text = policies[0]
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(text.starts_with(MULTI_AGENT_MODE_OPEN_TAG));
+        assert!(text.contains(PROACTIVE_MULTI_AGENT_MODE_TEXT));
+        assert!(text.ends_with(MULTI_AGENT_MODE_CLOSE_TAG));
+        assert_eq!(input.last().unwrap()["role"], "user");
+    }
+
+    #[test]
+    fn non_ultra_sol_effort_keeps_delegation_explicit_request_only() {
+        let mut body = serde_json::json!({
+            "input": [{ "type": "message", "role": "user", "content": "hello" }],
+            "reasoning": { "effort": "xhigh" },
+        });
+        patch_codex_request_compat(
+            &mut body,
+            ModelProvider::Codex,
+            true,
+            Some(ReasoningEffort::Max),
+        );
+        let policy = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| is_multi_agent_mode_item(item))
+            .unwrap();
+        let text = policy
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(text.contains(EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT));
+        assert!(!text.contains(PROACTIVE_MULTI_AGENT_MODE_TEXT));
+    }
+
+    #[test]
+    fn multi_agent_policy_is_gated_to_codex_v2_models() {
+        for (provider, multi_agent_v2) in [
+            (ModelProvider::Xai, true),
+            (ModelProvider::Codex, false),
+        ] {
+            let mut body = serde_json::json!({
+                "input": [{ "type": "message", "role": "user", "content": "hello" }],
+                "reasoning": { "effort": "xhigh" },
+            });
+            patch_codex_request_compat(
+                &mut body,
+                provider,
+                multi_agent_v2,
+                Some(ReasoningEffort::Ultra),
+            );
+            assert!(
+                body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| !is_multi_agent_mode_item(item)),
+            );
+        }
+    }
+
+    #[test]
+    fn live_catalog_v2_capability_enables_proactive_policy() {
+        let mut body = serde_json::json!({
+            "input": [{ "type": "message", "role": "user", "content": "hello" }],
+            "reasoning": { "effort": "xhigh" },
+        });
+        patch_codex_request_compat(
+            &mut body,
+            ModelProvider::Codex,
+            true,
+            Some(ReasoningEffort::Ultra),
+        );
+        let policy = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| is_multi_agent_mode_item(item))
+            .unwrap();
+        assert!(
+            policy
+                .pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .contains(PROACTIVE_MULTI_AGENT_MODE_TEXT),
+        );
+    }
+
+    #[test]
+    fn max_response_effort_normalizes_at_typed_boundary() {
+        let mut response = serde_json::json!({
+            "background": false,
+            "created_at": 0,
+            "id": "resp_max",
+            "model": "gpt-5.6-sol",
+            "object": "response",
+            "output": [],
+            "reasoning": { "effort": "max" },
+            "status": "completed"
+        });
+        assert!(serde_json::from_value::<rs::Response>(response.clone()).is_err());
+        normalize_response_reasoning_effort(&mut response);
+        let typed = serde_json::from_value::<rs::Response>(response).unwrap();
+        assert_eq!(
+            typed.reasoning.and_then(|reasoning| reasoning.effort),
+            Some(rs::ReasoningEffort::Xhigh),
+        );
+    }
+
+    #[test]
+    fn streamed_max_response_effort_normalizes_before_event_parse() {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "background": false,
+                "created_at": 0,
+                "id": "resp_max_stream",
+                "model": "gpt-5.6-sol",
+                "object": "response",
+                "output": [],
+                "reasoning": { "effort": "max" },
+                "status": "completed"
+            }
+        })
+        .to_string();
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
+        let typed = deserialize_response_event(&event).unwrap();
+        let rs::ResponseStreamEvent::ResponseCompleted(completed) = typed else {
+            panic!("expected response.completed");
+        };
+        assert_eq!(
+            completed
+                .response
+                .reasoning
+                .and_then(|reasoning| reasoning.effort),
+            Some(rs::ReasoningEffort::Xhigh),
+        );
     }
 
     #[test]

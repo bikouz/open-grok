@@ -13,6 +13,8 @@ fn model_with_support(id: &str, supports: bool) -> (acp::ModelId, acp::ModelInfo
             "reasoningEfforts": [
                 { "id": "deep", "value": "xhigh", "label": "Deep" },
                 { "id": "high", "value": "high", "label": "High" },
+                { "id": "max", "value": "max", "label": "Max" },
+                { "id": "ultra", "value": "ultra", "label": "Ultra" },
             ],
         }))
     } else {
@@ -110,7 +112,7 @@ fn effort_only_errors_on_unknown_token() {
             switch: None,
             effort_error: Some(EffortTokenError::UnknownToken {
                 token: "bogus".into(),
-                offered: vec!["deep".into(), "high".into()],
+                offered: vec!["deep".into(), "high".into(), "max".into(), "ultra".into()],
             }),
         }
     );
@@ -159,7 +161,7 @@ fn stashed_model_keeps_model_when_token_unresolvable() {
             switch: Some((current, None)),
             effort_error: Some(EffortTokenError::UnknownToken {
                 token: "bogus".into(),
-                offered: vec!["deep".into(), "high".into()],
+                offered: vec!["deep".into(), "high".into(), "max".into(), "ultra".into()],
             }),
         }
     );
@@ -183,19 +185,21 @@ fn stashed_model_keeps_model_when_unsupported() {
 }
 
 #[test]
-fn effort_only_accepts_max_as_xhigh() {
+fn effort_only_keeps_max_and_ultra_distinct() {
     let models = models_with_current(true);
-    let out = take_deferred_model_switch(None, &models, Some("max"));
-    assert_eq!(
-        out,
-        DeferredSwitchOutcome {
-            switch: Some((
-                models.current.clone().unwrap(),
-                Some(ReasoningEffort::Xhigh)
-            )),
-            effort_error: None,
-        }
-    );
+    for (token, effort) in [
+        ("max", ReasoningEffort::Max),
+        ("ultra", ReasoningEffort::Ultra),
+    ] {
+        let out = take_deferred_model_switch(None, &models, Some(token));
+        assert_eq!(
+            out,
+            DeferredSwitchOutcome {
+                switch: Some((models.current.clone().unwrap(), Some(effort))),
+                effort_error: None,
+            }
+        );
+    }
 }
 
 #[test]

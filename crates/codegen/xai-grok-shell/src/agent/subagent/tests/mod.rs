@@ -3097,6 +3097,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             api_backend: Default::default(),
             provider: Default::default(),
             tool_mode: None,
+            codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(256_000).unwrap(),

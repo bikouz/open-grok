@@ -469,14 +469,19 @@ mod tests {
             "reasoningEfforts": [
                 { "id": "balanced", "value": "medium", "label": "Balanced" },
                 { "id": "deep", "value": "xhigh", "label": "Deep", "description": "Max" },
+                { "value": "max", "label": "Max" },
+                { "value": "ultra", "label": "Ultra", "description": "Automatic delegation" },
             ],
         })));
         let opts = state.reasoning_effort_options();
-        assert_eq!(opts.len(), 2);
+        assert_eq!(opts.len(), 4);
         assert_eq!(opts[0].label, "Balanced");
         assert_eq!(opts[0].value, ReasoningEffort::Medium);
         assert_eq!(opts[1].id, "deep");
         assert_eq!(opts[1].description.as_deref(), Some("Max"));
+        assert_eq!(opts[2].value, ReasoningEffort::Max);
+        assert_eq!(opts[3].value, ReasoningEffort::Ultra);
+        assert_eq!(opts[3].description.as_deref(), Some("Automatic delegation"));
     }
 
     #[test]

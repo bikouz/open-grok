@@ -22,14 +22,17 @@
       "api_backend": "responses",
       "provider": "codex",
       "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
       "agent_type": "codex",
       "supported_in_api": false,
       "supports_backend_search": true,
       "reasoning_efforts": [
-        { "value": "low", "default": true },
-        "medium",
-        "high",
-        "xhigh"
+        { "value": "low", "description": "Fast responses with lighter reasoning", "default": true },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" },
+        { "value": "ultra", "description": "Maximum reasoning with automatic task delegation" }
       ]
     },
     {
@@ -40,14 +43,17 @@
       "api_backend": "responses",
       "provider": "codex",
       "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
       "agent_type": "codex",
       "supported_in_api": false,
       "supports_backend_search": true,
       "reasoning_efforts": [
-        "low",
-        { "value": "medium", "default": true },
-        "high",
-        "xhigh"
+        { "value": "low", "description": "Fast responses with lighter reasoning" },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" },
+        { "value": "ultra", "description": "Maximum reasoning with automatic task delegation" }
       ]
     },
     {
@@ -58,14 +64,16 @@
       "api_backend": "responses",
       "provider": "codex",
       "tool_mode": "code_mode_only",
+      "multi_agent_version": "v1",
       "agent_type": "codex",
       "supported_in_api": false,
       "supports_backend_search": true,
       "reasoning_efforts": [
-        "low",
-        { "value": "medium", "default": true },
-        "high",
-        "xhigh"
+        { "value": "low", "description": "Fast responses with lighter reasoning" },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" }
       ]
     }
   ]

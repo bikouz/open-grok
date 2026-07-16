@@ -864,6 +864,7 @@ pub fn parse_remote_model_value(
         api_backend,
         provider,
         tool_mode,
+        codex_multi_agent_v2: false,
         context_window,
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
             .or_else(|| get_u64(obj, "auto_compact_threshold_percent"))

@@ -663,6 +663,15 @@ impl ModelsManager {
             .unwrap_or(false)
     }
 
+    /// Resolve the live Codex v2 multi-agent capability by catalog key or
+    /// routing slug. The menu comes from the authenticated `/models` response,
+    /// with the embedded catalog used only as its offline fallback.
+    pub fn model_supports_codex_multi_agent_v2(&self, model_id: &str) -> bool {
+        let models = self.inner.models.read();
+        config::find_model_by_id(&models, model_id)
+            .is_some_and(|entry| config::supports_codex_multi_agent_v2(entry.info()))
+    }
+
     pub fn model_compactions_remaining(
         &self,
         model_id: &str,
@@ -3671,6 +3680,7 @@ mod tests {
             api_backend: Default::default(),
             provider: Default::default(),
             tool_mode: None,
+            codex_multi_agent_v2: false,
             context_window: std::num::NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
             system_prompt_label: None,

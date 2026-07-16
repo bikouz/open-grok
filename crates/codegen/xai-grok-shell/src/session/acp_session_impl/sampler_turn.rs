@@ -369,6 +369,9 @@ impl SessionActor {
                 &extra_headers,
             )) as xai_grok_sampler::SharedBearerResolver
         });
+        let codex_multi_agent_v2 = self
+            .models_manager
+            .model_supports_codex_multi_agent_v2(&cfg.model);
         SamplingConfig {
             api_key: creds.api_key,
             base_url: cfg.base_url,
@@ -425,6 +428,7 @@ impl SessionActor {
                 None
             },
             supports_backend_search: self.supports_backend_search.get(),
+            codex_multi_agent_v2,
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,

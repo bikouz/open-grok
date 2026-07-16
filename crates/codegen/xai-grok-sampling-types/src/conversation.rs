@@ -6586,6 +6586,8 @@ mod tests {
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
             (crate::ReasoningEffort::Xhigh, "max"),
+            (crate::ReasoningEffort::Max, "max"),
+            (crate::ReasoningEffort::Ultra, "max"),
         ] {
             let req = messages_test_request(Some(variant));
             let msgs = build_messages_request(&req);
@@ -6634,6 +6636,8 @@ mod tests {
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
             (crate::ReasoningEffort::Xhigh, "xhigh"),
+            (crate::ReasoningEffort::Max, "max"),
+            (crate::ReasoningEffort::Ultra, "ultra"),
         ] {
             let req = ConversationRequest::from_items(vec![ConversationItem::user("hi")])
                 .with_model("test");
@@ -6673,6 +6677,11 @@ mod tests {
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
             (crate::ReasoningEffort::Xhigh, "xhigh"),
+            // async-openai 0.33.1 has no Max/Ultra variants. The sampler
+            // retains the local selection on CreateResponseWrapper and
+            // patches Codex request JSON immediately before transport.
+            (crate::ReasoningEffort::Max, "xhigh"),
+            (crate::ReasoningEffort::Ultra, "xhigh"),
         ] {
             let req = ConversationRequest {
                 reasoning_effort: Some(variant),

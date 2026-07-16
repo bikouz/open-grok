@@ -1044,10 +1044,16 @@ mod is_hidden_tests {
         let back: Summary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.reasoning_effort, None);
 
-        s.reasoning_effort = Some(ReasoningEffort::Xhigh);
-        let json = serde_json::to_string(&s).unwrap();
-        let back: Summary = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        for effort in [
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+        ] {
+            s.reasoning_effort = Some(effort);
+            let json = serde_json::to_string(&s).unwrap();
+            let back: Summary = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.reasoning_effort, Some(effort));
+        }
     }
 
     #[test]

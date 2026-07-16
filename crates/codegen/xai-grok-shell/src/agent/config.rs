@@ -3484,6 +3484,8 @@ struct DefaultModelJson {
     provider: ModelProvider,
     /// Model-selected tool presentation. `None` keeps the direct-tool default.
     tool_mode: Option<ToolMode>,
+    /// Codex model-catalog execution contract. Unknown versions stay disabled.
+    multi_agent_version: Option<String>,
     #[serde(default = "default_agent_type")]
     agent_type: String,
     inference_idle_timeout_secs: Option<u64>,
@@ -3554,6 +3556,8 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 api_backend: m.api_backend,
                 provider: m.provider,
                 tool_mode: m.tool_mode,
+                codex_multi_agent_v2: m.provider == ModelProvider::Codex
+                    && m.multi_agent_version.as_deref() == Some("v2"),
                 auth_scheme: None,
                 agent_type: m.agent_type,
                 inference_idle_timeout_secs: m.inference_idle_timeout_secs,
@@ -3620,6 +3624,9 @@ pub struct ModelEntryConfig {
     /// the user Code Mode preference, matching the Codex model catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<ToolMode>,
+    /// Whether this Codex model advertises `multi_agent_version = "v2"`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub codex_multi_agent_v2: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scheme: Option<AuthScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3899,6 +3906,10 @@ pub struct ModelInfo {
     /// decide; `Some` is authoritative for compatibility-sensitive models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<ToolMode>,
+    /// Live Codex multi-agent protocol capability. This is provider metadata,
+    /// independent from which reasoning efforts happen to be advertised.
+    #[serde(default)]
+    pub codex_multi_agent_v2: bool,
     pub auth_scheme: AuthScheme,
     pub extra_headers: IndexMap<String, String>,
     pub context_window: NonZeroU64,
@@ -3966,6 +3977,7 @@ impl ModelInfo {
             api_backend: ApiBackend::default(),
             provider: ModelProvider::default(),
             tool_mode: None,
+            codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -4003,6 +4015,7 @@ impl ModelInfo {
             api_backend: entry.api_backend.clone(),
             provider: entry.provider,
             tool_mode: entry.tool_mode,
+            codex_multi_agent_v2: entry.codex_multi_agent_v2,
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
             context_window: entry.context_window,
@@ -4737,6 +4750,7 @@ pub fn resolve_aux_model_sampling_config(
                 api_backend: ApiBackend::Responses,
                 provider: ModelProvider::Xai,
                 tool_mode: None,
+                codex_multi_agent_v2: false,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(200_000).unwrap(),
@@ -4975,11 +4989,21 @@ pub fn sampling_config_for_model(
             )) as xai_grok_sampler::SharedBearerResolver
         }),
         supports_backend_search: info.supports_backend_search,
+        // Preserve the live Codex `multi_agent_version` contract through the sampler.
+        codex_multi_agent_v2: supports_codex_multi_agent_v2(info),
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,
         header_injector: None,
     }
+}
+
+/// Whether authenticated catalog metadata opts this Codex model into the v2
+/// multi-agent policy contract. The value comes directly from the live
+/// `multi_agent_version` field (or its embedded fallback), independently from
+/// the model's reasoning-effort menu.
+pub fn supports_codex_multi_agent_v2(info: &ModelInfo) -> bool {
+    info.provider == ModelProvider::Codex && info.codex_multi_agent_v2
 }
 /// Fold URL-derived headers into `extra_headers`.
 ///
@@ -5055,6 +5079,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             api_backend: ApiBackend::Responses,
             provider: ModelProvider::Xai,
             tool_mode: None,
+            codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -5860,6 +5885,7 @@ reasoning_effort = "low"
                 api_backend: ApiBackend::default(),
                 provider: ModelProvider::default(),
                 tool_mode: None,
+                codex_multi_agent_v2: false,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(200_000).unwrap(),
@@ -6996,6 +7022,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             provider: ModelProvider::default(),
             tool_mode: None,
+            codex_multi_agent_v2: false,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -7157,6 +7184,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             provider: ModelProvider::default(),
             tool_mode: None,
+            codex_multi_agent_v2: false,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -7610,6 +7638,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             provider: ModelProvider::default(),
             tool_mode: None,
+            codex_multi_agent_v2: false,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -11176,6 +11205,7 @@ default = "grok-4.5"
                 api_backend,
                 provider: ModelProvider::default(),
                 tool_mode: None,
+                codex_multi_agent_v2: false,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(context_window).unwrap(),
@@ -11630,6 +11660,46 @@ default = "grok-4.5"
                 "embedded Codex fallbacks require a Codex OAuth session"
             );
         }
+
+        let efforts = |slug: &str| {
+            defaults[slug]
+                .info
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            efforts("gpt-5.6-sol"),
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max,
+                ReasoningEffort::Ultra,
+            ]
+        );
+        assert_eq!(efforts("gpt-5.6-terra"), efforts("gpt-5.6-sol"));
+        assert!(supports_codex_multi_agent_v2(
+            defaults["gpt-5.6-sol"].info()
+        ));
+        assert!(supports_codex_multi_agent_v2(
+            defaults["gpt-5.6-terra"].info()
+        ));
+        assert_eq!(
+            efforts("gpt-5.6-luna"),
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max,
+            ]
+        );
+        assert!(!supports_codex_multi_agent_v2(
+            defaults["gpt-5.6-luna"].info()
+        ));
     }
     #[test]
     fn authoritative_codex_catalog_replaces_only_codex_partition() {

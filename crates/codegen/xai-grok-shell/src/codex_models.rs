@@ -174,6 +174,8 @@ struct CodexWireModel {
     supports_search_tool: bool,
     #[serde(default)]
     tool_mode: Option<String>,
+    #[serde(default)]
+    multi_agent_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -503,6 +505,7 @@ impl CodexModelsClient {
         info.api_backend = ApiBackend::Responses;
         info.provider = ModelProvider::Codex;
         info.tool_mode = parse_tool_mode(wire.tool_mode.as_deref());
+        info.codex_multi_agent_v2 = wire.multi_agent_version.as_deref() == Some("v2");
         info.agent_type = "codex".to_owned();
         info.hidden = !wire.visibility.is_list_visible();
         // This transport is backed exclusively by ChatGPT OAuth credentials.
@@ -695,9 +698,8 @@ impl CodexModelsRequestError {
 }
 
 fn parse_supported_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
-    // Do not use `ReasoningEffort::from_str` here: it intentionally aliases
-    // server `max` to local `xhigh`, which would duplicate an advertised xhigh
-    // option. Live options are restricted to values the local wire enum owns.
+    // Keep this allowlist explicit so future server values do not silently
+    // become selectable before the local transport knows how to encode them.
     match value {
         "none" => Some(ReasoningEffort::None),
         "minimal" => Some(ReasoningEffort::Minimal),
@@ -705,6 +707,8 @@ fn parse_supported_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
         "medium" => Some(ReasoningEffort::Medium),
         "high" => Some(ReasoningEffort::High),
         "xhigh" => Some(ReasoningEffort::Xhigh),
+        "max" => Some(ReasoningEffort::Max),
+        "ultra" => Some(ReasoningEffort::Ultra),
         _ => None,
     }
 }
@@ -717,6 +721,8 @@ fn effort_label(effort: ReasoningEffort) -> &'static str {
         ReasoningEffort::Medium => "Medium",
         ReasoningEffort::High => "High",
         ReasoningEffort::Xhigh => "Xhigh",
+        ReasoningEffort::Max => "Max",
+        ReasoningEffort::Ultra => "Ultra",
     }
 }
 
@@ -847,8 +853,8 @@ mod tests {
                         {"effort": "low", "description": "Fast"},
                         {"effort": "medium", "description": "Balanced"},
                         {"effort": "xhigh", "description": "Deep"},
-                        {"effort": "max", "description": "Unsupported locally"},
-                        {"effort": "ultra", "description": "Unsupported locally"}
+                        {"effort": "max", "description": "Maximum"},
+                        {"effort": "ultra", "description": "Automatic delegation"}
                     ],
                     "visibility": "list",
                     "supported_in_api": true,
@@ -857,7 +863,8 @@ mod tests {
                     "max_context_window": 400000,
                     "effective_context_window_percent": 95,
                     "supports_search_tool": true,
-                    "tool_mode": "code_mode_only"
+                    "tool_mode": "code_mode_only",
+                    "multi_agent_version": "v2"
                 },
                 {
                     "slug": "hidden-model",
@@ -1045,6 +1052,7 @@ mod tests {
         assert_eq!(live.entry.info.provider, ModelProvider::Codex);
         assert_eq!(live.entry.info.api_backend, ApiBackend::Responses);
         assert_eq!(live.entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
+        assert!(live.entry.info.codex_multi_agent_v2);
         assert!(live.entry.info.supports_backend_search);
         assert_eq!(live.entry.info.agent_type, "codex");
         assert!(
@@ -1061,8 +1069,18 @@ mod tests {
             vec![
                 ReasoningEffort::Low,
                 ReasoningEffort::Medium,
-                ReasoningEffort::Xhigh
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max,
+                ReasoningEffort::Ultra,
             ]
+        );
+        assert_eq!(
+            live.entry.info.reasoning_efforts[3].description.as_deref(),
+            Some("Maximum")
+        );
+        assert_eq!(
+            live.entry.info.reasoning_efforts[4].description.as_deref(),
+            Some("Automatic delegation")
         );
         assert_eq!(
             live.entry.info.reasoning_effort,
@@ -1331,6 +1349,53 @@ mod tests {
         assert!(catalog.list_visible_entries().is_empty());
         assert_eq!(catalog.entries().len(), 1);
         assert!(catalog.entries()["hidden"].info.hidden);
+    }
+
+    #[test]
+    fn multi_agent_version_is_independent_from_ultra_effort() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = test_client(
+            &temp,
+            "https://chatgpt.example/codex".to_owned(),
+            "1.2.3",
+            Duration::from_secs(300),
+            auth_source(credentials("token", "workspace-1", false)),
+        );
+        let convert = |value| {
+            let wire: CodexWireModel = serde_json::from_value(value).unwrap();
+            client.convert_model(wire).unwrap().entry
+        };
+
+        let v2_without_ultra = convert(json!({
+            "slug": "future-v2",
+            "display_name": "Future v2",
+            "visibility": "list",
+            "context_window": 100000,
+            "multi_agent_version": "v2",
+            "supported_reasoning_levels": [{"effort": "high"}]
+        }));
+        assert!(v2_without_ultra.info.codex_multi_agent_v2);
+        assert!(
+            v2_without_ultra
+                .info
+                .reasoning_efforts
+                .iter()
+                .all(|option| option.value != ReasoningEffort::Ultra)
+        );
+
+        let v1_with_ultra = convert(json!({
+            "slug": "future-v1",
+            "display_name": "Future v1",
+            "visibility": "list",
+            "context_window": 100000,
+            "multi_agent_version": "v1",
+            "supported_reasoning_levels": [{"effort": "ultra"}]
+        }));
+        assert!(!v1_with_ultra.info.codex_multi_agent_v2);
+        assert_eq!(
+            v1_with_ultra.info.reasoning_efforts[0].value,
+            ReasoningEffort::Ultra
+        );
     }
 
     #[test]
