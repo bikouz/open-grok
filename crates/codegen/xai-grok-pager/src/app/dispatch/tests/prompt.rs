@@ -226,6 +226,32 @@ fn small_screen_trigger_out_of_band_consumes_without_showing() {
     assert!(!app.agents[&id].ephemeral_tip.is_active());
 }
 
+/// A restored transcript should settle in one stable frame. The ambient
+/// compact-mode hint is consumed rather than briefly inserting/removing a row
+/// while replay and startup progress are still arriving.
+#[test]
+fn small_screen_trigger_is_consumed_during_session_replay() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.last_terminal_size = (100, 24);
+        agent.session.loading_replay = true;
+    }
+
+    app.maybe_trigger_small_screen_tip();
+    assert!(app.small_screen_tip_evaluated);
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+    assert!(app.tip_seen_counts.is_empty(), "no count burned");
+
+    app.agents.get_mut(&id).unwrap().session.loading_replay = false;
+    app.maybe_trigger_small_screen_tip();
+    assert!(
+        !app.agents[&id].ephemeral_tip.is_active(),
+        "the spent resume gate must not flash a tip after load"
+    );
+}
+
 /// The small-screen tip is ambient: submitting the promote prompt right
 /// after it shows must NOT retire it (a real turn takes seconds, so the
 /// submit-clear reduced the tip to a sub-second blink), while the

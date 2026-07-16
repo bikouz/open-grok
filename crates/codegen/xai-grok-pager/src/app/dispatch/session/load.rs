@@ -902,6 +902,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         agent.session.loading_replay = false;
         agent.session.restore_degree = restore_degree;
         agent.session.finish_turn(&mut agent.scrollback);
+        agent.scrollback.clear_finish_flashes();
         agent.mark_turn_finished();
         if let Some(placeholder_id) = agent.loading_placeholder_id.take() {
             agent.scrollback.remove_entry(placeholder_id);

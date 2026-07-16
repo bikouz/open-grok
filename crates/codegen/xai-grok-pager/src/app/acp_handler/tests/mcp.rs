@@ -118,6 +118,31 @@
     }
 
     #[test]
+    fn mcp_progress_updates_quietly_during_session_replay() {
+        let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .session
+            .loading_replay = true;
+
+        let changed = handle_ext_notification(&make_mcp_init_progress_notif(4, 2), &mut app);
+        assert!(
+            !changed,
+            "MCP state must not repaint an incomplete restored transcript"
+        );
+        let progress = app.agents[&AgentId(0)]
+            .mcp_init_progress
+            .as_ref()
+            .expect("progress state still updates");
+        assert_eq!((progress.total, progress.connected), (4, 2));
+
+        let changed = handle_ext_notification(&make_mcp_initialized_notif("sess-1"), &mut app);
+        assert!(!changed, "completion also remains quiet until load settles");
+        assert!(app.agents[&AgentId(0)].mcp_init_progress.is_none());
+    }
+
+    #[test]
     fn mcp_initialized_clears_progress() {
         // x.ai/mcp_initialized must set mcp_init_progress to None.
         let mut app = make_app_with_agent("sess-1");
@@ -724,4 +749,3 @@
             "legacy fallback targets the foregrounded agent"
         );
     }
-

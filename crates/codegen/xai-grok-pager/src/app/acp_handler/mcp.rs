@@ -43,7 +43,7 @@ pub(super) fn handle_mcp_init_progress(notif: &acp::ExtNotification, app: &mut A
             started_at: std::time::Instant::now(),
         });
     }
-    is_active
+    is_active && !agent.session.loading_replay
 }
 
 /// Handle `x.ai/mcp/tools_changed` and `x.ai/mcp_initialized`.
@@ -115,6 +115,10 @@ pub(super) fn handle_mcp_tools_changed(notif: &acp::ExtNotification, app: &mut A
     let Some((is_active, id)) = target else {
         return false;
     };
+    let loading_replay = app
+        .agents
+        .get(&id)
+        .is_some_and(|agent| agent.session.loading_replay);
 
     let mut redraw = false;
 
@@ -146,7 +150,7 @@ pub(super) fn handle_mcp_tools_changed(notif: &acp::ExtNotification, app: &mut A
         });
         redraw |= is_active;
     }
-    redraw
+    redraw && !loading_replay
 }
 
 /// Per-agent coalescing test for [`Effect::FetchMcpsList`].

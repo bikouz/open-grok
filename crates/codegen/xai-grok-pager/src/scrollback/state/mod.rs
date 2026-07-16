@@ -1331,6 +1331,26 @@ impl ScrollbackState {
         self.finish_running_with_time(id, None);
     }
 
+    /// Mark an entry finished without the short live-completion accent flash.
+    ///
+    /// Historical replay and cold-load reconciliation use this path: those
+    /// entries completed before this TUI attached, so presenting them as a new
+    /// success/failure transition is both misleading and visually noisy.
+    pub(crate) fn finish_running_quietly(&mut self, id: EntryId) {
+        self.finish_running_inner(id, None, false);
+    }
+
+    /// Remove completion flashes created while reconstructing a transcript.
+    /// The entries remain fully finalized; only their local, time-based accent
+    /// is cleared before the restored transcript is presented.
+    pub(crate) fn clear_finish_flashes(&mut self) {
+        for id in std::mem::take(&mut self.flashing) {
+            if let Some(entry) = self.entries.get_mut(&id) {
+                entry.finished_at = None;
+            }
+        }
+    }
+
     /// Mark every running entry finished.
     ///
     /// Used when a transcript is restored/merged after a reconnect reload:
@@ -1347,17 +1367,28 @@ impl ScrollbackState {
     ///
     /// For thinking blocks, the thinking_time_ms will be displayed in collapsed mode.
     pub fn finish_running_with_time(&mut self, id: EntryId, thinking_time_ms: Option<i64>) {
+        self.finish_running_inner(id, thinking_time_ms, true);
+    }
+
+    fn finish_running_inner(
+        &mut self,
+        id: EntryId,
+        thinking_time_ms: Option<i64>,
+        flash_completion: bool,
+    ) {
         self.running.remove(&id);
         // Track the finish-flash window so `tick()` checks O(flashing)
         // entries instead of scanning the whole scrollback per tick.
-        if self.entries.contains_key(&id) && !self.flashing.contains(&id) {
+        if flash_completion && self.entries.contains_key(&id) && !self.flashing.contains(&id) {
             self.flashing.push(id);
+        } else if !flash_completion {
+            self.flashing.retain(|candidate| *candidate != id);
         }
         let thinking_mode = self.thinking_display_mode;
         let respect_manual_folds = self.appearance.scrollback.scroll.respect_manual_folds;
         if let Some(entry) = self.get_by_id_mut(id) {
             entry.is_running = false;
-            entry.finished_at = Some(Instant::now());
+            entry.finished_at = flash_completion.then(Instant::now);
             // Finish streaming renderers (final safety re-render)
             match &mut entry.block {
                 RenderBlock::AgentMessage(msg) => msg.finish(),
@@ -2570,6 +2601,20 @@ mod tests {
         assert!(state.flashing.is_empty(), "expired flash is drained");
         assert!(!state.needs_animation(), "nothing left to animate");
         assert!(!state.tick(), "and ticks stop redrawing");
+    }
+
+    #[test]
+    fn quiet_finish_finalizes_without_registering_completion_flash() {
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(stub_block("restored tool"));
+        state.set_last_running(true);
+
+        state.finish_running_quietly(id);
+
+        let entry = state.get_by_id(id).expect("entry remains present");
+        assert!(!entry.is_running);
+        assert!(entry.finished_at.is_none());
+        assert!(state.flashing.is_empty());
     }
 
     /// Rewound/removed entries can't strand ids in the flash list.

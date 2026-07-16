@@ -113,10 +113,12 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     };
     match &session_notif.update {
         XaiSessionUpdate::TaskBackgrounded { .. } => {
-            return handle_task_backgrounded(notif, app);
+            let loading_replay = notification_target_loading(app, &session_notif.session_id);
+            return handle_task_backgrounded(notif, app) && !loading_replay;
         }
         XaiSessionUpdate::TaskCompleted { .. } => {
-            return handle_task_completed(notif, app);
+            let loading_replay = notification_target_loading(app, &session_notif.session_id);
+            return handle_task_completed(notif, app) && !loading_replay;
         }
         XaiSessionUpdate::ScheduledTaskCreated { .. } => {
             return handle_scheduled_task_created(notif, app);
@@ -146,13 +148,18 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         .expect("find_session_match returned an existing AgentId");
     if matches!(matched, SessionMatch::Child(_)) {
         let child_sid: &str = session_notif.session_id.0.as_ref();
+        let loading_replay = agent.session.loading_replay
+            || agent
+                .subagent_views
+                .get(child_sid)
+                .is_some_and(|child| child.session.loading_replay);
         let changed = handle_child_session_notification(
             session_notif.update,
             child_sid,
             agent,
             is_api_key_auth,
         );
-        return changed && is_active;
+        return changed && is_active && !loading_replay;
     }
     let meta = NotificationMeta::from_json(session_notif.meta.as_ref().and_then(|v| v.as_object()));
     if drop_unexpected_replay(
@@ -163,6 +170,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     ) {
         return false;
     }
+    let suppress_replay_redraw = meta.is_replay || agent.session.loading_replay;
     if !meta.is_replay
         && meta.event_seq.is_some_and(|seq| {
             agent
@@ -1031,7 +1039,28 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             outcome, app, parent_id, is_active,
         );
     }
-    changed && is_active
+    changed && is_active && !suppress_replay_redraw
+}
+
+/// Whether the notification's owning root/child view is still reconstructing
+/// a transcript. Early-routed background-task updates use this before their
+/// specialized handlers so they mutate restored state without painting a
+/// partial session.
+fn notification_target_loading(app: &AppView, session_id: &acp::SessionId) -> bool {
+    match find_session_match(app, session_id) {
+        Some(SessionMatch::Root(id)) => app
+            .agents
+            .get(&id)
+            .is_some_and(|agent| agent.session.loading_replay),
+        Some(SessionMatch::Child(id)) => app.agents.get(&id).is_some_and(|agent| {
+            agent.session.loading_replay
+                || agent
+                    .subagent_views
+                    .get(session_id.0.as_ref())
+                    .is_some_and(|child| child.session.loading_replay)
+        }),
+        None => false,
+    }
 }
 /// Handle an xAI session notification that targets a child (subagent) session.
 ///

@@ -50,7 +50,14 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
         // by explicit model/session transitions.
         let effects = app.sync_primary_provider_from_active_agent();
         app.pending_effects.extend(effects);
-        true
+        !matches!(
+            app.active_view,
+            ActiveView::Agent(id)
+                if app
+                    .agents
+                    .get(&id)
+                    .is_some_and(|agent| agent.session.loading_replay)
+        )
     } else {
         tracing::warn!("Failed to parse x.ai/models/update");
         false

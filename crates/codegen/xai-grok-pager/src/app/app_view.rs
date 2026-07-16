@@ -4690,6 +4690,9 @@ impl AppView {
     /// every `draw`. Waits (without consuming the one-shot) until the active
     /// AGENT view has a stable, draw-measured size — so a welcome screen, an
     /// undrawn agent, or a pending post-resize re-measure defer it. An
+    /// in-flight session restore consumes it without showing: an ambient hint
+    /// must not appear and disappear while a transcript is being reconstructed.
+    /// An
     /// out-of-band (or user-compact-on) first measure consumes the one-shot,
     /// so later resizes can never re-trigger. An in-band measure whose banner
     /// row is occluded (permission ask, modal, open dropdown, session banner)
@@ -4706,6 +4709,10 @@ impl AppView {
         let Some(agent) = self.agents.get(&id) else {
             return;
         };
+        if agent.session.loading_replay {
+            self.small_screen_tip_evaluated = true;
+            return;
+        }
         if agent.terminal_size_stale || agent.last_terminal_size == (0, 0) {
             return;
         }
@@ -4843,22 +4850,25 @@ impl AppView {
         if let ActiveView::Agent(id) = self.active_view
             && let Some(agent) = self.agents.get_mut(&id)
         {
-            needs_redraw |= agent.scrollback.tick();
-            needs_redraw |= agent.todo.list_state.tick();
-            needs_redraw |= agent.todo.badge_tick();
-            needs_redraw |= agent.tasks.tick();
-            for child_view in agent.subagent_views.values_mut() {
-                needs_redraw |= child_view.scrollback.tick();
-                needs_redraw |= child_view.tick_toast();
-                needs_redraw |= child_view.tick_ephemeral_tip();
-                needs_redraw |= child_view.tick_mode_banner();
-                needs_redraw |= child_view.tick_selection_highlight();
-                needs_redraw |= child_view.tick_drag_autoscroll();
-                needs_redraw |= child_view.poll_link_modifier();
-                needs_redraw |= child_view.poll_scrollback_search();
-                needs_redraw |= child_view.mermaid_tick();
-                needs_redraw |= Self::tick_agent_image_load(child_view);
-                needs_redraw |= Self::tick_agent_block_viewer(child_view);
+            let loading_replay = agent.session.loading_replay;
+            if !loading_replay {
+                needs_redraw |= agent.scrollback.tick();
+                needs_redraw |= agent.todo.list_state.tick();
+                needs_redraw |= agent.todo.badge_tick();
+                needs_redraw |= agent.tasks.tick();
+                for child_view in agent.subagent_views.values_mut() {
+                    needs_redraw |= child_view.scrollback.tick();
+                    needs_redraw |= child_view.tick_toast();
+                    needs_redraw |= child_view.tick_ephemeral_tip();
+                    needs_redraw |= child_view.tick_mode_banner();
+                    needs_redraw |= child_view.tick_selection_highlight();
+                    needs_redraw |= child_view.tick_drag_autoscroll();
+                    needs_redraw |= child_view.poll_link_modifier();
+                    needs_redraw |= child_view.poll_scrollback_search();
+                    needs_redraw |= child_view.mermaid_tick();
+                    needs_redraw |= Self::tick_agent_image_load(child_view);
+                    needs_redraw |= Self::tick_agent_block_viewer(child_view);
+                }
             }
             let spinner_frame_tick =
                 agent.scrollback.animation_tick() % crate::views::turn_status::SPINNER_DIVISOR == 0;
@@ -4867,6 +4877,7 @@ impl AppView {
                 .mcp_init_progress
                 .as_ref()
                 .is_some_and(McpInitProgress::is_visible)
+                && !loading_replay
                 && spinner_frame_tick;
             needs_redraw |= matches!(
                 agent.btw_state,
@@ -4888,7 +4899,7 @@ impl AppView {
             needs_redraw |= agent.poll_scrollback_search();
             needs_redraw |= agent.tick_toast();
             needs_redraw |= agent.tick_extensions_result_notice();
-            needs_redraw |= agent.tick_ephemeral_tip();
+            needs_redraw |= !loading_replay && agent.tick_ephemeral_tip();
             needs_redraw |= agent.tick_mode_banner();
             needs_redraw |= agent.tick_selection_highlight();
             needs_redraw |= agent.tick_drag_autoscroll();

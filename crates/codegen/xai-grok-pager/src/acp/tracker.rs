@@ -681,6 +681,12 @@ impl AcpUpdateTracker {
             acp::SessionUpdate::Plan(_) | acp::SessionUpdate::CurrentModeUpdate(_) => false,
             _ => false,
         };
+        if meta.is_replay {
+            // Replay reconstructs historical terminal states. Any completion
+            // reached through one of the shared streaming helpers must not be
+            // painted as a brand-new 400ms success/failure transition.
+            scrollback.clear_finish_flashes();
+        }
         if is_agent_output && changed && !meta.is_replay {
             self.bump_agent_output_epoch();
         }
@@ -2596,6 +2602,41 @@ mod tests {
             &mut sb,
         ));
         assert_eq!(tracker.agent_output_epoch(), 4);
+    }
+
+    #[test]
+    fn replayed_tool_completion_has_no_live_finish_flash() {
+        let replay = NotificationMeta {
+            is_replay: true,
+            ..Default::default()
+        };
+        let mut replay_sb = ScrollbackState::new();
+        let mut replay_tracker = AcpUpdateTracker::new();
+        assert!(replay_tracker.handle_update(
+            tool_call_completed("read-replay", acp::ToolKind::Read, "read_file"),
+            &replay,
+            &mut replay_sb,
+        ));
+        assert!(
+            replay_sb
+                .last()
+                .is_some_and(|entry| entry.finished_at.is_none()),
+            "historical completion must render statically"
+        );
+
+        let mut live_sb = ScrollbackState::new();
+        let mut live_tracker = AcpUpdateTracker::new();
+        assert!(live_tracker.handle_update(
+            tool_call_completed("read-live", acp::ToolKind::Read, "read_file"),
+            &meta(),
+            &mut live_sb,
+        ));
+        assert!(
+            live_sb
+                .last()
+                .is_some_and(|entry| entry.finished_at.is_some()),
+            "a new live completion keeps the success accent"
+        );
     }
     #[test]
     fn streaming_thinking() {

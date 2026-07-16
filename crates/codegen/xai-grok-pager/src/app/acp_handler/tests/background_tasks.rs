@@ -335,10 +335,16 @@
     #[test]
     fn session_restart_completion_finalizes_without_failure_block() {
         let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .session
+            .loading_replay = true;
 
         let replayed =
             make_replayed_task_backgrounded_notif("sess-1", "tc-r", "task-r", "tail -f x.log");
-        handle_task_backgrounded(&replayed, &mut app);
+        let replay_changed = handle_task_backgrounded(&replayed, &mut app);
+        assert!(!replay_changed, "replay state is restored without a redraw");
         {
             let agent = app.agents.get(&AgentId(0)).unwrap();
             assert_eq!(agent.scrollback.len(), 1, "replay restores started block");
@@ -353,7 +359,7 @@
             Some("session_restart"),
         );
         let changed = handle_task_completed(&notif, &mut app);
-        assert!(changed);
+        assert!(!changed, "cold-load reconciliation stays visually quiet");
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
         assert_eq!(
@@ -364,6 +370,16 @@
         assert!(
             !agent.scrollback.needs_animation(),
             "the replayed started entry must be finished (no running accent)"
+        );
+        let entry_id = agent.session.bg_tasks["task-r"]
+            .scrollback_entry_id
+            .expect("restored task has a scrollback row");
+        assert!(
+            agent
+                .scrollback
+                .get_by_id(entry_id)
+                .is_some_and(|entry| entry.finished_at.is_none()),
+            "historical completion must not receive a fresh finish flash"
         );
         let task = &agent.session.bg_tasks["task-r"];
         assert_eq!(
@@ -620,7 +636,7 @@
 
         let replayed =
             make_replayed_task_backgrounded_notif("sess-1", "tc-r", "task-r", "tail -f x.log");
-        handle_task_backgrounded(&replayed, &mut app);
+        assert!(!handle_task_backgrounded(&replayed, &mut app));
         let live = make_task_backgrounded_notif("sess-1", "tc-l", "task-l", "sleep 5");
         handle_task_backgrounded(&live, &mut app);
 
@@ -634,4 +650,3 @@
             "live TaskBackgrounded must not mark restored_from_replay"
         );
     }
-

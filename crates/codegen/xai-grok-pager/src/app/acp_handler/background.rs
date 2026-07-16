@@ -122,6 +122,7 @@ pub(super) fn handle_task_backgrounded(notif: &acp::ExtNotification, app: &mut A
     let Some((session, scrollback)) = resolve_target_view(agent, matched, child_sid) else {
         return false;
     };
+    let loading_replay = session.loading_replay;
 
     // Check if this is a demotion (foreground→background): the execute block
     // already exists in scrollback as a pending tool in the tracker.
@@ -197,7 +198,11 @@ pub(super) fn handle_task_backgrounded(notif: &acp::ExtNotification, app: &mut A
             entry.display_mode_pinned = false;
             entry.invalidate_cache();
             scrollback.mark_height_dirty(eid);
-            scrollback.finish_running(eid);
+            if restored_from_replay || loading_replay {
+                scrollback.finish_running_quietly(eid);
+            } else {
+                scrollback.finish_running(eid);
+            }
             session.tracker.remove_pending_tool(&tool_call_id);
             eid
         } else {
@@ -238,7 +243,7 @@ pub(super) fn handle_task_backgrounded(notif: &acp::ExtNotification, app: &mut A
         agent.maybe_push_parked_marker();
     }
 
-    is_active
+    is_active && !restored_from_replay && !loading_replay
 }
 
 /// Handle `x.ai/monitor_event` — background task or monitor emitted new output.
@@ -593,6 +598,7 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
     let Some((session, scrollback)) = resolve_target_view(agent, matched, child_sid) else {
         return false;
     };
+    let loading_replay = session.loading_replay;
 
     // Compute elapsed duration from the bg task state (if we have it).
     // Prefer the human description for "Task completed/failed: …" labels
@@ -663,7 +669,11 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
                 entry.invalidate_cache();
             }
         }
-        scrollback.finish_running(entry_id);
+        if stale_on_load || loading_replay {
+            scrollback.finish_running_quietly(entry_id);
+        } else {
+            scrollback.finish_running(entry_id);
+        }
     }
 
     // Keep central store in sync when we recovered a description from the
@@ -683,7 +693,7 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
         // The replayed "Task started" block above is finished (static
         // bullet); the pane row leaves the running filter via the status
         // update. No new scrollback block: nothing happened in THIS session.
-        return is_active;
+        return false;
     }
 
     // Emit "Task completed/failed" scrollback block — uses description when
@@ -723,5 +733,5 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
         agent.maybe_push_work_status();
     }
 
-    is_active
+    is_active && !loading_replay
 }

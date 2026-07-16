@@ -592,9 +592,13 @@
             .session
             .loading_replay = true;
 
-        let _ = handle_ext_notification(
+        let affected = handle_ext_notification(
             &xai_hook_execution_notif("sess-replay", "stop", true),
             &mut app,
+        );
+        assert!(
+            !affected,
+            "replayed hooks mutate restored history without painting a partial transcript"
         );
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
@@ -826,10 +830,11 @@
             agent.session.start_turn(&mut agent.scrollback);
             agent.session.current_prompt_id = Some("pid-1".into());
         }
-        let _ = handle_ext_notification(
+        let affected = handle_ext_notification(
             &xai_hook_execution_notif("sess-ls", "session_start", false),
             &mut app,
         );
+        assert!(affected, "live lifecycle hooks still request a redraw");
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
         assert_eq!(count_lifecycle_blocks(&agent.scrollback), 1);
@@ -1381,4 +1386,3 @@
         );
         assert!(agent.pending_stop_hooks.is_none());
     }
-

@@ -75,6 +75,32 @@
     }
 
     #[test]
+    fn models_update_applies_without_redraw_during_session_replay() {
+        let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .session
+            .loading_replay = true;
+
+        let changed = handle_models_update(
+            &make_models_update_notif("gpt-5.6-sol", &["gpt-5.6-sol", "gpt-5.6-luna"]),
+            &mut app,
+        );
+
+        assert!(
+            !changed,
+            "catalog refresh must not repaint a partially restored transcript"
+        );
+        assert!(
+            app.models
+                .available
+                .contains_key(&acp::ModelId::new("gpt-5.6-luna")),
+            "catalog state still updates while redraw is deferred"
+        );
+    }
+
+    #[test]
     fn models_update_uses_shell_default_when_agent_model_removed() {
         let mut app = make_app_with_agent("sess-1");
 
@@ -441,4 +467,3 @@
             "unrelated-session broadcast must not touch this agent's model"
         );
     }
-
