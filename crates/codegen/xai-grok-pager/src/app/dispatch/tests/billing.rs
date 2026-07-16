@@ -484,15 +484,111 @@ fn upsell_max_tier_not_idempotent_pushes_multiple_cards() {
 // ── ShowUsage dispatch tests ────────────────────────────────────────
 
 #[test]
-fn show_usage_returns_fetch_billing_effect() {
+fn show_usage_returns_combined_fetch_usage_effect() {
     let mut app = test_app_with_agent();
     let effects = dispatch(Action::ShowUsage, &mut app);
-    // One non-silent FetchBilling — the effect pulls billing + auto-topup
-    // together and renders a single summary.
+    // One manual provider fetch; background xAI polling still uses
+    // `FetchBilling` independently.
     assert_eq!(effects.len(), 1, "got: {effects:?}");
     assert!(
-        matches!(&effects[0], Effect::FetchBilling { agent_id, silent } if *agent_id == AgentId(0) && !*silent),
-        "effect should be a non-silent FetchBilling, got: {effects:?}"
+        matches!(&effects[0], Effect::FetchUsage { agent_id, xai_redirect_url: None } if *agent_id == AgentId(0)),
+        "effect should fetch both providers, got: {effects:?}"
+    );
+}
+
+#[test]
+fn usage_fetched_renders_xai_and_explicit_codex_disconnected_state() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    dispatch(
+        Action::TaskComplete(TaskResult::UsageFetched {
+            agent_id: AgentId(0),
+            xai: Ok(crate::app::actions::XaiUsageSnapshot {
+                balance: Some(test_bal(25.0)),
+                subscription_tier: Some("supergrok".to_string()),
+                autotopup: crate::views::credit_bar::AutoTopupFetch::Cleared,
+            }),
+            codex: Err("Not connected; run `grok login --codex`".to_string()),
+        }),
+        &mut app,
+    );
+
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    let text = last_system_text(&app, AgentId(0));
+    assert!(text.contains("xAI\nUsage: 25%"), "got: {text}");
+    assert!(text.contains("OpenAI Codex\nNot connected."), "got: {text}");
+    assert_eq!(app.subscription_tier.as_deref(), Some("supergrok"));
+}
+
+#[test]
+fn usage_xai_failure_preserves_cached_billing_and_still_renders_codex_half() {
+    use chrono::Utc;
+    use xai_grok_shell::codex_auth::CodexUsageSnapshot;
+
+    let mut app = test_app_with_agent();
+    dispatch_billing(&mut app, Some(test_bal(91.0)), true, None);
+    app.billing_poll_wanted = true;
+    let cached = app.credit_balance.as_ref().unwrap().usage_pct;
+    dispatch(
+        Action::TaskComplete(TaskResult::UsageFetched {
+            agent_id: AgentId(0),
+            xai: Err("xAI temporarily unavailable".to_string()),
+            codex: Ok(CodexUsageSnapshot {
+                account: None,
+                plan_type: Some("plus".to_string()),
+                rate_limit: None,
+                credits: None,
+                spend_control: None,
+                additional_rate_limits: Vec::new(),
+                rate_limit_reached_type: None,
+                token_usage: None,
+                fetched_at: Utc::now(),
+            }),
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.credit_balance.as_ref().unwrap().usage_pct, cached);
+    assert!(
+        app.billing_poll_wanted,
+        "xAI failure must not alter polling"
+    );
+    let text = last_system_text(&app, AgentId(0));
+    assert!(
+        text.contains("xAI\nUsage unavailable: xAI temporarily unavailable"),
+        "got: {text}"
+    );
+    assert!(text.contains("OpenAI Codex\nPlan: Plus"), "got: {text}");
+}
+
+#[test]
+fn codex_failure_does_not_change_xai_polling_or_paywall_state() {
+    let mut app = test_app_with_agent();
+    app.gate = Some(xai_grok_shell::auth::GateInfo {
+        message: "Subscribe".to_string(),
+        url: None,
+        label: None,
+    });
+    dispatch(
+        Action::TaskComplete(TaskResult::UsageFetched {
+            agent_id: AgentId(0),
+            xai: Ok(crate::app::actions::XaiUsageSnapshot {
+                balance: Some(test_bal(99.5)),
+                subscription_tier: None,
+                autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
+            }),
+            codex: Err("service unavailable".to_string()),
+        }),
+        &mut app,
+    );
+    assert!(app.billing_poll_wanted);
+    assert_eq!(
+        app.gate.as_ref().map(|gate| gate.message.as_str()),
+        Some("Subscribe")
+    );
+    assert!(
+        last_system_text(&app, AgentId(0))
+            .contains("OpenAI Codex\nUsage unavailable: service unavailable")
     );
 }
 

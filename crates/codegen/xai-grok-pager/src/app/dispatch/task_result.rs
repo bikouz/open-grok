@@ -5,7 +5,7 @@ use super::auth::{
 use super::billing::{
     PAYWALL_AUTO_CHECK_TIMEOUT, apply_auto_topup, handle_billing_fetched,
     handle_check_subscription_complete, handle_credit_limit_recheck_complete,
-    handle_gate_refreshed, handle_gate_verify_timeout,
+    handle_gate_refreshed, handle_gate_verify_timeout, handle_usage_fetched,
 };
 use super::cta::{
     handle_cta_plugin_install_done, handle_cta_plugin_reload_done,
@@ -74,6 +74,21 @@ pub(super) fn unregister_all_active_sessions(app: &AppView) -> Vec<Effect> {
         })
         .collect()
 }
+
+fn push_codex_auth_result(
+    app: &mut AppView,
+    agent_id: Option<crate::app::agent::AgentId>,
+    message: String,
+) {
+    if let Some(agent_id) = agent_id
+        && let Some(agent) = app.agents.get_mut(&agent_id)
+    {
+        agent.scrollback.push_block(RenderBlock::system(message));
+    } else {
+        app.show_toast(&message);
+    }
+}
+
 pub(super) const X11_PRIMARY_PASTE_HINT: &str = "Try Shift+Insert to paste selected text";
 fn show_clipboard_toast(target: &ClipboardPasteTarget, message: &str, app: &mut AppView) {
     match target {
@@ -236,6 +251,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             subscription_tier,
             autotopup,
         } => handle_billing_fetched(app, agent_id, balance, silent, subscription_tier, autotopup),
+        TaskResult::UsageFetched {
+            agent_id,
+            xai,
+            codex,
+        } => handle_usage_fetched(app, agent_id, xai, codex),
         TaskResult::BillingError {
             agent_id,
             error,
@@ -956,6 +976,36 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let effects = dispatch_exit_session(app);
             app.welcome_prompt_focused = false;
             effects
+        }
+        TaskResult::CodexLoginComplete { agent_id, result } => {
+            let message = match result {
+                Ok(account) => {
+                    let mut details = Vec::new();
+                    if let Some(email) = account.email.filter(|value| !value.trim().is_empty()) {
+                        details.push(email);
+                    }
+                    if let Some(plan) = account.plan_type.filter(|value| !value.trim().is_empty()) {
+                        details.push(format!("{plan} plan"));
+                    }
+                    if details.is_empty() {
+                        "OpenAI Codex connected.".to_string()
+                    } else {
+                        format!("OpenAI Codex connected: {}.", details.join(" · "))
+                    }
+                }
+                Err(error) => format!("OpenAI Codex login failed: {error}"),
+            };
+            push_codex_auth_result(app, agent_id, message);
+            vec![]
+        }
+        TaskResult::CodexLogoutComplete { agent_id, result } => {
+            let message = match result {
+                Ok(true) => "OpenAI Codex disconnected.".to_string(),
+                Ok(false) => "OpenAI Codex was not connected.".to_string(),
+                Err(error) => format!("OpenAI Codex logout failed: {error}"),
+            };
+            push_codex_auth_result(app, agent_id, message);
+            vec![]
         }
         TaskResult::DeepSearchResults { results, seq } => {
             handle_deep_search_results(app, results, seq)

@@ -20,6 +20,32 @@ pub(super) fn dispatch_logout(_app: &mut AppView) -> Vec<Effect> {
     vec![Effect::Logout]
 }
 
+/// `/login codex` -- connect the independent OpenAI account without changing
+/// the xAI ACP authentication state or leaving the current session.
+pub(super) fn dispatch_login_codex(app: &mut AppView) -> Vec<Effect> {
+    let agent_id = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        _ => None,
+    };
+    if let Some(agent_id) = agent_id
+        && let Some(agent) = app.agents.get_mut(&agent_id)
+    {
+        agent.scrollback.push_block(RenderBlock::system(
+            "Opening your browser to connect OpenAI Codex…",
+        ));
+    }
+    vec![Effect::LoginCodex { agent_id }]
+}
+
+/// `/logout codex` -- revoke only the independent OpenAI account.
+pub(super) fn dispatch_logout_codex(app: &mut AppView) -> Vec<Effect> {
+    let agent_id = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        _ => None,
+    };
+    vec![Effect::LogoutCodex { agent_id }]
+}
+
 /// Ensure `login_method_id` is populated from stored auth methods.
 /// On the eager-auth path (cached token), login_method_id is never set
 /// because the user skipped the login screen.

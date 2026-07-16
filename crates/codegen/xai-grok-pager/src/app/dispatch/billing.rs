@@ -418,6 +418,51 @@ pub(super) fn handle_billing_fetched(
     vec![]
 }
 
+/// Apply the xAI half of a manual `/usage` result with the exact same cache,
+/// polling, subscription, and agent propagation behavior as background
+/// billing, then render both independently fetched providers in one block.
+pub(super) fn handle_usage_fetched(
+    app: &mut AppView,
+    agent_id: AgentId,
+    xai: Result<crate::app::actions::XaiUsageSnapshot, String>,
+    codex: Result<xai_grok_shell::codex_auth::CodexUsageSnapshot, String>,
+) -> Vec<Effect> {
+    let xai_summary = match xai {
+        Ok(crate::app::actions::XaiUsageSnapshot {
+            balance,
+            subscription_tier,
+            autotopup,
+        }) => {
+            let summary_balance = balance.clone();
+            // Silent here means "do not render the xAI-only block". All of
+            // the existing xAI state updates still run before we render the
+            // combined provider summary below.
+            handle_billing_fetched(app, agent_id, balance, true, subscription_tier, autotopup);
+            match summary_balance {
+                Some(balance) => crate::views::credit_bar::format_usage_summary(
+                    &balance,
+                    app.auto_topup.as_ref(),
+                ),
+                None => "No billing data available.".to_string(),
+            }
+        }
+        Err(error) => crate::views::usage::format_xai_usage_error(&error),
+    };
+    let codex_summary = match codex {
+        Ok(snapshot) => crate::views::usage::format_codex_usage_summary(&snapshot),
+        Err(error) => crate::views::usage::format_codex_usage_error(&error),
+    };
+
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.scrollback.push_block(RenderBlock::System(
+            crate::scrollback::blocks::SystemMessageBlock::new(
+                crate::views::usage::format_combined_usage_summary(&xai_summary, &codex_summary),
+            ),
+        ));
+    }
+    vec![]
+}
+
 pub(super) fn handle_gate_refreshed(
     app: &mut AppView,
     settings: Option<xai_grok_shell::util::config::RemoteSettings>,

@@ -594,10 +594,14 @@ pub enum Action {
     PermissionCancel,
     /// Log out: remove credentials and return to the login screen.
     Logout,
+    /// Disconnect the independent OpenAI Codex OAuth account.
+    LogoutCodex,
     /// Log out and immediately start a new login flow.
     SwitchAccount,
     /// User pressed login on the welcome screen.
     Login,
+    /// Connect the independent OpenAI Codex OAuth account in the browser.
+    LoginCodex,
     /// Cancel an in-progress login that was started from inside a session
     /// (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit
@@ -1308,6 +1312,19 @@ pub enum ProbedAttachment {
     /// The attachment probe task failed or timed out.
     ProbeFailed,
 }
+
+/// Successful xAI half of a manual `/usage` refresh.
+///
+/// Kept separate from [`TaskResult::BillingFetched`] so Codex usage can be
+/// fetched alongside it without changing background billing polling or
+/// paywall behavior.
+#[derive(Debug)]
+pub struct XaiUsageSnapshot {
+    pub balance: Option<crate::views::credit_bar::CreditBalance>,
+    pub subscription_tier: Option<String>,
+    pub autotopup: crate::views::credit_bar::AutoTopupFetch,
+}
+
 #[derive(Debug)]
 pub enum Effect {
     /// Create a new ACP session.
@@ -1865,6 +1882,10 @@ pub enum Effect {
     },
     /// Log out via `x.ai/auth/logout` (shell clears auth.json + in-memory state).
     Logout,
+    /// Run the independent OpenAI Codex browser OAuth flow.
+    LoginCodex { agent_id: Option<AgentId> },
+    /// Revoke and remove the independent OpenAI Codex OAuth credentials.
+    LogoutCodex { agent_id: Option<AgentId> },
     /// Re-check subscription status via `x.ai/auth/check_subscription`.
     /// `verify` scopes the result to a deferred-gate verification (see
     /// [`crate::app::subscription`]); `None` for generic checks.
@@ -1964,6 +1985,14 @@ pub enum Effect {
     /// pushing a system message into scrollback (used for automatic refreshes
     /// on session init and after each turn).
     FetchBilling { agent_id: AgentId, silent: bool },
+    /// Fetch xAI billing and OpenAI Codex quota usage concurrently for the
+    /// manual `/usage` summary. Each provider reports success independently.
+    FetchUsage {
+        agent_id: AgentId,
+        /// Remote xAI kill switch: show this management URL instead of
+        /// calling `x.ai/billing`, while still fetching Codex usage.
+        xai_redirect_url: Option<String>,
+    },
     /// Fetch billing data at the app level (no agent required).
     /// Used on startup to populate the welcome-screen credit warning.
     FetchAppBilling,
@@ -2542,6 +2571,16 @@ pub enum TaskResult {
     },
     /// Shell acknowledged logout (auth cleared).
     LogoutComplete,
+    /// Independent OpenAI Codex browser OAuth finished.
+    CodexLoginComplete {
+        agent_id: Option<AgentId>,
+        result: Result<xai_grok_shell::codex_auth::CodexAccountSummary, String>,
+    },
+    /// Independent OpenAI Codex logout finished.
+    CodexLogoutComplete {
+        agent_id: Option<AgentId>,
+        result: Result<bool, String>,
+    },
     /// Shell responded to `x.ai/auth/check_subscription`. `verify` echoes
     /// the generation from `Effect::CheckSubscription` for deferred-gate
     /// verifications.
@@ -2617,6 +2656,12 @@ pub enum TaskResult {
         subscription_tier: Option<String>,
         /// Auto top-up rule fetch result; `Unchanged` keeps any cached rule.
         autotopup: crate::views::credit_bar::AutoTopupFetch,
+    },
+    /// Both independently fetched halves of a manual `/usage` request.
+    UsageFetched {
+        agent_id: AgentId,
+        xai: Result<XaiUsageSnapshot, String>,
+        codex: Result<xai_grok_shell::codex_auth::CodexUsageSnapshot, String>,
     },
     /// App-level billing data (welcome screen).
     AppBillingFetched {

@@ -1,9 +1,9 @@
-//! `/usage` -- show credit usage or open billing management page.
+//! `/usage` -- show xAI and OpenAI Codex usage or manage xAI billing.
 
 use crate::app::actions::Action;
 use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
 
-/// Show coding credit usage or manage billing.
+/// Show provider usage or manage xAI billing.
 ///
 /// `/usage`        -- show current credit usage
 /// `/usage show`   -- same as above
@@ -23,7 +23,7 @@ impl SlashCommand for UsageCommand {
     }
 
     fn description(&self) -> &str {
-        "View credit usage or manage billing"
+        "View xAI and OpenAI Codex usage or manage xAI billing"
     }
 
     fn usage(&self) -> &str {

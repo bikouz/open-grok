@@ -29,7 +29,33 @@ Running `grok login` starts the sign-in flow again, replacing your cached sessio
 | `--oauth` | Sign in through SpaceXAI OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
 | `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. |
 
-To sign out, run `grok logout`. It takes no flags and clears your cached credentials.
+To sign out of xAI, run `grok logout`. It clears only the xAI credentials in
+`~/.grok/auth.json`.
+
+### OpenAI Codex OAuth
+
+Grok Build can also connect a ChatGPT account for OpenAI Codex models and
+quota usage. This is a second, independent account: connecting or
+disconnecting Codex never replaces the xAI login used by the Grok shell.
+
+```bash
+grok login --codex
+grok login --codex --device-auth   # headless or remote environments
+grok logout --codex
+```
+
+Inside an active session, use `/login codex` and `/logout codex` for the same
+independent account. Bare `/login` and `/logout` continue to operate on xAI.
+
+The Codex flow follows the OpenAI Codex OAuth authorization-code + PKCE setup,
+refreshes access tokens automatically, and stores the resulting tokens in
+`~/.grok/codex-auth.json` with owner-only permissions. Keeping that file
+separate from `~/.grok/auth.json` prevents a Codex refresh, logout, or usage
+failure from changing xAI authentication or paywall state.
+
+Run `/usage` to view xAI billing and OpenAI Codex quota windows together. If
+Codex is not connected, the OpenAI section says so and points to
+`grok login --codex`; xAI usage still loads independently.
 
 ---
 

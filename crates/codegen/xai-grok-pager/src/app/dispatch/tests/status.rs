@@ -899,23 +899,25 @@ fn show_usage_on_welcome_screen_is_noop() {
 }
 
 #[test]
-fn show_usage_with_redirect_url_shows_link_and_skips_fetch() {
+fn show_usage_with_redirect_url_skips_only_xai_fetch() {
     let mut app = test_app_with_agent();
     app.usage_billing_redirect_url = Some("https://billing.example.com/me".to_string());
     let before = agent_scrollback_len(&app);
     let effects = dispatch(Action::ShowUsage, &mut app);
-    assert!(
-        effects.is_empty(),
-        "with a redirect URL set, ShowUsage should not fetch (billing or auto-topup), got: {effects:?}"
-    );
     assert_eq!(
         agent_scrollback_len(&app),
-        before + 1,
-        "redirect path should push one system message with the billing link"
+        before,
+        "the combined result should be rendered only after Codex completes"
     );
     assert!(
-        last_system_text(&app, AgentId(0)).contains("https://billing.example.com/me"),
-        "redirect message should use the remote settings-provided URL"
+        matches!(
+            effects.as_slice(),
+            [Effect::FetchUsage {
+                agent_id: AgentId(0),
+                xai_redirect_url: Some(url),
+            }] if url == "https://billing.example.com/me"
+        ),
+        "redirect URL should bypass only xAI while Codex still fetches, got: {effects:?}"
     );
 }
 

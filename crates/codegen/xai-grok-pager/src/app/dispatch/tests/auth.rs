@@ -3,6 +3,51 @@
 use super::*;
 
 #[test]
+fn codex_login_keeps_xai_session_active_and_emits_independent_effect() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::LoginCodex, &mut app);
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::LoginCodex {
+            agent_id: Some(AgentId(0))
+        }]
+    ));
+    assert!(last_system_text(&app, AgentId(0)).contains("OpenAI Codex"));
+}
+
+#[test]
+fn codex_logout_keeps_xai_session_active_and_emits_independent_effect() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::LogoutCodex, &mut app);
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::LogoutCodex {
+            agent_id: Some(AgentId(0))
+        }]
+    ));
+}
+
+#[test]
+fn codex_auth_completion_does_not_change_xai_auth_state() {
+    let mut app = test_app_with_agent();
+    let before = format!("{:?}", app.auth_state);
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexLogoutComplete {
+            agent_id: Some(AgentId(0)),
+            result: Ok(true),
+        }),
+        &mut app,
+    );
+    assert_eq!(format!("{:?}", app.auth_state), before);
+    assert_eq!(
+        last_system_text(&app, AgentId(0)),
+        "OpenAI Codex disconnected."
+    );
+}
+
+#[test]
 fn cta_mcps_loaded_needs_auth_opens_modal_and_seeds() {
     use crate::app::agent_view::CtaPhase;
     use crate::views::extensions_modal::{ExtensionsTab, TabDataState};

@@ -31,6 +31,37 @@ use agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::http_status_from_error;
 use xai_grok_shell::session::{ExtMethodResult, SessionInfoResponse};
+
+async fn fetch_xai_usage(tx: &AcpAgentTx) -> Result<actions::XaiUsageSnapshot, String> {
+    use xai_grok_shell::extensions::billing::BillingConfigResponse;
+
+    let req = acp::ExtRequest::new(
+        "x.ai/billing",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize billing params")
+            .into(),
+    );
+    let response = acp_send(req, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let wrapper: serde_json::Value = serde_json::from_str(response.0.get()).unwrap_or_default();
+    let result = wrapper.get("result").unwrap_or(&wrapper);
+    let billing = serde_json::from_value::<BillingConfigResponse>(result.clone())
+        .map_err(|error| format!("Parse error: {error}"))?;
+    let subscription_tier = billing.subscription_tier;
+    let balance = billing.config.map(credit_balance_from_config);
+    let autotopup = if has_prepaid_credits(balance.as_ref()) {
+        fetch_auto_topup_info(tx).await
+    } else {
+        crate::views::credit_bar::AutoTopupFetch::Cleared
+    };
+    Ok(actions::XaiUsageSnapshot {
+        balance,
+        subscription_tier,
+        autotopup,
+    })
+}
+
 pub(crate) fn execute(
     effect: Effect,
     tasks: &mut JoinSet<TaskResult>,
@@ -80,6 +111,22 @@ pub(crate) fn execute(
                     send_logout(&tx).await;
                     TaskResult::LogoutComplete
                 });
+        }
+        Effect::LoginCodex { agent_id } => {
+            tasks.spawn(async move {
+                let result = xai_grok_shell::codex_auth::run_tui_login()
+                    .await
+                    .map_err(|error| sanitize_user_error(&format!("{error:#}")));
+                TaskResult::CodexLoginComplete { agent_id, result }
+            });
+        }
+        Effect::LogoutCodex { agent_id } => {
+            tasks.spawn(async move {
+                let result = xai_grok_shell::codex_auth::run_cli_logout()
+                    .await
+                    .map_err(|error| sanitize_user_error(&format!("{error:#}")));
+                TaskResult::CodexLogoutComplete { agent_id, result }
+            });
         }
         Effect::CheckSubscription { verify } => {
             let tx = acp_tx.clone();
@@ -3842,59 +3889,50 @@ pub(crate) fn execute(
         }
         Effect::FetchBilling { agent_id, silent } => {
             let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    use xai_grok_shell::extensions::billing::BillingConfigResponse;
-                    let req = acp::ExtRequest::new(
-                        "x.ai/billing",
-                        serde_json::value::to_raw_value(&serde_json::json!({}))
-                            .expect("serialize billing params")
-                            .into(),
-                    );
-                    let parsed = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let result = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                BillingConfigResponse,
-                            >(result.clone())
-                        }
-                        Err(e) => {
-                            return TaskResult::BillingError {
-                                agent_id,
-                                error: sanitize_user_error(&format!("{e}")),
-                                silent,
-                            };
-                        }
-                    };
-                    let billing = match parsed {
-                        Ok(billing) => billing,
-                        Err(e) => {
-                            return TaskResult::BillingError {
-                                agent_id,
-                                error: format!("Parse error: {e}"),
-                                silent,
-                            };
-                        }
-                    };
-                    let subscription_tier = billing.subscription_tier;
-                    let balance = billing.config.map(credit_balance_from_config);
-                    let autotopup = if has_prepaid_credits(balance.as_ref()) {
-                        fetch_auto_topup_info(&tx).await
-                    } else {
-                        crate::views::credit_bar::AutoTopupFetch::Cleared
-                    };
-                    TaskResult::BillingFetched {
+            tasks.spawn(async move {
+                match fetch_xai_usage(&tx).await {
+                    Ok(actions::XaiUsageSnapshot {
+                        balance,
+                        subscription_tier,
+                        autotopup,
+                    }) => TaskResult::BillingFetched {
                         agent_id,
                         balance,
                         silent,
                         subscription_tier,
                         autotopup,
+                    },
+                    Err(error) => TaskResult::BillingError {
+                        agent_id,
+                        error,
+                        silent,
+                    },
+                }
+            });
+        }
+        Effect::FetchUsage {
+            agent_id,
+            xai_redirect_url,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let xai_usage = async {
+                    match xai_redirect_url {
+                        Some(url) => Err(format!("View current usage at {url}.")),
+                        None => fetch_xai_usage(&tx).await,
                     }
-                });
+                };
+                let (xai, codex) = tokio::join!(
+                    xai_usage,
+                    xai_grok_shell::codex_auth::fetch_usage()
+                );
+                TaskResult::UsageFetched {
+                    agent_id,
+                    xai,
+                    codex: codex
+                        .map_err(|error| sanitize_user_error(&format!("{error:#}"))),
+                }
+            });
         }
         Effect::RefreshGate => {
             tasks

@@ -483,26 +483,33 @@ Manage personas -- create, edit, and delete personas. A subagent can apply a per
 
 ### `/login`
 
-Log in or re-authenticate with your account without leaving the session.
+Log in or re-authenticate with xAI without leaving the session. Add `codex` to
+connect an independent OpenAI Codex OAuth account without changing xAI auth.
 
 ```
 /login
+/login codex
 ```
 
 ### `/logout`
 
-Log out and return to the login screen.
+Log out of xAI and return to the login screen. Add `codex` to disconnect only
+the independent OpenAI Codex account and keep the xAI session active.
 
 ```
 /logout
+/logout codex
 ```
 
 ### `/usage`
 
-View credit usage or manage billing.
+View xAI billing and OpenAI Codex quota usage together in one labeled summary.
+The two providers load independently, so one provider's error does not hide or
+alter the other. `/usage manage` opens xAI billing management.
 
 ```
 /usage
+/usage manage
 ```
 
 ### `/privacy`

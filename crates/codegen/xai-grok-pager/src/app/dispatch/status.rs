@@ -244,31 +244,22 @@ pub(super) fn dispatch_show_context_info(app: &mut AppView) -> Vec<Effect> {
     }]
 }
 
-/// Show credit usage: fetch billing data and display inline.
+/// Show xAI credit usage and OpenAI Codex quota usage in one inline block.
 ///
 /// When the remote settings `grok_build_usage_redirect_url` flag is set (delivered via
-/// RemoteSettings, targeted at personal-team users), skip the backend fetch and
-/// just point the user at that URL instead. This is a kill switch for the
-/// personal-team billing path while it is unreliable.
+/// RemoteSettings, targeted at personal-team users), skip only the xAI backend
+/// fetch and point that provider at the URL instead. Codex usage still loads.
+/// This remains a kill switch for the personal-team billing path while it is
+/// unreliable.
 pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
-    if let Some(url) = app.usage_billing_redirect_url.clone() {
-        if let Some(agent) = app.agents.get_mut(&id) {
-            agent.scrollback.push_block(RenderBlock::System(
-                crate::scrollback::blocks::SystemMessageBlock::new(format!(
-                    "Please check your usage on {url}"
-                )),
-            ));
-        }
-        return vec![];
-    }
-    // Non-silent fetch: the effect also pulls the auto top-up rule so the
-    // summary can render usage, prepaid credits, and auto top-up together.
-    vec![Effect::FetchBilling {
+    // This manual path fetches both providers independently. Background xAI
+    // billing refreshes continue to use `FetchBilling` and remain silent.
+    vec![Effect::FetchUsage {
         agent_id: id,
-        silent: false,
+        xai_redirect_url: app.usage_billing_redirect_url.clone(),
     }]
 }
 

@@ -454,6 +454,49 @@ mod tests {
             CommandResult::Action(Action::EnterRememberMode)
         ));
     }
+    fn run_login(args: &str) -> CommandResult {
+        let models = ModelState::default();
+        let mut ctx = make_ctx(&models);
+        login::LoginCommand.run(&mut ctx, args)
+    }
+    fn run_logout(args: &str) -> CommandResult {
+        let models = ModelState::default();
+        let mut ctx = make_ctx(&models);
+        logout::LogoutCommand.run(&mut ctx, args)
+    }
+    #[test]
+    fn login_bare_preserves_xai_flow() {
+        assert!(matches!(
+            run_login(""),
+            CommandResult::Action(Action::Login)
+        ));
+    }
+    #[test]
+    fn login_codex_selects_independent_oauth_flow() {
+        assert!(matches!(
+            run_login(" codex "),
+            CommandResult::Action(Action::LoginCodex)
+        ));
+    }
+    #[test]
+    fn logout_bare_preserves_xai_flow() {
+        assert!(matches!(
+            run_logout(""),
+            CommandResult::Action(Action::Logout)
+        ));
+    }
+    #[test]
+    fn logout_codex_selects_independent_oauth_flow() {
+        assert!(matches!(
+            run_logout(" codex "),
+            CommandResult::Action(Action::LogoutCodex)
+        ));
+    }
+    #[test]
+    fn provider_login_and_logout_reject_unknown_accounts() {
+        assert!(matches!(run_login("other"), CommandResult::Error(_)));
+        assert!(matches!(run_logout("other"), CommandResult::Error(_)));
+    }
     fn run_usage(args: &str) -> CommandResult {
         let models = ModelState::default();
         let mut ctx = make_ctx(&models);
