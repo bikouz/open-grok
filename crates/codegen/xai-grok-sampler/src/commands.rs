@@ -4,6 +4,8 @@
 //! [`SamplerHandle`](crate::handle::SamplerHandle) and the actor task,
 //! not a public type. External callers always go through `SamplerHandle`.
 
+use std::sync::{Arc, OnceLock};
+
 use tokio::sync::oneshot;
 
 use xai_grok_sampling_types::{ConversationRequest, ConversationResponse, SamplingError};
@@ -25,6 +27,8 @@ pub(crate) enum SamplerCommand {
         request_id: RequestId,
         request: Box<ConversationRequest>,
         config: Option<Box<SamplerConfig>>,
+        /// Turn generation captured synchronously before actor enqueue.
+        codex_turn_state: Arc<OnceLock<String>>,
         completion_tx: Option<
             oneshot::Sender<Result<(ConversationResponse, InferenceLatencyStats), SamplingError>>,
         >,

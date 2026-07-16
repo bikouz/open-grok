@@ -150,6 +150,8 @@ pub fn stream_responses_with_client_custom_tools<'a>(
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
         let mut custom_input_started: BTreeSet<u32> = BTreeSet::new();
+        let mut backend_output_started: BTreeSet<u32> = BTreeSet::new();
+        let mut backend_tool_started: BTreeSet<String> = BTreeSet::new();
         let mut next_tool_index: u32 = 0;
 
         let mut stream = raw_stream;
@@ -309,6 +311,26 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                                 arguments_delta: has_initial_input.then_some(ct.input),
                             };
                         }
+                        rs::OutputItem::CustomToolCall(ct) => {
+                            // xAI's current Responses schema returns hosted X
+                            // search as `x_search_call`. The transport adapter
+                            // normalizes that provider-only item to a backend
+                            // CustomToolCall so the rest of the harness can keep
+                            // one provider-neutral lifecycle.
+                            let was_started = backend_output_started.contains(&added_event.output_index)
+                                || backend_tool_started.contains(&ct.id)
+                                || backend_tool_started.contains(&ct.call_id);
+                            backend_output_started.insert(added_event.output_index);
+                            backend_tool_started.insert(ct.id.clone());
+                            backend_tool_started.insert(ct.call_id.clone());
+                            if !was_started {
+                                yield SamplingEvent::BackendToolCallStarted {
+                                    request_id: request_id.clone(),
+                                    call_id: ct.id,
+                                    name: "x_search".to_string(),
+                                };
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -403,11 +425,17 @@ pub fn stream_responses_with_client_custom_tools<'a>(
 
                 // Web search
                 ResponseStreamEvent::ResponseWebSearchCallInProgress(ev) => {
-                    yield SamplingEvent::BackendToolCallStarted {
-                        request_id: request_id.clone(),
-                        call_id: ev.item_id.clone(),
-                        name: "web_search".to_string(),
-                    };
+                    let was_started = backend_output_started.contains(&ev.output_index)
+                        || backend_tool_started.contains(&ev.item_id);
+                    backend_output_started.insert(ev.output_index);
+                    backend_tool_started.insert(ev.item_id.clone());
+                    if !was_started {
+                        yield SamplingEvent::BackendToolCallStarted {
+                            request_id: request_id.clone(),
+                            call_id: ev.item_id.clone(),
+                            name: "web_search".to_string(),
+                        };
+                    }
                 }
                 // Completed/Searching carry no data — the real payload
                 // arrives via ResponseOutputItemDone(WebSearchCall) below.
@@ -420,6 +448,17 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                 ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
                     match &done_event.item {
                         rs::OutputItem::WebSearchCall(ws) => {
+                            let was_started = backend_output_started.contains(&done_event.output_index)
+                                || backend_tool_started.contains(&ws.id);
+                            backend_output_started.insert(done_event.output_index);
+                            backend_tool_started.insert(ws.id.clone());
+                            if !was_started {
+                                yield SamplingEvent::BackendToolCallStarted {
+                                    request_id: request_id.clone(),
+                                    call_id: ws.id.clone(),
+                                    name: "web_search".to_string(),
+                                };
+                            }
                             let result = serde_json::to_value(ws).ok();
                             yield SamplingEvent::BackendToolCallCompleted {
                                 request_id: request_id.clone(),
@@ -436,6 +475,19 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                         rs::OutputItem::CustomToolCall(ct)
                             if !client_custom_tool_names.iter().any(|name| name == &ct.name) =>
                         {
+                            let was_started = backend_output_started.contains(&done_event.output_index)
+                                || backend_tool_started.contains(&ct.id)
+                                || backend_tool_started.contains(&ct.call_id);
+                            backend_output_started.insert(done_event.output_index);
+                            backend_tool_started.insert(ct.id.clone());
+                            backend_tool_started.insert(ct.call_id.clone());
+                            if !was_started {
+                                yield SamplingEvent::BackendToolCallStarted {
+                                    request_id: request_id.clone(),
+                                    call_id: ct.id.clone(),
+                                    name: "x_search".to_string(),
+                                };
+                            }
                             let result = serde_json::to_value(ct).ok();
                             yield SamplingEvent::BackendToolCallCompleted {
                                 request_id: request_id.clone(),
@@ -463,11 +515,17 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                             };
                         }
                     } else {
-                        yield SamplingEvent::BackendToolCallStarted {
-                            request_id: request_id.clone(),
-                            call_id: ev.item_id.clone(),
-                            name: "x_search".to_string(),
-                        };
+                        let was_started = backend_output_started.contains(&ev.output_index)
+                            || backend_tool_started.contains(&ev.item_id);
+                        backend_output_started.insert(ev.output_index);
+                        backend_tool_started.insert(ev.item_id.clone());
+                        if !was_started {
+                            yield SamplingEvent::BackendToolCallStarted {
+                                request_id: request_id.clone(),
+                                call_id: ev.item_id.clone(),
+                                name: "x_search".to_string(),
+                            };
+                        }
                     }
                 }
 
@@ -1158,10 +1216,16 @@ mod tests {
         .await;
 
         assert!(tool_call_deltas(&evs).is_empty());
-        assert!(evs.iter().any(|event| matches!(
-            event,
-            SamplingEvent::BackendToolCallStarted { name, .. } if name == "x_search"
-        )));
+        assert_eq!(
+            evs.iter()
+                .filter(|event| matches!(
+                    event,
+                    SamplingEvent::BackendToolCallStarted { name, .. } if name == "x_search"
+                ))
+                .count(),
+            1,
+            "output-item and input-done frames must share one hosted-tool lifecycle",
+        );
         assert!(evs.iter().any(|event| matches!(
             event,
             SamplingEvent::BackendToolCallCompleted { name, .. } if name == "x_search"
@@ -1174,6 +1238,58 @@ mod tests {
             &response.items[0],
             ConversationItem::BackendToolCall(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn normalized_xsearch_item_needs_no_custom_input_event_for_lifecycle() {
+        let final_call = custom_tool_call(
+            "xs_123",
+            "xs_123",
+            "x_search",
+            r#"{"query":"current xAI news"}"#,
+        );
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(custom_call_added_event(0, "xs_123", "xs_123", "x_search")),
+            Ok(rs::ResponseStreamEvent::ResponseOutputItemDone(
+                rs_types::ResponseOutputItemDoneEvent {
+                    sequence_number: 1,
+                    output_index: 0,
+                    item: rs_types::OutputItem::CustomToolCall(final_call.clone()),
+                },
+            )),
+            Ok(completed_event_with_output(vec![
+                rs_types::OutputItem::CustomToolCall(final_call),
+            ])),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["code".into()],
+        ))
+        .await;
+
+        assert_eq!(
+            evs.iter()
+                .filter(|event| matches!(
+                    event,
+                    SamplingEvent::BackendToolCallStarted { name, .. } if name == "x_search"
+                ))
+                .count(),
+            1,
+        );
+        assert_eq!(
+            evs.iter()
+                .filter(|event| matches!(
+                    event,
+                    SamplingEvent::BackendToolCallCompleted { name, .. } if name == "x_search"
+                ))
+                .count(),
+            1,
+        );
     }
 
     #[tokio::test]

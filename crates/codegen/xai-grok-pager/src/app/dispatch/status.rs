@@ -259,6 +259,7 @@ pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
     // billing refreshes continue to use `FetchBilling` and remain silent.
     vec![Effect::FetchUsage {
         agent_id: id,
+        include_xai: app.usage_visible,
         xai_redirect_url: app.usage_billing_redirect_url.clone(),
     }]
 }
@@ -349,7 +350,7 @@ pub(super) fn notify_session_ready(
 ) {
     notification_service.notify(NotificationEvent {
         kind: NotificationEventKind::SessionReady,
-        title: "Grok".into(),
+        title: "Open Grok".into(),
         body: NotificationEventKind::SessionReady.as_str().into(),
         session_id: agent.session.session_id.as_ref().map(|s| s.0.to_string()),
     });

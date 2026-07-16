@@ -207,6 +207,7 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub persisted_announcement_state: Option<
         crate::session::announcement_state::AnnouncementState,
     >,
+    pub previous_turn_model: Option<crate::session::compaction_config::PreviousModelInfo>,
     pub session_meta: Option<&'a acp::Meta>,
     pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
@@ -343,6 +344,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         persisted_plan_mode: None,
         persisted_goal_mode: None,
         persisted_announcement_state: None,
+        previous_turn_model: None,
         session_meta,
         managed_mcp_expires_at: None,
         model_agent_type,
@@ -967,7 +969,7 @@ pub(crate) fn inherited_harness_template(
 /// config. The two must stay consistent: a strict-harness model implies the
 /// alternate harness.
 ///
-/// When a zero-turn switch rebuilds the harness (`did_rebuild`), the handle
+/// When a between-turn switch rebuilds the harness (`did_rebuild`), the handle
 /// must adopt the rebuilt harness's agent type. Otherwise the name is left
 /// unchanged — compatible stock switches (e.g. `grok-build` →
 /// `grok-build-plan`) intentionally preserve the session's original ACP
@@ -983,7 +985,7 @@ pub(crate) fn agent_name_after_model_switch(
         current_agent_name.to_owned()
     }
 }
-/// Harness compatibility for zero-turn / mid-turn model switching.
+/// Harness compatibility for zero-turn and between-turn model switching.
 ///
 /// Two stock (non-strict) agents are interchangeable — they share the
 /// default wire format and toolset, so switching e.g. `grok-build` →
@@ -1001,6 +1003,32 @@ pub(crate) fn harnesses_are_compatible(active: &str, required: &str) -> bool {
         (false, false) => true,
         (true, true) => active == required,
         _ => false,
+    }
+}
+
+/// Whether a model switch can keep the current harness or must rebuild it.
+///
+/// Prior turns do not make a strict/stock transition invalid. They only mean
+/// the rebuild must preserve the existing conversation while replacing the
+/// provider-specific prompt, tool bridge, and hosted-tool configuration. The
+/// session actor already performs that replacement atomically while idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HarnessSwitchPlan {
+    Keep,
+    Rebuild { has_prior_turns: bool },
+}
+
+pub(crate) fn plan_harness_switch(
+    active: Option<&str>,
+    required: &str,
+    turn_count: u32,
+) -> HarnessSwitchPlan {
+    if active.is_none_or(|active| harnesses_are_compatible(active, required)) {
+        HarnessSwitchPlan::Keep
+    } else {
+        HarnessSwitchPlan::Rebuild {
+            has_prior_turns: turn_count > 0,
+        }
     }
 }
 /// Read a string field from `session_meta` first, falling back to
@@ -1401,7 +1429,11 @@ impl MvpAgent {
                         tc.status, acp::ToolCallStatus::Completed |
                         acp::ToolCallStatus::Failed
                     );
-                    if is_pre_completed {} else {
+                    if is_pre_completed {
+                        if crate::session::code_mode::is_code_mode_transport_tool(&tc.title) {
+                            return;
+                        }
+                    } else {
                         pending_tool_calls.insert(tc.tool_call_id.clone(), tc.clone());
                         return;
                     }
@@ -1413,6 +1445,11 @@ impl MvpAgent {
                             if let Some(mut base) = pending_tool_calls
                                 .remove(&u.tool_call_id)
                             {
+                                if crate::session::code_mode::is_code_mode_transport_tool(
+                                    &base.title,
+                                ) {
+                                    return;
+                                }
                                 base.update(std::mem::take(&mut u.fields));
                                 notification.update = acp::SessionUpdate::ToolCall(base);
                             }
@@ -1545,7 +1582,7 @@ impl MvpAgent {
         target_client_id: Option<&serde_json::Value>,
         mark_replay: bool,
     ) -> Vec<tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<()>>> {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::Read;
         let Some(updates_path) = updates_file_path.clone() else {
             return Vec::new();
         };
@@ -1553,14 +1590,24 @@ impl MvpAgent {
             Ok(f) => f,
             Err(_) => return Vec::new(),
         };
-        if file.seek(SeekFrom::Start(from_offset)).is_err() {
+        let mut full_contents = String::new();
+        if file.read_to_string(&mut full_contents).is_err() {
             return Vec::new();
         }
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_err() || contents.is_empty() {
+        let Ok(from_offset) = usize::try_from(from_offset) else {
+            return Vec::new();
+        };
+        if from_offset > full_contents.len() || !full_contents.is_char_boundary(from_offset) {
             return Vec::new();
         }
-        let live_lines = crate::session::storage::filter_delta_replay_lines(&contents);
+        let (prior_contents, contents) = full_contents.split_at(from_offset);
+        if contents.is_empty() {
+            return Vec::new();
+        }
+        let live_lines = crate::session::storage::filter_delta_replay_lines_with_prior(
+            contents,
+            prior_contents,
+        );
         let delta_count = live_lines.len();
         let mut completions = Vec::with_capacity(live_lines.len());
         let mut pending_tool_calls = std::collections::HashMap::new();
@@ -1966,7 +2013,7 @@ impl MvpAgent {
             subscription_tier,
             self.auth_manager.current_or_expired().as_ref(),
         );
-        let meta = self
+        let mut meta = self
             .auth_manager
             .current()
             .map(|auth| {
@@ -1999,6 +2046,20 @@ impl MvpAgent {
                     .and_then(|v| v.as_object().cloned())
                     .unwrap_or_default()
             });
+        if let Some(meta) = meta.as_mut() {
+            // Authentication can change provider visibility. Carry the exact
+            // post-auth ACP projection in the response so the pager can choose
+            // a first-session model without racing the fire-and-forget
+            // `x.ai/models/update` notification.
+            let available = self.models_manager.available();
+            let models = agent_client_protocol::SessionModelState::new(
+                self.models_manager.current_model_id(),
+                available.values().cloned().collect(),
+            );
+            if let Ok(value) = serde_json::to_value(models) {
+                meta.insert("models".to_string(), value);
+            }
+        }
         AuthenticateResponse::new().meta(meta)
     }
     /// Fetch remote settings after authentication when early prefetch had none.

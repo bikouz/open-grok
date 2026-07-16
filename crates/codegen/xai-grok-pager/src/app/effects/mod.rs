@@ -62,6 +62,58 @@ async fn fetch_xai_usage(tx: &AcpAgentTx) -> Result<actions::XaiUsageSnapshot, S
     })
 }
 
+fn is_codex_session_auth_required(error: &acp::Error) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some(xai_grok_shell::codex_auth::CODEX_AUTH_REQUIRED_ERROR_KIND)
+}
+
+/// Ask the in-process shell to rebuild and broadcast its Codex model catalog
+/// after OAuth succeeds. The request is deliberately completed before the
+/// login task result is delivered so startup can select Sol against the live
+/// catalog rather than racing a later notification.
+async fn refresh_codex_models(tx: &AcpAgentTx) -> Result<acp::SessionModelState, String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/codex/models/refresh",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize Codex model refresh params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("Codex model refresh returned invalid JSON: {error}"))?;
+    let result = envelope.get("result").unwrap_or(&envelope);
+    if let Some(warning) = result.get("warning").and_then(serde_json::Value::as_str) {
+        tracing::warn!(%warning, "Codex login is using cached/embedded model catalog");
+    }
+    let models = result
+        .get("models")
+        .cloned()
+        .ok_or_else(|| "Codex model refresh did not return a model catalog".to_string())?;
+    serde_json::from_value(models)
+        .map_err(|error| format!("Codex model refresh returned an invalid catalog: {error}"))
+}
+
+/// Clear account-scoped Codex catalog entries after logout while leaving the
+/// embedded fallback and all xAI models untouched.
+async fn clear_codex_models(tx: &AcpAgentTx) -> Result<(), String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/codex/models/clear",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize Codex model clear params")
+            .into(),
+    );
+    acp_send(request, tx)
+        .await
+        .map(|_| ())
+        .map_err(|error| sanitize_user_error(&format!("{error}")))
+}
+
 pub(crate) fn execute(
     effect: Effect,
     tasks: &mut JoinSet<TaskResult>,
@@ -104,28 +156,77 @@ pub(crate) fn execute(
                     TaskResult::AuthCopiedTimeout
                 });
         }
-        Effect::Logout => {
+        Effect::Logout {
+            xai_targets,
+            codex_targets,
+        } => {
             let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    send_logout(&tx).await;
-                    TaskResult::LogoutComplete
-                });
+            tasks.spawn(async move {
+                // xAI logout must not invoke or depend on an OpenAI network
+                // refresh. Presence of the isolated local Codex credential
+                // store is sufficient to preserve those tabs; their sampler
+                // owns refresh/re-auth if the access token later proves stale.
+                let codex_account = xai_grok_shell::codex_auth::load_credentials()
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(xai_grok_shell::codex_auth::CodexAccountSummary::from);
+                send_logout(&tx).await;
+                TaskResult::LogoutComplete {
+                    xai_targets,
+                    codex_targets,
+                    codex_account,
+                }
+            });
         }
-        Effect::LoginCodex { agent_id } => {
+        Effect::LoginCodex { agent_id, purpose } => {
+            let tx = acp_tx.clone();
             tasks.spawn(async move {
                 let result = xai_grok_shell::codex_auth::run_tui_login()
                     .await
                     .map_err(|error| sanitize_user_error(&format!("{error:#}")));
-                TaskResult::CodexLoginComplete { agent_id, result }
+                let models = if result.is_ok() {
+                    match refresh_codex_models(&tx).await {
+                        Ok(models) => Some(models),
+                        Err(error) => {
+                            // OAuth succeeded and is independently usable even
+                            // when an older shell does not implement refresh.
+                            tracing::warn!(%error, "Codex model catalog refresh failed after login");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                TaskResult::CodexLoginComplete {
+                    agent_id,
+                    purpose,
+                    result,
+                    models,
+                }
             });
         }
-        Effect::LogoutCodex { agent_id } => {
+        Effect::LogoutCodex {
+            agent_id,
+            targets,
+            primary_was_codex,
+        } => {
+            let tx = acp_tx.clone();
             tasks.spawn(async move {
                 let result = xai_grok_shell::codex_auth::run_cli_logout()
                     .await
                     .map_err(|error| sanitize_user_error(&format!("{error:#}")));
-                TaskResult::CodexLogoutComplete { agent_id, result }
+                if result.is_ok()
+                    && let Err(error) = clear_codex_models(&tx).await
+                {
+                    tracing::warn!(%error, "Codex model catalog clear failed after logout");
+                }
+                TaskResult::CodexLogoutComplete {
+                    agent_id,
+                    targets,
+                    primary_was_codex,
+                    result,
+                }
             });
         }
         Effect::CheckSubscription { verify } => {
@@ -601,6 +702,7 @@ pub(crate) fn execute(
                             }
                         }
                         Err(e) => {
+                            let codex_auth_required = is_codex_session_auth_required(&e);
                             let error = e.to_string();
                             ulog::error(
                                 "session.load.failed",
@@ -611,10 +713,17 @@ pub(crate) fn execute(
                                     ),
                                 ),
                             );
-                            TaskResult::SessionLoadFailed {
-                                agent_id,
-                                session_id: acp_session_id,
-                                error: sanitize_user_error(&error),
+                            if codex_auth_required {
+                                TaskResult::CodexSessionLoadAuthRequired {
+                                    agent_id,
+                                    session_id: acp_session_id,
+                                }
+                            } else {
+                                TaskResult::SessionLoadFailed {
+                                    agent_id,
+                                    session_id: acp_session_id,
+                                    error: sanitize_user_error(&error),
+                                }
                             }
                         }
                     }
@@ -3912,11 +4021,15 @@ pub(crate) fn execute(
         }
         Effect::FetchUsage {
             agent_id,
+            include_xai,
             xai_redirect_url,
         } => {
             let tx = acp_tx.clone();
             tasks.spawn(async move {
                 let xai_usage = async {
+                    if !include_xai {
+                        return Err("Usage is not available for this xAI account.".to_string());
+                    }
                     match xai_redirect_url {
                         Some(url) => Err(format!("View current usage at {url}.")),
                         None => fetch_xai_usage(&tx).await,

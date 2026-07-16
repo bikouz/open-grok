@@ -535,6 +535,12 @@ pub trait StorageAdapter: Send + Sync {
         reasoning_effort: Option<Option<ReasoningEffort>>,
     ) -> io::Result<()>;
 
+    async fn update_previous_turn_model(
+        &self,
+        info: &Info,
+        previous_turn_model: crate::session::compaction_config::PreviousModelInfo,
+    ) -> io::Result<()>;
+
     /// Persist the monotonic marker that this session has carried Codex
     /// content. Implementations must never clear an existing marker.
     async fn mark_ever_used_codex(&self, info: &Info) -> io::Result<()>;
@@ -1100,6 +1106,59 @@ fn line_has_event_id(line: &str, cursor_id: &str) -> bool {
     line_event_id(line).as_deref() == Some(cursor_id)
 }
 
+/// Decode an ACP tool update from a persisted envelope. The substring guard
+/// keeps ordinary text and xAI-extension lines off the typed serde path.
+fn persisted_acp_tool_update(line: &str) -> Option<acp::SessionUpdate> {
+    if !line.contains("tool_call") {
+        return None;
+    }
+    let env = serde_json::from_str::<RawLinePeek<'_>>(line).ok()?;
+    if env.method == Some(XAI_SESSION_UPDATE_METHOD) {
+        return None;
+    }
+    let raw = env.params.map(|params| params.get()).unwrap_or(line);
+    let notification = serde_json::from_str::<acp::SessionNotification>(raw).ok()?;
+    match notification.update {
+        update @ (acp::SessionUpdate::ToolCall(_) | acp::SessionUpdate::ToolCallUpdate(_)) => {
+            Some(update)
+        }
+        _ => None,
+    }
+}
+
+/// Find legacy Code Mode transport call ids across the complete surviving
+/// timeline. `exec` and `wait` remain model-history items, but—matching
+/// codex-rs—must never become typed user-facing tool cards.
+fn code_mode_transport_call_ids<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashSet<acp::ToolCallId> {
+    lines
+        .into_iter()
+        .filter_map(persisted_acp_tool_update)
+        .filter_map(|update| match update {
+            acp::SessionUpdate::ToolCall(call)
+                if crate::session::code_mode::is_code_mode_transport_tool(&call.title) =>
+            {
+                Some(call.tool_call_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn line_is_code_mode_transport_update(
+    line: &str,
+    transport_ids: &std::collections::HashSet<acp::ToolCallId>,
+) -> bool {
+    match persisted_acp_tool_update(line) {
+        Some(acp::SessionUpdate::ToolCall(call)) => transport_ids.contains(&call.tool_call_id),
+        Some(acp::SessionUpdate::ToolCallUpdate(update)) => {
+            transport_ids.contains(&update.tool_call_id)
+        }
+        _ => false,
+    }
+}
+
 /// Rewind-filter, resolve the reconnect cursor, drop redundant command catalogs,
 /// and scan `totalTokens`. Pure data processing — no gateway, no async.
 ///
@@ -1117,6 +1176,7 @@ pub(crate) fn prepare_replay_lines<'a>(
             .filter(|l| !l.trim().is_empty())
             .collect(),
     );
+    let code_mode_transport_ids = code_mode_transport_call_ids(filtered.iter().copied());
 
     // Highest `eventId` counter across all live (rewind-filtered) lines, used to
     // re-seed the process-global event counter on resume so post-load live events
@@ -1162,9 +1222,11 @@ pub(crate) fn prepare_replay_lines<'a>(
     let cursor_pos = cursor
         .and_then(|id| filtered.iter().rposition(|l| line_has_event_id(l, id)))
         .filter(|&pos| {
-            let bounded = filtered[pos + 1..]
-                .iter()
-                .all(|l| line_is_available_commands_update(l) || line_event_id(l).is_some());
+            let bounded = filtered[pos + 1..].iter().all(|l| {
+                line_is_available_commands_update(l)
+                    || line_is_code_mode_transport_update(l, &code_mode_transport_ids)
+                    || line_event_id(l).is_some()
+            });
             if !bounded {
                 tracing::warn!(
                     "replay: post-cursor tail contains eventId-less lines; full replay instead"
@@ -1180,7 +1242,9 @@ pub(crate) fn prepare_replay_lines<'a>(
     let mut lines: Vec<&str> = Vec::with_capacity(filtered.len().saturating_sub(start));
     let mut total_live = 0usize;
     for (i, &line) in filtered.iter().enumerate() {
-        if line_is_available_commands_update(line) {
+        if line_is_available_commands_update(line)
+            || line_is_code_mode_transport_update(line, &code_mode_transport_ids)
+        {
             continue;
         }
         total_live += 1;
@@ -1204,11 +1268,31 @@ pub(crate) fn prepare_replay_lines<'a>(
 /// reconnect cursor); the initial replay path is [`prepare_replay_lines`], which
 /// additionally resolves a cursor (and so must see ACUs) before dropping them.
 pub(crate) fn filter_delta_replay_lines(contents: &str) -> Vec<&str> {
+    filter_delta_replay_lines_with_prior(contents, "")
+}
+
+/// Delta replay variant that scans the already-forwarded prefix for hidden
+/// Code Mode transport ids. This prevents an outer terminal update from
+/// leaking when `from_offset` falls between the legacy base `ToolCall` and its
+/// `ToolCallUpdate`.
+pub(crate) fn filter_delta_replay_lines_with_prior<'a>(
+    contents: &'a str,
+    prior_contents: &str,
+) -> Vec<&'a str> {
     let live: Vec<&str> = contents
         .lines()
         .filter(|l| !l.trim().is_empty() && !line_is_available_commands_update(l))
         .collect();
-    filter_rewind_lines(live)
+    let live = filter_rewind_lines(live);
+    let transport_ids = code_mode_transport_call_ids(
+        prior_contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .chain(live.iter().copied()),
+    );
+    live.into_iter()
+        .filter(|line| !line_is_code_mode_transport_update(line, &transport_ids))
+        .collect()
 }
 
 // ============================================================================
@@ -2959,6 +3043,67 @@ mod tests {
         assert!(live[1].contains("a1"));
         assert!(live.iter().all(|l| !l.contains("dead")));
         assert!(live.iter().all(|l| !l.contains("rewind_marker")));
+    }
+
+    #[test]
+    fn replay_hides_code_mode_transport_but_keeps_nested_tool_cards() {
+        let outer = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":"tools.exec_command({cmd:'echo RAW_MARKER'})"}"#,
+            r#"{"eventId":"ev1"}"#,
+        );
+        let nested = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"nested","title":"exec_command","kind":"execute","status":"in_progress","rawInput":{"cmd":"echo hello"}}"#,
+            r#"{"eventId":"ev2"}"#,
+        );
+        let nested_done = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"nested","status":"completed","rawOutput":{"output":"hello"}}"#,
+            r#"{"eventId":"ev3"}"#,
+        );
+        let outer_done = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"outer","status":"completed","rawOutput":{"cell_id":"7","text":"RAW_MARKER"}}"#,
+            r#"{"eventId":"ev4"}"#,
+        );
+        let wait = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"wait-1","title":"wait","kind":"other","status":"completed","rawInput":{"cell_id":"7"},"rawOutput":{"text":"RAW_WAIT"}}"#,
+            r#"{"eventId":"ev5"}"#,
+        );
+        let raw = format!("{outer}\n{nested}\n{nested_done}\n{outer_done}\n{wait}\n");
+
+        let full = prepare_replay_lines(&raw, None);
+        assert_eq!(full.lines.len(), 2);
+        assert_eq!(full.total_live, 2);
+        assert!(full.lines.iter().all(|line| line.contains("nested")));
+        assert!(full.lines.iter().all(|line| !line.contains("RAW_MARKER")));
+        assert!(full.lines.iter().all(|line| !line.contains("RAW_WAIT")));
+
+        // The reconnect cursor lands on the hidden outer base. Its terminal
+        // update still must not leak from the post-cursor slice.
+        let cursor = prepare_replay_lines(&raw, Some("ev1"));
+        assert!(!cursor.mark_replay);
+        assert_eq!(cursor.lines.len(), 2);
+        assert!(cursor.lines.iter().all(|line| line.contains("nested")));
+    }
+
+    #[test]
+    fn delta_replay_seeds_hidden_transport_ids_from_prior_prefix() {
+        let outer = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":"RAW_JS"}"#,
+            r#"{"eventId":"ev1"}"#,
+        );
+        let nested = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"nested","title":"apply_patch","kind":"edit","status":"completed"}"#,
+            r#"{"eventId":"ev2"}"#,
+        );
+        let outer_done = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"outer","status":"completed","rawOutput":{"cell_id":"9","text":"RAW_JS"}}"#,
+            r#"{"eventId":"ev3"}"#,
+        );
+        let delta = format!("{nested}\n{outer_done}\n");
+
+        let live = filter_delta_replay_lines_with_prior(&delta, &outer);
+        assert_eq!(live.len(), 1);
+        assert!(live[0].contains("apply_patch"));
+        assert!(!live[0].contains("RAW_JS"));
     }
 
     #[test]

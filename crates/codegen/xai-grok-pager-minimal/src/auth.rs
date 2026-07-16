@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use xai_grok_pager::app::app_view::AuthState;
+use xai_grok_pager::app::app_view::{AuthState, PrimaryProvider};
 use xai_grok_pager::theme::Theme;
 
 /// What the minimal live region shows when there is no active agent yet: the
@@ -20,11 +20,14 @@ use xai_grok_pager::theme::Theme;
 /// brief "starting" transient once authenticated. Computed from [`AuthState`]
 /// before the draw closure so the closure can own it.
 pub(super) enum MinimalAuthHint {
+    /// Neither selected provider has a usable credential yet.
+    ChooseProvider { error: Option<String> },
     /// Interactive sign-in underway — show the URL (when known) and the device
     /// code (when the URL carries one). Covers device flow and the external
     /// command flow (where the provider opens its own browser; `url` may be
     /// `None`).
     SigningIn {
+        provider: PrimaryProvider,
         url: Option<String>,
         code: Option<String>,
     },
@@ -34,10 +37,27 @@ pub(super) enum MinimalAuthHint {
     Starting,
 }
 
+/// Resolve the owner of the welcome auth flow independently from the active
+/// model provider. Bare `/login` is always xAI—even from a Codex tab—while the
+/// first-launch chooser records its explicit selection.
+pub(super) fn minimal_auth_provider(
+    _active_provider: PrimaryProvider,
+    startup_selection: Option<PrimaryProvider>,
+) -> PrimaryProvider {
+    startup_selection.unwrap_or(PrimaryProvider::Xai)
+}
+
 /// Map the app's [`AuthState`] to what the no-agent live region should show.
-pub(super) fn minimal_auth_hint(auth: &AuthState) -> MinimalAuthHint {
+pub(super) fn minimal_auth_hint(
+    auth: &AuthState,
+    primary_provider: PrimaryProvider,
+) -> MinimalAuthHint {
     match auth {
+        AuthState::ProviderChoice { error } => MinimalAuthHint::ChooseProvider {
+            error: error.clone(),
+        },
         AuthState::Authenticating { auth_url, .. } => MinimalAuthHint::SigningIn {
+            provider: primary_provider,
             url: auth_url.clone(),
             code: auth_url
                 .as_deref()
@@ -48,6 +68,7 @@ pub(super) fn minimal_auth_hint(auth: &AuthState) -> MinimalAuthHint {
         // Login is starting (auto-triggered at startup) — the URL arrives via
         // AuthUrlReady, which flips us to `Authenticating`.
         AuthState::Pending { error: None } => MinimalAuthHint::SigningIn {
+            provider: primary_provider,
             url: None,
             code: None,
         },
@@ -135,13 +156,70 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
         .bg(Color::Reset);
 
     match hint {
-        MinimalAuthHint::SigningIn { url, code } => {
+        MinimalAuthHint::ChooseProvider { error } => {
             y = put_line(
                 buf,
                 area,
                 y,
                 bottom,
-                Line::from(Span::styled("Sign in to Grok", bold)),
+                Line::from(Span::styled("Choose your provider", bold)),
+            );
+            if let Some(error) = error {
+                y = put_line(
+                    buf,
+                    area,
+                    y,
+                    bottom,
+                    Line::from(Span::styled(
+                        error.clone(),
+                        Style::default().fg(theme.warning).bg(Color::Reset),
+                    )),
+                );
+            }
+            y = put_line(buf, area, y, bottom, Line::default());
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(vec![
+                    Span::styled("[c] ", bold),
+                    Span::styled("ChatGPT Codex", gray),
+                ]),
+            );
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(vec![
+                    Span::styled("[x] ", bold),
+                    Span::styled("xAI Grok", gray),
+                ]),
+            );
+            let _ = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(vec![Span::styled("[q] ", bold), Span::styled("Quit", gray)]),
+            );
+        }
+        MinimalAuthHint::SigningIn {
+            provider,
+            url,
+            code,
+        } => {
+            let provider_name = match provider {
+                PrimaryProvider::Codex => "ChatGPT Codex",
+                PrimaryProvider::Xai => "xAI Grok",
+            };
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled(format!("Sign in to {provider_name}"), bold)),
             );
             y = put_line(buf, area, y, bottom, Line::default());
             match url {
@@ -264,8 +342,8 @@ mod tests {
             auth_url: Some("https://accounts.x.ai/device?user_code=ABCD-EFGH".into()),
             mode: AuthMode::Device,
         };
-        match minimal_auth_hint(&st) {
-            MinimalAuthHint::SigningIn { url, code } => {
+        match minimal_auth_hint(&st, PrimaryProvider::Xai) {
+            MinimalAuthHint::SigningIn { url, code, .. } => {
                 assert_eq!(
                     url.as_deref(),
                     Some("https://accounts.x.ai/device?user_code=ABCD-EFGH")
@@ -282,8 +360,8 @@ mod tests {
             auth_url: Some("https://provider.example/login".into()),
             mode: AuthMode::Command,
         };
-        match minimal_auth_hint(&st) {
-            MinimalAuthHint::SigningIn { url, code } => {
+        match minimal_auth_hint(&st, PrimaryProvider::Xai) {
+            MinimalAuthHint::SigningIn { url, code, .. } => {
                 assert_eq!(url.as_deref(), Some("https://provider.example/login"));
                 assert!(code.is_none());
             }
@@ -291,14 +369,62 @@ mod tests {
         }
 
         assert!(matches!(
-            minimal_auth_hint(&AuthState::Done),
+            minimal_auth_hint(
+                &AuthState::ProviderChoice { error: None },
+                PrimaryProvider::Codex,
+            ),
+            MinimalAuthHint::ChooseProvider { error: None }
+        ));
+        assert!(matches!(
+            minimal_auth_hint(&AuthState::Done, PrimaryProvider::Xai),
             MinimalAuthHint::Starting
         ));
         assert!(matches!(
-            minimal_auth_hint(&AuthState::Pending {
-                error: Some("nope".into())
-            }),
+            minimal_auth_hint(
+                &AuthState::Pending {
+                    error: Some("nope".into())
+                },
+                PrimaryProvider::Xai,
+            ),
             MinimalAuthHint::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn active_codex_model_does_not_relabel_an_xai_auth_flow() {
+        let provider = minimal_auth_provider(PrimaryProvider::Codex, None);
+        assert_eq!(provider, PrimaryProvider::Xai);
+        let state = AuthState::Authenticating {
+            request_seq: 3,
+            handle: None,
+            auth_url: Some("https://accounts.x.ai/oauth2/device".into()),
+            mode: xai_grok_pager::app::app_view::AuthMode::Device,
+        };
+        let hint = minimal_auth_hint(&state, provider);
+        assert!(matches!(
+            hint,
+            MinimalAuthHint::SigningIn {
+                provider: PrimaryProvider::Xai,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_session_resume_uses_explicit_codex_auth_label() {
+        let provider = minimal_auth_provider(PrimaryProvider::Xai, Some(PrimaryProvider::Codex));
+        let state = AuthState::Authenticating {
+            request_seq: 4,
+            handle: None,
+            auth_url: None,
+            mode: xai_grok_pager::app::app_view::AuthMode::Command,
+        };
+        assert!(matches!(
+            minimal_auth_hint(&state, provider),
+            MinimalAuthHint::SigningIn {
+                provider: PrimaryProvider::Codex,
+                ..
+            }
         ));
     }
 
@@ -308,6 +434,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 12);
         let mut buf = Buffer::empty(area);
         let hint = MinimalAuthHint::SigningIn {
+            provider: PrimaryProvider::Xai,
             url: Some("https://accounts.x.ai/device?user_code=ABCD-EFGH".into()),
             code: Some("ABCD-EFGH".into()),
         };
@@ -320,12 +447,38 @@ mod tests {
                 }
             }
         }
-        assert!(text.contains("Sign in to Grok"), "header: {text:?}");
+        assert!(text.contains("Sign in to xAI Grok"), "header: {text:?}");
         assert!(text.contains("accounts.x.ai/device"), "url: {text:?}");
         assert!(text.contains("ABCD-EFGH"), "device code: {text:?}");
         assert!(
             text.contains("Waiting for approval"),
             "waiting line: {text:?}"
         );
+    }
+
+    #[test]
+    fn render_auth_names_chatgpt_codex_during_codex_oauth() {
+        let theme = Theme::current();
+        let area = Rect::new(0, 0, 80, 6);
+        let mut buf = Buffer::empty(area);
+        let hint = MinimalAuthHint::SigningIn {
+            provider: PrimaryProvider::Codex,
+            url: None,
+            code: None,
+        };
+        render_auth(&mut buf, area, &theme, &hint);
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+        }
+        assert!(
+            text.contains("Sign in to ChatGPT Codex"),
+            "header: {text:?}"
+        );
+        assert!(!text.contains("Sign in to Grok"), "header: {text:?}");
     }
 }

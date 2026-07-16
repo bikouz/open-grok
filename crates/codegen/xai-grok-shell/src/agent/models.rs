@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 
 use crate::agent::config::{self, ModelEntry, resolve_credentials, sampling_config_for_model};
 use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
-use crate::codex_models::{CodexModelsCatalog, CodexModelsClient};
+use crate::codex_models::{CodexCompactionMetadata, CodexModelsCatalog, CodexModelsClient};
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::sampling::SamplerConfig as SamplingConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -670,6 +670,26 @@ impl ModelsManager {
         let models = self.inner.models.read();
         config::find_model_by_id(&models, model_id)
             .is_some_and(|entry| config::supports_codex_multi_agent_v2(entry.info()))
+    }
+
+    /// Live Codex compaction metadata for a catalog key or routing slug.
+    /// Embedded/offline models deliberately return `None`, retaining the
+    /// historical 90%-of-raw fallback and no hash-triggered compaction.
+    pub(crate) fn codex_compaction_metadata(
+        &self,
+        model_id: &str,
+    ) -> Option<CodexCompactionMetadata> {
+        let routing_slug = {
+            let models = self.inner.models.read();
+            let entry = config::find_model_by_id(&models, model_id)?;
+            (entry.info.provider == xai_grok_sampling_types::ModelProvider::Codex)
+                .then(|| entry.info.model.clone())?
+        };
+        self.inner
+            .codex_catalog
+            .read()
+            .as_ref()
+            .and_then(|catalog| catalog.compaction_metadata(&routing_slug))
     }
 
     pub fn model_compactions_remaining(
@@ -1903,6 +1923,22 @@ pub(crate) fn resolve_default_model(
     resolve_default_model_with_provider_auth(cfg, catalog, is_session_auth, is_session_auth)
 }
 
+/// Resolve only the configured startup preference, without provider-auth
+/// filtering or fallback selection. Initialize metadata uses this same helper
+/// so client-side provider planning cannot drift from the shell's precedence.
+pub(crate) fn resolved_default_model_preference(
+    cfg: &config::Config,
+) -> Option<config::Resolved<String>> {
+    config::resolve_string_flag(
+        cfg.default_model_override.as_deref(),
+        "GROK_DEFAULT_MODEL",
+        cfg.models.default.as_deref(),
+        cfg.remote_settings
+            .as_ref()
+            .and_then(|settings| settings.default_model.as_deref()),
+    )
+}
+
 fn resolve_default_model_with_provider_auth(
     cfg: &config::Config,
     catalog: &IndexMap<String, ModelEntry>,
@@ -1919,14 +1955,7 @@ fn resolve_default_model_with_provider_auth(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let model_pref = config::resolve_string_flag(
-        cfg.default_model_override.as_deref(),
-        "GROK_DEFAULT_MODEL",
-        cfg.models.default.as_deref(),
-        cfg.remote_settings
-            .as_ref()
-            .and_then(|rs| rs.default_model.as_deref()),
-    );
+    let model_pref = resolved_default_model_preference(cfg);
 
     let first_or_fallback = || -> (String, ModelEntry) {
         if let Some((key, first)) = visible.first() {
@@ -2343,6 +2372,16 @@ mod tests {
             "picked non-selectable {}",
             entry.model
         );
+    }
+
+    #[test]
+    fn configured_default_hint_uses_the_default_resolver_precedence() {
+        let mut cfg = config::Config::default();
+        cfg.models.default = Some("configured-model".to_string());
+        cfg.default_model_override = Some("cli-model".to_string());
+        let cli = resolved_default_model_preference(&cfg).unwrap();
+        assert_eq!(cli.value, "cli-model");
+        assert_eq!(cli.source, config::ConfigSource::Cli);
     }
 
     #[test]

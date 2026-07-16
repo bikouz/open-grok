@@ -197,6 +197,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
     };
     let parent_chat_kind = parent.chat_kind || app.chat_mode;
     app.agents.insert(new_id, new_agent);
+    let usage_command_visible = app.usage_command_visible();
     {
         let agent = app
             .agents
@@ -211,7 +212,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
         agent.set_voice_mode_available(app.voice_mode_enabled);
         agent.apply_app_scoped_gates(
             app.sharing_enabled,
-            app.usage_visible,
+            usage_command_visible,
             app.chat_mode,
             app.screen_mode,
             &app.active_announcements,

@@ -1,6 +1,8 @@
 //! Async task-result application: routes task results into state.
 use super::auth::{
-    ensure_login_method, handle_auth_complete, handle_auth_url_ready, handle_mcp_auth_trigger_done,
+    ensure_login_method, handle_auth_complete, handle_auth_url_ready,
+    handle_codex_session_resume_complete, handle_codex_startup_complete,
+    handle_mcp_auth_trigger_done,
 };
 use super::billing::{
     PAYWALL_AUTO_CHECK_TIMEOUT, apply_auto_topup, handle_billing_fetched,
@@ -12,7 +14,9 @@ use super::cta::{
     handle_plugin_cta_catalog_loaded, handle_plugin_cta_debounce_expired,
     handle_plugin_cta_mcps_loaded,
 };
-use super::ctx::{find_agent_by_session_id, get_active_agent_mut};
+use super::ctx::{
+    SwitchCause, find_agent_by_session_id, get_active_agent_mut, show_welcome, switch_to_agent,
+};
 use super::notes::{handle_btw_response, handle_memory_note_saved};
 use super::prompt::{
     defer_to_open_reload_window, handle_compact_complete, handle_prompt_response,
@@ -34,9 +38,9 @@ use super::session::lifecycle::{
     handle_worktree_session_created, handle_worktree_session_failed,
 };
 use super::session::load::{
-    handle_card_detail_loaded, handle_deep_search_results, handle_session_load_failed,
-    handle_session_loaded, handle_session_restore_failed, handle_session_restored,
-    handle_session_search_debounce_expired, remove_session_from_pickers,
+    handle_card_detail_loaded, handle_codex_session_load_auth_required, handle_deep_search_results,
+    handle_session_load_failed, handle_session_loaded, handle_session_restore_failed,
+    handle_session_restored, handle_session_search_debounce_expired, remove_session_from_pickers,
 };
 use super::settings::ui::apply_setting_rollback;
 use super::status::{
@@ -52,7 +56,7 @@ use crate::app::actions::{
     ClipboardPasteCompletion, ClipboardPasteContext, ClipboardPasteFailure, ClipboardPasteTarget,
     Effect, ProbedAttachment, SubagentKillOutcome, TaskResult,
 };
-use crate::app::app_view::{ActiveView, AppView, AuthState};
+use crate::app::app_view::{ActiveView, AppView, AuthState, PrimaryProvider};
 use crate::scrollback::block::RenderBlock;
 use agent_client_protocol as acp;
 pub(super) fn unregister_session_effect(session_id: Option<acp::SessionId>) -> Vec<Effect> {
@@ -87,6 +91,30 @@ fn push_codex_auth_result(
     } else {
         app.show_toast(&message);
     }
+}
+
+/// Apply the catalog returned synchronously with independent Codex login. A
+/// successful live refresh normally broadcasts the same state, but the
+/// cached/embedded fallback path deliberately has no broadcast of its own.
+fn apply_codex_login_models(app: &mut AppView, model_state: acp::SessionModelState) -> Vec<Effect> {
+    let new_models = crate::acp::model_state::ModelState::from(Some(model_state));
+    let shell_fallback_current = new_models.current.clone();
+    let mut app_models = new_models.clone();
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+        && let Some(agent_model) = agent.session.models.current.as_ref()
+        && app_models.available.contains_key(agent_model)
+    {
+        app_models.current = Some(agent_model.clone());
+    }
+    app.models = app_models;
+    for agent in app.agents.values_mut() {
+        agent
+            .session
+            .models
+            .update_catalog(new_models.available.clone(), shell_fallback_current.clone());
+    }
+    app.sync_primary_provider_from_active_agent()
 }
 
 pub(super) const X11_PRIMARY_PASTE_HINT: &str = "Try Shift+Insert to paste selected text";
@@ -261,7 +289,10 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             error,
             silent,
         } => {
-            if !silent && let Some(agent) = app.agents.get_mut(&agent_id) {
+            if app.uses_xai_access_controls()
+                && !silent
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+            {
                 agent.scrollback.push_block(RenderBlock::System(
                     crate::scrollback::blocks::SystemMessageBlock::new(format!(
                         "Billing error: {error}"
@@ -271,8 +302,10 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             vec![]
         }
         TaskResult::AppBillingFetched { balance, autotopup } => {
-            app.credit_balance = balance;
-            apply_auto_topup(&mut app.auto_topup, &autotopup);
+            if app.uses_xai_access_controls() {
+                app.credit_balance = balance;
+                apply_auto_topup(&mut app.auto_topup, &autotopup);
+            }
             vec![]
         }
         TaskResult::GateRefreshed { settings } => handle_gate_refreshed(app, settings),
@@ -310,6 +343,10 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             session_id,
             error,
         } => handle_session_load_failed(app, agent_id, session_id, error),
+        TaskResult::CodexSessionLoadAuthRequired {
+            agent_id,
+            session_id,
+        } => handle_codex_session_load_auth_required(app, agent_id, session_id),
         TaskResult::SessionListLoaded {
             sessions,
             partial,
@@ -577,7 +614,20 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             } = &app.auth_state
                 && *current_seq == request_seq
             {
-                app.auth_state = AuthState::Pending { error: Some(error) };
+                let startup_xai_choice = app.auth_return_view.is_none()
+                    && app.primary_provider == crate::app::app_view::PrimaryProvider::Xai
+                    && app.startup_provider_selection
+                        == Some(crate::app::app_view::PrimaryProvider::Xai);
+                if startup_xai_choice {
+                    app.clear_xai_access_controls();
+                    app.startup_provider_selection = None;
+                    app.auth_state = AuthState::ProviderChoice {
+                        error: Some(format!("xAI Grok login failed: {error}")),
+                    };
+                    app.welcome_menu_index = Some(0);
+                } else {
+                    app.auth_state = AuthState::Pending { error: Some(error) };
+                }
                 app.auth_code_input.clear();
             }
             vec![]
@@ -963,8 +1013,13 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::CreditLimitRecheckComplete { agent_id, meta } => {
             handle_credit_limit_recheck_complete(app, agent_id, meta)
         }
-        TaskResult::LogoutComplete => {
-            app.auth_state = AuthState::Pending { error: None };
+        TaskResult::LogoutComplete {
+            xai_targets,
+            codex_targets,
+            codex_account,
+        } => {
+            app.startup_xai_ready = false;
+            app.startup_xai_auth_meta = None;
             app.access_gate_shown_logged = false;
             app.announcement_cta_impressions_logged.clear();
             app.gate = None;
@@ -973,39 +1028,252 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.login_method_id = None;
             ensure_login_method(app);
             app.auth_clipboard_copied = false;
-            let effects = dispatch_exit_session(app);
+            let active_agent_id = match app.active_view {
+                ActiveView::Agent(id) => Some(id),
+                _ => None,
+            };
+            let active_xai_removed = active_agent_id
+                .is_some_and(|id| xai_targets.iter().any(|target| target.agent_id == id));
+            let mut effects = xai_targets
+                .iter()
+                .filter_map(|target| target.session_id.clone())
+                .map(|session_id| Effect::UnregisterActiveSession { session_id })
+                .collect::<Vec<_>>();
+            if active_xai_removed {
+                let _ = dispatch_exit_session(app);
+            }
+            for target in &xai_targets {
+                super::session::modal::remove_agent_and_cleanup(app, target.agent_id);
+            }
+
+            if let Some(account) = codex_account {
+                // The fallback decision was validated before xAI's logout
+                // broadcast, so models/update ordering cannot change it.
+                app.startup_codex_account = Some(account);
+                app.sync_usage_command_visibility();
+                app.primary_provider = PrimaryProvider::Codex;
+                app.clear_xai_access_controls();
+                app.auth_state = AuthState::Done;
+                let surviving_codex = codex_targets
+                    .iter()
+                    .map(|target| target.agent_id)
+                    .find(|id| app.agents.contains_key(id));
+                if active_xai_removed {
+                    if let Some(id) = surviving_codex {
+                        switch_to_agent(app, id, SwitchCause::Picker);
+                    } else {
+                        show_welcome(app);
+                    }
+                }
+                app.welcome_prompt_focused = app.has_access();
+                app.show_toast("xAI Grok disconnected. ChatGPT Codex remains connected.");
+                return effects;
+            }
+
+            // Neither provider is authenticated. Any snapshotted Codex tabs
+            // are invalid too; close them and return to the side-by-side
+            // provider chooser rather than an xAI-only login state.
+            app.startup_codex_account = None;
+            app.sync_usage_command_visibility();
+            app.codex_resume_auth_pending = false;
+            let active_codex_removed = active_agent_id
+                .is_some_and(|id| codex_targets.iter().any(|target| target.agent_id == id));
+            if active_codex_removed && !active_xai_removed {
+                let _ = dispatch_exit_session(app);
+            }
+            effects.extend(
+                codex_targets
+                    .iter()
+                    .filter_map(|target| target.session_id.clone())
+                    .map(|session_id| Effect::UnregisterActiveSession { session_id }),
+            );
+            for target in &codex_targets {
+                super::session::modal::remove_agent_and_cleanup(app, target.agent_id);
+            }
+            app.primary_provider = PrimaryProvider::Xai;
+            app.clear_xai_access_controls();
+            app.auth_state = AuthState::ProviderChoice {
+                error: Some(
+                    "xAI Grok is disconnected. Sign in to ChatGPT Codex or xAI Grok to continue."
+                        .to_string(),
+                ),
+            };
+            show_welcome(app);
+            app.welcome_menu_index = Some(0);
             app.welcome_prompt_focused = false;
             effects
         }
-        TaskResult::CodexLoginComplete { agent_id, result } => {
-            let message = match result {
-                Ok(account) => {
-                    let mut details = Vec::new();
-                    if let Some(email) = account.email.filter(|value| !value.trim().is_empty()) {
-                        details.push(email);
-                    }
-                    if let Some(plan) = account.plan_type.filter(|value| !value.trim().is_empty()) {
-                        details.push(format!("{plan} plan"));
-                    }
-                    if details.is_empty() {
-                        "OpenAI Codex connected.".to_string()
-                    } else {
-                        format!("OpenAI Codex connected: {}.", details.join(" · "))
-                    }
+        TaskResult::CodexLoginComplete {
+            agent_id,
+            purpose,
+            result,
+            models,
+        } => match purpose {
+            crate::app::actions::CodexLoginPurpose::Independent => {
+                if let Ok(account) = &result {
+                    app.startup_codex_account = Some(account.clone());
+                    app.sync_usage_command_visibility();
                 }
-                Err(error) => format!("OpenAI Codex login failed: {error}"),
-            };
-            push_codex_auth_result(app, agent_id, message);
-            vec![]
-        }
-        TaskResult::CodexLogoutComplete { agent_id, result } => {
+                let effects = if result.is_ok()
+                    && let Some(models) = models
+                {
+                    apply_codex_login_models(app, models)
+                } else {
+                    Vec::new()
+                };
+                let message = match result {
+                    Ok(account) => {
+                        let mut details = Vec::new();
+                        if let Some(email) = account.email.filter(|value| !value.trim().is_empty())
+                        {
+                            details.push(email);
+                        }
+                        if let Some(plan) =
+                            account.plan_type.filter(|value| !value.trim().is_empty())
+                        {
+                            details.push(format!("{plan} plan"));
+                        }
+                        if details.is_empty() {
+                            "OpenAI Codex connected.".to_string()
+                        } else {
+                            format!("OpenAI Codex connected: {}.", details.join(" · "))
+                        }
+                    }
+                    Err(error) => format!("OpenAI Codex login failed: {error}"),
+                };
+                push_codex_auth_result(app, agent_id, message);
+                effects
+            }
+            crate::app::actions::CodexLoginPurpose::Startup { request_seq } => {
+                handle_codex_startup_complete(app, request_seq, result, models)
+            }
+            crate::app::actions::CodexLoginPurpose::SessionResume { request_seq } => {
+                handle_codex_session_resume_complete(app, request_seq, result, models)
+            }
+        },
+        TaskResult::CodexLogoutComplete {
+            agent_id,
+            targets,
+            primary_was_codex,
+            result,
+        } => {
+            let logout_succeeded = result.is_ok();
             let message = match result {
                 Ok(true) => "OpenAI Codex disconnected.".to_string(),
                 Ok(false) => "OpenAI Codex was not connected.".to_string(),
                 Err(error) => format!("OpenAI Codex logout failed: {error}"),
             };
             push_codex_auth_result(app, agent_id, message);
-            vec![]
+            if !logout_succeeded {
+                return vec![];
+            }
+
+            app.startup_codex_account = None;
+            app.sync_usage_command_visibility();
+            app.codex_resume_auth_pending = false;
+            if app.startup_provider_selection == Some(PrimaryProvider::Codex) {
+                app.startup_provider_selection = None;
+            }
+
+            // Codex OAuth is process-global. Remove every Codex-backed tab,
+            // not just the one that issued /logout, so dashboard/tab switching
+            // cannot resurrect a promptable session with revoked credentials.
+            let active_agent_id = match app.active_view {
+                ActiveView::Agent(id) => Some(id),
+                _ => None,
+            };
+            let mut codex_agent_ids = targets
+                .iter()
+                .map(|target| target.agent_id)
+                .collect::<Vec<_>>();
+            let discovered_codex_agent_ids = app
+                .agents
+                .iter()
+                .filter_map(|(id, agent)| {
+                    (PrimaryProvider::for_current_model(&agent.session.models)
+                        == Some(PrimaryProvider::Codex))
+                    .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for id in discovered_codex_agent_ids {
+                if !codex_agent_ids.contains(&id) {
+                    codex_agent_ids.push(id);
+                }
+            }
+            // A legacy/incomplete model state may not carry provider metadata.
+            // If Codex owns the foreground, the invoking/active tab is still
+            // invalidated by the global credential removal.
+            if primary_was_codex
+                && let Some(id) = agent_id.or(active_agent_id)
+                && !codex_agent_ids.contains(&id)
+            {
+                codex_agent_ids.push(id);
+            }
+            let mut effects = targets
+                .iter()
+                .filter_map(|target| {
+                    target
+                        .session_id
+                        .clone()
+                        .map(|session_id| Effect::UnregisterActiveSession { session_id })
+                })
+                .collect::<Vec<_>>();
+            effects.extend(codex_agent_ids.iter().filter_map(|id| {
+                if targets.iter().any(|target| target.agent_id == *id) {
+                    return None;
+                }
+                app.agents
+                    .get(id)
+                    .and_then(|agent| agent.session.session_id.clone())
+                    .map(|session_id| Effect::UnregisterActiveSession { session_id })
+            }));
+            let active_removed = active_agent_id.is_some_and(|id| codex_agent_ids.contains(&id));
+            if active_removed {
+                // Reuse the normal welcome cleanup, but registration teardown
+                // is already emitted exactly once for every removed Codex tab.
+                let _ = dispatch_exit_session(app);
+            }
+            for id in codex_agent_ids {
+                super::session::modal::remove_agent_and_cleanup(app, id);
+            }
+
+            if !primary_was_codex {
+                return effects;
+            }
+
+            if app.startup_xai_ready {
+                effects
+                    .extend(app.switch_primary_provider_with_effects(PrimaryProvider::Xai, None));
+                // This is an already-authenticated provider fallback, not a
+                // first-run login. Keep the startup marker clear so a later
+                // ordinary xAI /login cannot re-enter startup model selection.
+                app.startup_provider_selection = None;
+                app.auth_state = AuthState::Done;
+                app.welcome_prompt_focused = app.has_access();
+                let surviving_xai = app.agents.iter().find_map(|(id, agent)| {
+                    (PrimaryProvider::for_current_model(&agent.session.models)
+                        == Some(PrimaryProvider::Xai))
+                    .then_some(*id)
+                });
+                if let Some(id) = surviving_xai {
+                    switch_to_agent(app, id, SwitchCause::Picker);
+                } else {
+                    show_welcome(app);
+                }
+                app.show_toast("ChatGPT Codex disconnected. xAI Grok remains connected.");
+            } else {
+                show_welcome(app);
+                app.clear_xai_access_controls();
+                app.auth_state = AuthState::ProviderChoice {
+                    error: Some(
+                        "ChatGPT Codex is disconnected. Sign in to ChatGPT Codex or xAI Grok to continue."
+                            .to_string(),
+                    ),
+                };
+                app.welcome_menu_index = Some(0);
+                app.welcome_prompt_focused = false;
+            }
+            effects
         }
         TaskResult::DeepSearchResults { results, seq } => {
             handle_deep_search_results(app, results, seq)

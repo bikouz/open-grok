@@ -1027,6 +1027,37 @@ fn harnesses_are_compatible_rejects_strict_mismatches() {
     assert!(harnesses_are_compatible("codex", "codex"));
     assert!(!harnesses_are_compatible("grok-build-plan", "codex"));
 }
+
+/// Provider changes after a completed turn rebuild the provider-specific
+/// harness in place instead of forcing the user to abandon the session.
+#[test]
+fn post_turn_cross_provider_switches_plan_history_preserving_rebuilds() {
+    for (active, required) in [
+        ("grok-build-plan", "codex"),
+        ("codex", "grok-build-plan"),
+    ] {
+        assert_eq!(
+            plan_harness_switch(Some(active), required, 7),
+            HarnessSwitchPlan::Rebuild {
+                has_prior_turns: true,
+            },
+            "{active} -> {required} must rebuild without rejecting prior history",
+        );
+    }
+}
+
+#[test]
+fn compatible_model_switch_keeps_existing_harness_after_turns() {
+    assert_eq!(
+        plan_harness_switch(Some("remote-sidebar"), "grok-build-plan", 7),
+        HarnessSwitchPlan::Keep,
+        "stock-family switches must preserve a client-supplied harness",
+    );
+    assert_eq!(
+        plan_harness_switch(Some("codex"), "codex", 7),
+        HarnessSwitchPlan::Keep,
+    );
+}
 #[test]
 fn explicit_agent_type_wins_over_session_default() {
     assert_eq!(

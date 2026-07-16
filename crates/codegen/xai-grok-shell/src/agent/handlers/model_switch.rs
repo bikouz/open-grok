@@ -3,7 +3,8 @@
 //! (`new_session`, `load_session`) call `apply` directly.
 use crate::agent::config;
 use crate::agent::mvp_agent::{
-    MvpAgent, agent_name_after_model_switch, harnesses_are_compatible, resolve_required_agent_type,
+    HarnessSwitchPlan, MvpAgent, agent_name_after_model_switch, plan_harness_switch,
+    resolve_required_agent_type,
 };
 use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
@@ -40,7 +41,7 @@ pub(crate) async fn apply(
     let required_agent_type =
         resolve_required_agent_type(Some(model.info().agent_type.as_str()), session_default);
     let previous_model_id = handle.model_id.0.clone();
-    let mut pending_rebuild_definition: Option<xai_grok_agent::AgentDefinition> = None;
+    let mut pending_rebuild: Option<(xai_grok_agent::AgentDefinition, bool)> = None;
     {
         let required = &required_agent_type;
         let turn_count = handle
@@ -54,39 +55,14 @@ pub(crate) async fn apply(
             responds_to: agent_tx,
         });
         let active_agent_type = agent_rx.await.ok().flatten();
-        let is_mismatch = active_agent_type
-            .as_ref()
-            .is_some_and(|active| !harnesses_are_compatible(active, required));
+        let harness_plan = plan_harness_switch(active_agent_type.as_deref(), required, turn_count);
+        let requires_rebuild = matches!(harness_plan, HarnessSwitchPlan::Rebuild { .. });
         tracing::info!(
             session_id = % session_id.0, model_id = % model_id.0, ? required_agent_type,
-            ? active_agent_type, turn_count, is_mismatch,
+            ? active_agent_type, turn_count, requires_rebuild,
             "set_session_model: agent type compatibility check"
         );
-        if is_mismatch && turn_count > 0 {
-            tracing::warn!(
-                session_id = % session_id.0, model_id = % model_id.0, active_agent = ?
-                active_agent_type, required_agent = % required, turn_count,
-                "set_session_model: agent type mismatch rejected"
-            );
-            xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
-                session_id: session_id.0.to_string(),
-                previous_model_id: previous_model_id.to_string(),
-                new_model_id: model_id.0.to_string(),
-                success: false,
-                error_code: Some(config::MODEL_SWITCH_INCOMPATIBLE_AGENT.to_string()),
-                required_agent_type: Some(required.clone()),
-                current_agent_type: active_agent_type.clone(),
-            });
-            let err_payload = config::ModelSwitchIncompatibleAgentError {
-                code: config::MODEL_SWITCH_INCOMPATIBLE_AGENT.to_string(),
-                active_agent_type: active_agent_type.unwrap_or_else(|| "unknown".to_owned()),
-                required_agent_type: required.clone(),
-                model_id: model_id.0.to_string(),
-                suggestion: "start_new_session".to_string(),
-            };
-            return Err(err_payload.into_acp_error());
-        }
-        if is_mismatch && turn_count == 0 {
+        if let HarnessSwitchPlan::Rebuild { has_prior_turns } = harness_plan {
             let cwd = handle.tool_context.cwd.as_path();
             let resolved = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
                 required,
@@ -98,16 +74,32 @@ pub(crate) async fn apply(
                     tracing::info!(
                         session_id = % session_id.0, model_id = % model_id.0,
                         required_agent_type = % required, agent_def_name = % def.name,
-                        "set_session_model: zero-turn harness switch — queued agent rebuild"
+                        has_prior_turns,
+                        "set_session_model: provider harness switch — queued agent rebuild"
                     );
-                    pending_rebuild_definition = Some(def);
+                    pending_rebuild = Some((def, has_prior_turns));
                 }
                 None => {
-                    tracing::warn!(
+                    tracing::error!(
                         session_id = % session_id.0, model_id = % model_id.0,
                         required_agent_type = % required,
-                        "set_session_model: zero-turn harness switch — could not resolve agent definition; proceeding with stale harness"
+                        has_prior_turns,
+                        "set_session_model: required provider harness could not be resolved"
                     );
+                    xai_grok_telemetry::session_ctx::log_event(
+                        xai_grok_telemetry::events::ModelSwitched {
+                            session_id: session_id.0.to_string(),
+                            previous_model_id: previous_model_id.to_string(),
+                            new_model_id: model_id.0.to_string(),
+                            success: false,
+                            error_code: Some(config::MODEL_SWITCH_REBUILD_FAILED.to_string()),
+                            required_agent_type: Some(required.clone()),
+                            current_agent_type: active_agent_type.clone(),
+                        },
+                    );
+                    return Err(acp::Error::internal_error().data(format!(
+                        "model switch requires unavailable harness `{required}`"
+                    )));
                 }
             }
         }
@@ -141,14 +133,27 @@ pub(crate) async fn apply(
             session_id = % session_id.0, model_id = % model_id.0,
             "set_session_model: gateway gate closed, prompt override suppressed"
         );
-        pending_rebuild_definition = None;
+        if pending_rebuild.is_some() {
+            xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
+                session_id: session_id.0.to_string(),
+                previous_model_id: previous_model_id.to_string(),
+                new_model_id: model_id.0.to_string(),
+                success: false,
+                error_code: Some(config::MODEL_SWITCH_REBUILD_FAILED.to_string()),
+                required_agent_type: Some(required_agent_type.clone()),
+                current_agent_type: None,
+            });
+            return Err(acp::Error::internal_error()
+                .data("provider harness cannot be rebuilt while session replay is still loading"));
+        }
     }
-    let did_rebuild = if let Some(def) = pending_rebuild_definition {
+    let did_rebuild = if let Some((def, preserve_history)) = pending_rebuild {
         let (rebuild_tx, rebuild_rx) = oneshot::channel();
         let _ = handle
             .cmd_tx
             .send(SessionCommand::RebuildAgentForDefinition {
                 definition: def,
+                preserve_history,
                 responds_to: rebuild_tx,
             });
         let rebuild_result = rebuild_rx
@@ -159,7 +164,7 @@ pub(crate) async fn apply(
             Err(e) => {
                 tracing::error!(
                     session_id = % session_id.0, model_id = % model_id.0, error = ? e,
-                    "set_session_model: zero-turn harness rebuild failed; aborting model switch"
+                    "set_session_model: provider harness rebuild failed; aborting model switch"
                 );
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::ModelSwitched {

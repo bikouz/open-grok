@@ -722,6 +722,7 @@ impl JsonlStorageAdapter {
             num_messages,
             num_chat_messages,
             current_model_id: target_model_id,
+            previous_turn_model: source_summary.previous_turn_model,
             ever_used_codex: source_summary.ever_used_codex,
             parent_session_id: options.parent_session_id,
             forked_at: Some(chrono::Utc::now()),
@@ -983,6 +984,20 @@ impl StorageAdapter for JsonlStorageAdapter {
                     agent_name: agent_name.map(String::from),
                     reasoning_effort,
                 }),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    async fn update_previous_turn_model(
+        &self,
+        info: &Info,
+        previous_turn_model: crate::session::compaction_config::PreviousModelInfo,
+    ) -> io::Result<()> {
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                previous_turn_model: Some(previous_turn_model),
                 ..Default::default()
             },
         )

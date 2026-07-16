@@ -913,6 +913,382 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
+    use std::sync::Mutex;
+
+    let captured: Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let replayed: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let replayed_handler = Arc::clone(&replayed);
+    let compact_output = json!([
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "retained user context"}]
+        },
+        {
+            "type": "compaction",
+            "encrypted_content": "opaque-server-summary"
+        }
+    ]);
+    let response_output = compact_output.clone();
+    let app = Router::new()
+        .route(
+            "/v1/responses/compact",
+            post(
+                move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_handler);
+                    let output = response_output.clone();
+                    async move {
+                        captured.lock().unwrap().push((headers, body));
+                        axum::Json(json!({"output": output}))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/responses",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let replayed = Arc::clone(&replayed_handler);
+                async move {
+                    replayed.lock().unwrap().push(body);
+                    let response = sse::responses_api_reasoning_and_text_events(
+                        "continued",
+                        "answer",
+                        "gpt-5.6-sol",
+                    )
+                    .into_iter()
+                    .find_map(|event| {
+                        let payload =
+                            serde_json::from_str::<serde_json::Value>(&event.data).ok()?;
+                        (payload.get("type").and_then(serde_json::Value::as_str)
+                            == Some("response.completed"))
+                        .then(|| payload["response"].clone())
+                    })
+                    .expect("fixture must contain a completed response");
+                    axum::Json(response)
+                }
+            }),
+        );
+    let server = MockServer::spawn(app).await;
+    let mut config = responses_config(server.base_url(), None);
+    config.provider = ModelProvider::Codex;
+    config.model = "gpt-5.6-sol".into();
+    config
+        .extra_headers
+        .insert("originator".into(), "codex_cli_rs".into());
+    config
+        .extra_headers
+        .insert("chatgpt-account-id".into(), "acct_test".into());
+    config
+        .extra_headers
+        .insert("x-openai-fedramp".into(), "false".into());
+
+    let client = SamplingClient::new(config).expect("Codex sampling client should construct");
+    let replacement = client
+        .compact_codex_conversation(user_request("history to compact"), "base instructions")
+        .await
+        .expect("Codex compact request should complete");
+    let replay_request = ConversationRequest::from_items(replacement);
+    let replay = replay_request.raw_codex_input_replacements();
+    client
+        .conversation_responses(replay_request)
+        .await
+        .expect("the exact compacted history should be accepted on the next Codex turn");
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1, "compact must be one unary request");
+    let (headers, body) = &captured[0];
+    assert_eq!(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer test-key")
+    );
+    assert_eq!(
+        headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("acct_test")
+    );
+    assert_eq!(
+        headers
+            .get("x-openai-fedramp")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        headers
+            .get("originator")
+            .and_then(|value| value.to_str().ok()),
+        Some("codex_cli_rs")
+    );
+    assert_eq!(body["model"], "gpt-5.6-sol");
+    assert_eq!(body["instructions"], "base instructions");
+    assert_eq!(body["parallel_tool_calls"], true);
+    assert!(body["input"].is_array());
+    for forbidden in [
+        "store",
+        "stream",
+        "include",
+        "temperature",
+        "max_output_tokens",
+    ] {
+        assert!(
+            body.get(forbidden).is_none(),
+            "unexpected {forbidden}: {body}"
+        );
+    }
+
+    assert_eq!(
+        replay
+            .into_iter()
+            .map(|replacement| replacement.value)
+            .collect::<Vec<_>>(),
+        compact_output.as_array().unwrap().clone(),
+        "the next Codex turn must receive the exact ordered replacement history"
+    );
+    let replayed = replayed.lock().unwrap();
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(
+        replayed[0]["input"], compact_output,
+        "the normal Responses transport must splice the exact compact output, not typed placeholders"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_turn_state_replays_across_responses_and_compact_then_resets() {
+    use std::sync::Mutex;
+
+    const TURN_STATE: &str = "x-codex-turn-state";
+    let response_headers: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let response_headers_handler = Arc::clone(&response_headers);
+    let compact_headers: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let compact_headers_handler = Arc::clone(&compact_headers);
+
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post(
+                move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                    let response_headers = Arc::clone(&response_headers_handler);
+                    async move {
+                        response_headers.lock().unwrap().push(
+                            headers
+                                .get(TURN_STATE)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                        );
+                        let events = sse::responses_api_reasoning_and_text_events(
+                            "routing",
+                            "ok",
+                            "gpt-5.6-sol",
+                        );
+                        let mut response = if body
+                            .get("stream")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            Sse::new(stream::iter(
+                                sse_events_to_axum(events)
+                                    .into_iter()
+                                    .map(Ok::<_, std::convert::Infallible>),
+                            ))
+                            .into_response()
+                        } else {
+                            let completed = events
+                                .into_iter()
+                                .find_map(|event| {
+                                    let payload =
+                                        serde_json::from_str::<serde_json::Value>(&event.data)
+                                            .ok()?;
+                                    (payload.get("type").and_then(serde_json::Value::as_str)
+                                        == Some("response.completed"))
+                                    .then(|| payload["response"].clone())
+                                })
+                                .expect("fixture must contain a completed response");
+                            axum::Json(completed).into_response()
+                        };
+                        response
+                            .headers_mut()
+                            .insert(TURN_STATE, "response-state".parse().unwrap());
+                        response
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move |headers: HeaderMap| {
+                let compact_headers = Arc::clone(&compact_headers_handler);
+                async move {
+                    compact_headers.lock().unwrap().push(
+                        headers
+                            .get(TURN_STATE)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    );
+                    let mut response = axum::Json(json!({
+                        "output": [{
+                            "type": "compaction",
+                            "encrypted_content": "opaque-summary"
+                        }]
+                    }))
+                    .into_response();
+                    response
+                        .headers_mut()
+                        .insert(TURN_STATE, "compact-state".parse().unwrap());
+                    response
+                }
+            }),
+        );
+    let server = MockServer::spawn(app).await;
+    let mut config = responses_config(server.base_url(), None);
+    config.provider = ModelProvider::Codex;
+    config.model = "gpt-5.6-sol".into();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config.clone(), RetryPolicy::default(), event_tx);
+
+    // A successful Responses SSE seeds the turn; compact and later Responses
+    // calls replay that first value even when compact returns a different one.
+    handle.begin_codex_turn();
+    handle
+        .submit_and_collect(RequestId::from("turn-a-1"), user_request("first"))
+        .await
+        .expect("first response should complete");
+    SamplingClient::new_with_codex_turn_state(config.clone(), handle.codex_turn_state())
+        .expect("turn-scoped Codex client should construct")
+        .compact_codex_conversation(user_request("compact a"), "instructions")
+        .await
+        .expect("compact should complete");
+    handle
+        .submit_and_collect(RequestId::from("turn-a-2"), user_request("continue"))
+        .await
+        .expect("continuation should complete");
+
+    // Compact can also be the first successful request and seed sampling.
+    handle.begin_codex_turn();
+    SamplingClient::new_with_codex_turn_state(config.clone(), handle.codex_turn_state())
+        .expect("fresh turn-scoped Codex client should construct")
+        .compact_codex_conversation(user_request("compact b"), "instructions")
+        .await
+        .expect("pre-turn compact should complete");
+    handle
+        .submit_and_collect(RequestId::from("turn-b-1"), user_request("after compact"))
+        .await
+        .expect("post-compact response should complete");
+
+    // A new logical turn starts empty. Even if its state becomes populated,
+    // attaching that cell to an xAI client must never put the Codex header on
+    // the wire.
+    handle.begin_codex_turn();
+    handle
+        .submit_and_collect(RequestId::from("turn-c-1"), user_request("new turn"))
+        .await
+        .expect("new-turn response should complete");
+    let mut xai_config = config;
+    xai_config.provider = ModelProvider::Xai;
+    SamplingClient::new_with_codex_turn_state(xai_config, handle.codex_turn_state())
+        .expect("xAI client should construct")
+        .conversation_responses(user_request("provider isolation"))
+        .await
+        .expect("xAI Responses request should complete");
+    server.shutdown();
+
+    assert_eq!(
+        compact_headers.lock().unwrap().as_slice(),
+        &[Some("response-state".into()), None],
+        "compact must inherit Responses state and may seed an empty turn"
+    );
+    assert_eq!(
+        response_headers.lock().unwrap().as_slice(),
+        &[
+            None,
+            Some("response-state".into()),
+            Some("compact-state".into()),
+            None,
+            None,
+        ],
+        "state must persist only within one Codex turn and never reach xAI"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_turn_state_survives_http1_retry_client_rebuild() {
+    use std::sync::Mutex;
+
+    const TURN_STATE: &str = "x-codex-turn-state";
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts_handler = Arc::clone(&attempts);
+    let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap| {
+            let attempts = Arc::clone(&attempts_handler);
+            let captured = Arc::clone(&captured_handler);
+            async move {
+                captured.lock().unwrap().push(
+                    headers
+                        .get(TURN_STATE)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
+                );
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 1 {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "temporary failure")
+                        .into_response();
+                }
+                let events = sse_events_to_axum(sse::responses_api_reasoning_and_text_events(
+                    "routing",
+                    "ok",
+                    "gpt-5.6-sol",
+                ));
+                let mut response = Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+                .into_response();
+                response
+                    .headers_mut()
+                    .insert(TURN_STATE, "response-state".parse().unwrap());
+                response
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let mut config = responses_config(server.base_url(), None);
+    config.provider = ModelProvider::Codex;
+    config.model = "gpt-5.6-sol".into();
+    config.max_retries = Some(2);
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+    handle.begin_codex_turn();
+
+    handle
+        .submit_and_collect(RequestId::from("seed-state"), user_request("seed"))
+        .await
+        .expect("state-seeding response should complete");
+    handle
+        .submit_and_collect(RequestId::from("rebuild-client"), user_request("retry"))
+        .await
+        .expect("HTTP/1 retry should complete");
+    server.shutdown();
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        captured.lock().unwrap().as_slice(),
+        &[
+            None,
+            Some("response-state".into()),
+            Some("response-state".into()),
+        ],
+        "the rebuilt HTTP/1 client must retain the current turn's state"
+    );
+}
+
 /// Server-reported doom-loop triggers flow through the actor rung onto the
 /// completed response, without retries. The trigger is non-confident
 /// (`@response` channel), so the recovery — which resamples only confident

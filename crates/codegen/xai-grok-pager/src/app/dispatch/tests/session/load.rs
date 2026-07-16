@@ -1,5 +1,16 @@
 //! Tests for session loading, restore, pickers, and deep search.
 use super::*;
+
+fn loaded_provider_models(model: &str, provider: &str) -> acp::SessionModelState {
+    let model_id = acp::ModelId::new(model.to_string());
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!(provider));
+    acp::SessionModelState::new(
+        model_id.clone(),
+        vec![acp::ModelInfo::new(model_id, model.to_string()).meta(Some(meta))],
+    )
+}
+
 #[test]
 fn follow_up_chip_bypasses_project_picker() {
     let mut app = test_app_with_agent();
@@ -96,6 +107,46 @@ fn session_loaded_with_restore_shows_summary_in_scrollback() {
         app.agents[&id].session.restore_degree,
         Some(xai_grok_workspace::session::git::RestoreDegree::Full),
         "SessionLoaded must store restore_degree on the session"
+    );
+}
+
+#[test]
+fn session_loaded_reanchors_provider_and_skips_xai_billing_for_codex() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("codex-resume".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    app.primary_provider = PrimaryProvider::Xai;
+    app.team_id = Some("xai-team".into());
+    app.gate = Some(xai_grok_shell::auth::GateInfo {
+        message: "xAI subscription required".into(),
+        url: None,
+        label: None,
+    });
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionLoaded {
+            agent_id: id,
+            session_id: acp::SessionId::new("codex-resume"),
+            models: Some(loaded_provider_models("gpt-5.6-sol", "codex")),
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            running_prompt_id: None,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+    assert!(app.gate.is_none());
+    assert!(app.team_id.is_none());
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::FetchBilling { .. })),
+        "Codex resume must not schedule xAI billing: {effects:?}"
     );
 }
 /// Title hydration for an auto-generated title keeps today's behavior:
@@ -598,6 +649,119 @@ fn session_load_failed_clears_flag_no_fetches() {
     );
     assert_eq!(count_extension_fetches(&effects), 0);
     assert!(!app.agents[&id].pending_extensions_fetch);
+}
+
+#[test]
+fn codex_session_load_auth_required_runs_oauth_then_retries_exact_session() {
+    let mut app = test_app();
+    app.startup_xai_ready = true;
+    app.primary_provider = PrimaryProvider::Xai;
+    app.startup_model_override = Some(acp::ModelId::new("grok-build"));
+    let cwd = PathBuf::from("/tmp/codex-resume");
+    let _ = dispatch(
+        Action::LoadSession("codex-session".into(), Some(cwd.clone()), false),
+        &mut app,
+    );
+    let id = AgentId(0);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexSessionLoadAuthRequired {
+            agent_id: id,
+            session_id: acp::SessionId::new("codex-session"),
+        }),
+        &mut app,
+    );
+
+    assert!(
+        !app.agents.contains_key(&id),
+        "inert placeholder must be removed"
+    );
+    assert!(matches!(app.active_view, ActiveView::Welcome));
+    assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+    assert!(app.startup_xai_ready, "xAI credentials stay independent");
+    assert!(matches!(
+        app.auth_state,
+        AuthState::Authenticating { request_seq: 1, .. }
+    ));
+    assert!(matches!(
+        app.deferred_startup.session.as_ref(),
+        Some(crate::app::session_startup::DeferredSessionStartup::Load {
+            session_id,
+            session_cwd: Some(saved_cwd),
+            chat_kind: false,
+        }) if session_id == "codex-session" && saved_cwd == &cwd
+    ));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::UnregisterActiveSession { session_id }
+            if session_id.0.as_ref() == "codex-session"
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LoginCodex {
+            agent_id: None,
+            purpose: CodexLoginPurpose::SessionResume { request_seq: 1 },
+        }
+    )));
+
+    let failed_effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: None,
+            purpose: CodexLoginPurpose::SessionResume { request_seq: 1 },
+            result: Err("browser cancelled".into()),
+            models: None,
+        }),
+        &mut app,
+    );
+    assert!(failed_effects.is_empty());
+    assert!(app.codex_resume_auth_pending);
+    assert!(matches!(app.auth_state, AuthState::ProviderChoice { .. }));
+    let retry_effects = dispatch(Action::ChooseStartupCodex, &mut app);
+    assert!(retry_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LoginCodex {
+            agent_id: None,
+            purpose: CodexLoginPurpose::SessionResume { request_seq: 2 },
+        }
+    )));
+
+    let codex_model = acp::ModelId::new("gpt-5.6-sol");
+    let mut model_meta = acp::Meta::new();
+    model_meta.insert("provider".to_string(), serde_json::json!("codex"));
+    let models = acp::SessionModelState::new(
+        codex_model.clone(),
+        vec![acp::ModelInfo::new(codex_model, "GPT-5.6 Sol".to_string()).meta(Some(model_meta))],
+    );
+    let resume_effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: None,
+            purpose: CodexLoginPurpose::SessionResume { request_seq: 2 },
+            result: Ok(xai_grok_shell::codex_auth::CodexAccountSummary {
+                email: None,
+                account_id: Some("acct".into()),
+                plan_type: Some("Plus".into()),
+            }),
+            models: Some(models),
+        }),
+        &mut app,
+    );
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert!(app.startup_model_override.is_none());
+    assert!(!resume_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::PersistSetting {
+            key: "default_model",
+            ..
+        }
+    )));
+    assert!(resume_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LoadSession {
+            session_id,
+            session_cwd: Some(saved_cwd),
+            ..
+        } if session_id == "codex-session" && saved_cwd == &cwd
+    )));
 }
 #[test]
 fn load_session_seeds_available_commands_from_bootstrap() {

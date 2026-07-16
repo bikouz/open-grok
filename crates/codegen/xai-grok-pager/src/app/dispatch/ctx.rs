@@ -120,7 +120,9 @@ pub(super) fn show_welcome(app: &mut AppView) {
 pub(super) fn restore_auth_return_view(app: &mut AppView, return_view: ActiveView) {
     match return_view {
         ActiveView::Agent(id) if app.agents.contains_key(&id) => {
-            app.active_view = ActiveView::Agent(id)
+            app.active_view = ActiveView::Agent(id);
+            let effects = app.sync_primary_provider_from_active_agent();
+            app.pending_effects.extend(effects);
         }
         ActiveView::AgentDashboard => {
             app.active_view = ActiveView::AgentDashboard;
@@ -194,6 +196,14 @@ pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, _cause: Switch
         return;
     }
     app.active_view = ActiveView::Agent(target);
+    // A placeholder created before `session/new` has no authoritative model
+    // yet; preserve the planned startup provider until the create response.
+    // Bound-session tab switches, however, must immediately re-anchor global
+    // provider access state to the tab's actual model.
+    if app.agents[&target].session.session_id.is_some() {
+        let effects = app.sync_primary_provider_from_active_agent();
+        app.pending_effects.extend(effects);
+    }
     // Re-anchor the global permission-mode mirror to the now-active agent so the
     // cycle's `sync_active_auto_flag` (which derives from the global) can't copy a
     // different agent's stale Auto/Always-Approve onto this one. Per-session

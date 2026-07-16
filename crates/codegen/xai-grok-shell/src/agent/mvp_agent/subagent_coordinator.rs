@@ -362,9 +362,7 @@ impl MvpAgent {
                 ps.map(|h| h.agent_name.clone()),
                 ps.map(|h| h.managed_mcp_proxy_base_url.clone()),
                 ps.map(|h| h.feedback_manager.provider_boundary())
-                    .unwrap_or_else(|| {
-                        crate::session::persistence::ProviderBoundary::new(true)
-                    }),
+                    .unwrap_or_else(|| crate::session::persistence::ProviderBoundary::new(true)),
                 ps.map(|h| h.persistence_tx.clone()),
             )
         };

@@ -1138,6 +1138,7 @@ pub(crate) async fn spawn_session_actor(
         }
     };
     let doom_loop_recovery = effective_config.resolve_doom_loop_recovery();
+    let previous_turn_model = startup_hints.previous_turn_model.take();
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         session_info: session_info.clone(),
         auth_method_id,
@@ -1175,7 +1176,7 @@ pub(crate) async fn spawn_session_actor(
             context_window_override,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-            previous_model: std::cell::Cell::new(None),
+            previous_model: std::cell::Cell::new(previous_turn_model),
             compaction_mode,
             verbatim_input: compaction_verbatim_input,
             prefire: crate::session::compaction_config::PrefireState::default(),

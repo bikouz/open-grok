@@ -54,6 +54,13 @@ pub struct AcpConnection {
     pub rx: AcpClientRx,
     /// Available models and current selection.
     pub models: ModelState,
+    /// Provider lookup for the full configured catalog, including models that
+    /// are currently hidden only because their provider OAuth is missing.
+    pub model_providers: std::collections::HashMap<String, String>,
+    /// Configured startup model resolved before provider-auth visibility. This
+    /// lets startup route to Codex OAuth when the desired Codex model is absent
+    /// from the auth-filtered `modelState`.
+    pub configured_default_model: Option<acp::ModelId>,
     /// Whether the agent is a grok-shell instance.
     pub is_grok_shell: bool,
     /// Auth methods advertised by the agent.
@@ -197,6 +204,8 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
     // Initialize
     let (
         models,
+        model_providers,
+        configured_default_model,
         is_grok_shell,
         auth_methods,
         default_auth_method_id,
@@ -225,6 +234,8 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         tx,
         rx,
         models,
+        model_providers,
+        configured_default_model,
         is_grok_shell,
         auth_methods,
         cancel: spawned.cancel,
@@ -310,6 +321,8 @@ pub async fn connect_via_leader(
 
     let (
         models,
+        model_providers,
+        configured_default_model,
         is_grok_shell,
         auth_methods,
         default_auth_method_id,
@@ -351,6 +364,8 @@ pub async fn connect_via_leader(
         tx,
         rx,
         models,
+        model_providers,
+        configured_default_model,
         is_grok_shell,
         auth_methods,
         cancel: bridge.cancel,
@@ -478,12 +493,43 @@ pub fn parse_default_auth_method_id(meta: Option<&acp::Meta>) -> Option<acp::Aut
         .map(|s| acp::AuthMethodId::new(s.to_owned()))
 }
 
+/// Parse the shell's auth-unfiltered model/provider lookup. Values are plain
+/// provider labels (`xai` or `codex`); malformed entries are ignored so older
+/// or third-party ACP agents safely fall back to the visible model catalog.
+pub fn parse_model_providers(
+    meta: Option<&acp::Meta>,
+) -> std::collections::HashMap<String, String> {
+    meta.and_then(|m| m.get("modelProviders"))
+        .and_then(serde_json::Value::as_object)
+        .map(|providers| {
+            providers
+                .iter()
+                .filter_map(|(model, provider)| {
+                    provider
+                        .as_str()
+                        .map(|provider| (model.clone(), provider.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the shell's auth-unfiltered configured startup preference.
+pub fn parse_configured_default_model(meta: Option<&acp::Meta>) -> Option<acp::ModelId> {
+    meta.and_then(|m| m.get("configuredDefaultModel"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| acp::ModelId::new(value.to_owned()))
+}
+
 /// Send InitializeRequest and parse the response.
 async fn initialize(
     tx: &AcpAgentTx,
     flags: &ConnectFlags,
 ) -> Result<(
     ModelState,
+    std::collections::HashMap<String, String>,
+    Option<acp::ModelId>,
     bool,
     Vec<acp::AuthMethod>,
     Option<acp::AuthMethodId>,
@@ -519,6 +565,8 @@ async fn initialize(
         .and_then(|m| m.get("modelState"))
         .and_then(|v| serde_json::from_value::<acp::SessionModelState>(v.clone()).ok())
         .into();
+    let model_providers = parse_model_providers(resp.meta.as_ref());
+    let configured_default_model = parse_configured_default_model(resp.meta.as_ref());
 
     // Parse available commands from response meta (shell builtins + skills).
     // These seed the slash command registry so autocomplete works immediately.
@@ -536,6 +584,8 @@ async fn initialize(
 
     Ok((
         models,
+        model_providers,
+        configured_default_model,
         is_grok_shell,
         resp.auth_methods,
         default_auth_method_id,
@@ -807,6 +857,42 @@ mod tests {
         });
         let cmds = parse_available_commands(meta.as_object());
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn parse_model_providers_keeps_auth_hidden_provider_lookup() {
+        let meta = serde_json::json!({
+            "configuredDefaultModel": "gpt-5.6-sol",
+            "modelProviders": {
+                "gpt-5.6-sol": "codex",
+                "grok-build": "xai",
+                "bad": 42
+            }
+        });
+        let providers = parse_model_providers(meta.as_object());
+        assert_eq!(
+            providers.get("gpt-5.6-sol").map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(providers.get("grok-build").map(String::as_str), Some("xai"));
+        assert!(!providers.contains_key("bad"));
+        assert_eq!(
+            parse_configured_default_model(meta.as_object())
+                .as_ref()
+                .map(|model| model.0.as_ref()),
+            Some("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn parse_configured_default_model_rejects_missing_blank_or_non_string() {
+        for meta in [
+            serde_json::json!({}),
+            serde_json::json!({ "configuredDefaultModel": "  " }),
+            serde_json::json!({ "configuredDefaultModel": 42 }),
+        ] {
+            assert!(parse_configured_default_model(meta.as_object()).is_none());
+        }
     }
 
     #[test]

@@ -30,11 +30,52 @@ use xai_chat_state::compaction_utils::{
     prepare_conversation_for_verbatim_summarization, sanitize_compacted_history,
     validate_compacted_history,
 };
+use xai_grok_sampling_types::ModelProvider;
 use xai_grok_sampling_types::{ApiBackend, ConversationItem};
 /// Default percentage points below the auto-compact threshold at which prefire
 /// (background pass-1) starts, giving pass-1 runway to finish before the limit.
 /// Override with `GROK_PREFIRE_LEAD_PERCENT`.
 const DEFAULT_PREFIRE_LEAD_PERCENT: u64 = 10;
+const CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
+    "Output exceeded the available model context and was truncated";
+
+/// Match codex-rs's remote-compaction preflight: when the request itself has
+/// crossed the effective context window, rewrite trailing tool outputs from
+/// newest to oldest. Do not discard ordinary messages or arbitrary history;
+/// if tool-output trimming cannot make the request fit, let the endpoint
+/// return the provider error intact.
+fn rewrite_codex_tool_outputs_to_fit_context_window(
+    items: &mut [ConversationItem],
+    input_budget: u64,
+) -> usize {
+    let mut rewritten = 0usize;
+    for index in (0..items.len()).rev() {
+        if xai_chat_state::estimate_conversation_tokens(items) <= input_budget {
+            break;
+        }
+        let did_rewrite = match &mut items[index] {
+            ConversationItem::ToolResult(output) => {
+                output.content = Arc::<str>::from(CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+                output.images.clear();
+                output.ordered_content.clear();
+                true
+            }
+            ConversationItem::CustomToolOutput(output) => {
+                output.content = vec![xai_grok_sampling_types::CustomToolOutputContent::Text {
+                    text: Arc::<str>::from(CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE),
+                }];
+                true
+            }
+            _ => false,
+        };
+        if !did_rewrite {
+            break;
+        }
+        rewritten = rewritten.saturating_add(1);
+    }
+    rewritten
+}
+
 fn prefire_lead_percent() -> u64 {
     std::env::var("GROK_PREFIRE_LEAD_PERCENT")
         .ok()
@@ -114,8 +155,11 @@ impl From<PrefireOutcome> for PrefirePass1Run {
 }
 #[cfg(test)]
 mod two_pass_prefire_helper_tests {
-    use super::{fingerprint_prefix, prefire_lead_percent};
-    use xai_grok_sampling_types::ConversationItem;
+    use super::{
+        CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE, auto_compact_token_limit, comp_hash_changed,
+        fingerprint_prefix, prefire_lead_percent, rewrite_codex_tool_outputs_to_fit_context_window,
+    };
+    use xai_grok_sampling_types::{ConversationItem, ModelProvider};
     #[test]
     fn fingerprint_stable_for_same_prefix() {
         let items = vec![
@@ -154,6 +198,78 @@ mod two_pass_prefire_helper_tests {
     fn prefire_lead_percent_defaults_to_10() {
         unsafe { std::env::remove_var("GROK_PREFIRE_LEAD_PERCENT") };
         assert_eq!(prefire_lead_percent(), 10);
+    }
+
+    #[test]
+    fn codex_default_auto_compact_limit_matches_raw_ninety_percent() {
+        // Official raw context: 372_000. The live catalog exposes the 95%
+        // effective budget (353_400), while auto compact remains 90% of raw.
+        assert_eq!(
+            auto_compact_token_limit(ModelProvider::Codex, 353_400, 85, None),
+            334_800
+        );
+        assert_eq!(
+            auto_compact_token_limit(ModelProvider::Xai, 353_400, 85, Some(123_456)),
+            300_390,
+            "xAI keeps the existing configured threshold"
+        );
+        assert_eq!(
+            auto_compact_token_limit(ModelProvider::Codex, 353_400, 80, Some(123_456)),
+            282_720,
+            "an explicit non-default threshold overrides the Codex default"
+        );
+    }
+
+    #[test]
+    fn codex_live_absolute_limit_wins_only_at_the_default_threshold() {
+        assert_eq!(
+            auto_compact_token_limit(ModelProvider::Codex, 353_400, 85, Some(300_123)),
+            300_123,
+        );
+        assert_eq!(
+            auto_compact_token_limit(ModelProvider::Codex, 353_400, 80, Some(300_123)),
+            282_720,
+            "an explicit Open Grok threshold remains the intentional user override",
+        );
+    }
+
+    #[test]
+    fn comp_hash_requires_two_present_different_values() {
+        assert!(comp_hash_changed(Some("v1"), Some("v2")));
+        assert!(!comp_hash_changed(Some("v1"), Some("v1")));
+        assert!(!comp_hash_changed(None, Some("v2")));
+        assert!(!comp_hash_changed(Some("v1"), None));
+    }
+
+    #[test]
+    fn codex_remote_preflight_rewrites_only_trailing_tool_outputs() {
+        let original_user = "u".repeat(400);
+        let mut items = vec![
+            ConversationItem::user(original_user.clone()),
+            ConversationItem::tool_result("call_1", "x".repeat(4_000)),
+        ];
+        let budget = xai_chat_state::estimate_conversation_tokens(&items) / 2;
+
+        assert_eq!(
+            rewrite_codex_tool_outputs_to_fit_context_window(&mut items, budget),
+            1
+        );
+        assert_eq!(items.len(), 2, "preflight must never drop history items");
+        assert_eq!(items[0].text_content(), original_user);
+        assert_eq!(
+            items[1].text_content(),
+            CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
+        );
+
+        let mut non_trailing = vec![
+            ConversationItem::tool_result("call_2", "x".repeat(4_000)),
+            ConversationItem::assistant("ordinary tail"),
+        ];
+        assert_eq!(
+            rewrite_codex_tool_outputs_to_fit_context_window(&mut non_trailing, 1),
+            0,
+            "codex-rs stops rather than deleting an ordinary tail item"
+        );
     }
 }
 impl SessionActor {
@@ -226,6 +342,15 @@ impl SessionActor {
     /// is still runway before the hard auto-compact line at `threshold`).
     pub(crate) async fn should_prefire_two_pass(&self) -> bool {
         let sampling_cfg = self.chat_state_handle.get_sampling_config().await;
+        if sampling_cfg
+            .as_ref()
+            .is_some_and(|config| config.provider == ModelProvider::Codex)
+        {
+            // Codex uses OpenAI's server-side compact endpoint. A speculative
+            // local summary would spend an extra model call and then be thrown
+            // away when the provider installs its replacement history.
+            return false;
+        }
         let Some(cw) = sampling_cfg.as_ref().map(|c| c.context_window.get()) else {
             return false;
         };
@@ -441,6 +566,37 @@ pub(crate) struct AutoCompactTriggerInfo {
     pub context_window: u64,
     pub percentage: u8,
 }
+
+/// codex-rs derives the default automatic compaction limit as 90% of the raw
+/// model context. Open Grok stores the model's 95%-effective context in the
+/// picker/session (matching Codex's user-facing context budget), so convert the
+/// same raw limit into that coordinate space. An explicit non-default Open
+/// Grok threshold remains an override for cross-provider feature parity.
+fn auto_compact_token_limit(
+    provider: ModelProvider,
+    effective_context_window: u64,
+    configured_percent: u8,
+    codex_model_limit: Option<u64>,
+) -> u64 {
+    const CODEX_RAW_AUTO_COMPACT_PERCENT: u64 = 90;
+    const CODEX_EFFECTIVE_CONTEXT_PERCENT: u64 = 95;
+    if provider == ModelProvider::Codex
+        && configured_percent == crate::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
+    {
+        codex_model_limit.unwrap_or_else(|| {
+            effective_context_window.saturating_mul(CODEX_RAW_AUTO_COMPACT_PERCENT)
+                / CODEX_EFFECTIVE_CONTEXT_PERCENT
+        })
+    } else {
+        effective_context_window.saturating_mul(u64::from(configured_percent)) / 100
+    }
+}
+
+fn comp_hash_changed(previous: Option<&str>, current: Option<&str>) -> bool {
+    previous
+        .zip(current)
+        .is_some_and(|(previous, current)| previous != current)
+}
 /// Why auto-compaction was suppressed after a deterministic failure.
 /// [`SuppressReason::as_str`] is a stable telemetry value (BQ/OTLP/dashboards key
 /// off it) — don't rename the strings.
@@ -588,6 +744,236 @@ impl SessionActor {
             span.record("detail", tracing::field::display(detail));
         }
     }
+
+    async fn run_codex_remote_compact_request(
+        &self,
+        mut client: xai_grok_sampler::SamplingClient,
+        codex_turn_state: Arc<std::sync::OnceLock<String>>,
+        request: xai_grok_sampling_types::ConversationRequest,
+        instructions: &str,
+        auto_trigger: bool,
+        estimated_tokens: u64,
+        context_window: u64,
+    ) -> Result<(Vec<ConversationItem>, u32), acp::Error> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut refreshed_auth = false;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match client
+                .compact_codex_conversation(request.clone(), instructions)
+                .await
+            {
+                Ok(items) => return Ok((items, attempt)),
+                Err(error) => {
+                    if error.is_auth_error() && !refreshed_auth {
+                        refreshed_auth = true;
+                        match crate::codex_auth::force_refresh().await {
+                            Ok(Some(credentials)) => {
+                                if self.update_codex_chat_credentials(Some(credentials)).await {
+                                    client = self
+                                        .prepare_chat_completion_with_codex_turn_state(
+                                            false,
+                                            Arc::clone(&codex_turn_state),
+                                        )
+                                        .await?;
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    session_id = %self.session_info.id.0,
+                                    "Codex compaction auth refresh changed account identity"
+                                );
+                            }
+                            Ok(None) => tracing::warn!(
+                                session_id = %self.session_info.id.0,
+                                "Codex compaction auth refresh returned no account"
+                            ),
+                            Err(refresh_error) => tracing::warn!(
+                                session_id = %self.session_info.id.0,
+                                error = %refresh_error,
+                                "Codex compaction auth refresh failed"
+                            ),
+                        }
+                    }
+
+                    let retry_after = match &error {
+                        xai_grok_sampling_types::SamplingError::Api {
+                            retry_after_secs, ..
+                        } => *retry_after_secs,
+                        _ => None,
+                    };
+                    if attempt < MAX_ATTEMPTS && error.is_retryable() {
+                        let delay = retry_after.unwrap_or(3).min(120);
+                        tracing::warn!(
+                            session_id = %self.session_info.id.0,
+                            attempt,
+                            delay,
+                            error = %error,
+                            "retrying Codex responses/compact request"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        continue;
+                    }
+
+                    if auto_trigger {
+                        let reason = Self::classify_suppress_reason(&error.to_string());
+                        self.suppress_auto_compaction(reason, estimated_tokens, context_window)
+                            .await;
+                    }
+                    return Err(self.to_acp_error(error));
+                }
+            }
+        }
+        unreachable!("Codex compact retry loop returns on every terminal attempt")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn install_codex_remote_compacted_history(
+        &self,
+        mut compacted_history: Vec<ConversationItem>,
+        cross_provider_fallback: String,
+        system_items: Vec<ConversationItem>,
+        segment_messages: &[ConversationItem],
+        tokens_before: u64,
+        auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
+        compact_source: &'static str,
+        attempts: u32,
+        compaction: xai_grok_telemetry::events::CompactionScope,
+    ) -> Result<(), acp::Error> {
+        if compacted_history.is_empty() {
+            return Err(acp::Error::internal_error()
+                .data("OpenAI compact endpoint returned no replacement history"));
+        }
+        if !cross_provider_fallback.is_empty() {
+            for item in compacted_history.iter_mut().rev() {
+                let ConversationItem::BackendToolCall(item) = item else {
+                    continue;
+                };
+                let xai_grok_sampling_types::BackendToolKind::CodexRawInput(raw) = &mut item.kind
+                else {
+                    continue;
+                };
+                let item_type = raw.raw.get("type").and_then(serde_json::Value::as_str);
+                if matches!(item_type, Some("compaction" | "context_compaction")) {
+                    raw.cross_provider_fallback = Some(cross_provider_fallback);
+                    break;
+                }
+            }
+        }
+        let compacted_history_chars = compacted_history
+            .iter()
+            .map(|item| match item {
+                ConversationItem::BackendToolCall(item) => item.estimated_content_len(),
+                _ => item.text_content().chars().count(),
+            })
+            .sum::<usize>();
+
+        // Base instructions are request controls in codex-rs rather than part
+        // of replacement history. Open Grok's unified conversation stores
+        // them as leading System items, so reattach them locally while keeping
+        // every provider output item exact and ordered after that prefix.
+        let mut replacement = system_items;
+        replacement.append(&mut compacted_history);
+        self.persist_compaction_segment(segment_messages, "[OpenAI server-side compacted context]");
+
+        let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
+        self.chat_state_handle
+            .record_compaction_at(prompt_index_at_compaction);
+        let original_user_info = self
+            .chat_state_handle
+            .get_conversation_item_at(1)
+            .await
+            .and_then(|item| match item {
+                ConversationItem::User(parts) => {
+                    parts
+                        .content
+                        .into_iter()
+                        .next()
+                        .and_then(|part| match part {
+                            xai_grok_sampling_types::ContentPart::Text { text } => {
+                                Some(text.as_ref().to_owned())
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
+            });
+        self.persist_compaction_checkpoint(
+            &replacement,
+            prompt_index_at_compaction,
+            auto_continue,
+            original_user_info,
+        );
+
+        if self.startup_hints.inherited_prefix_len.is_some() {
+            // The server compacted the complete fork history into its opaque
+            // replacement item. Re-pinning the old prefix would defeat that
+            // compaction and immediately retrigger the threshold.
+            self.compaction
+                .prefix_released
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::Span::current().record("compaction_prefix_released", true);
+        }
+        let new_len = replacement.len();
+        self.chat_state_handle
+            .replace_conversation_for_compaction(replacement);
+        self.compaction
+            .auto_compact_suppressed
+            .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+        self.last_idle_flush_conversation_len
+            .store(new_len, std::sync::atomic::Ordering::Relaxed);
+        self.memory
+            .context_injected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::PlanState(
+                crate::tools::todo::TodoState::default(),
+            ));
+        self.agent
+            .borrow()
+            .tool_bridge()
+            .on_agents_md_compaction()
+            .await;
+        self.agent
+            .borrow()
+            .tool_bridge()
+            .on_skill_discovery_compaction()
+            .await;
+        self.persist_announcement_state().await;
+        self.plan_mode.lock().reset_after_compaction();
+        self.persist_plan_mode_state();
+        self.dispatch_hook(
+            xai_grok_hooks::event::HookEventName::PostCompact,
+            xai_grok_hooks::event::HookPayload::PostCompact {
+                source: compact_source.into(),
+            },
+            None,
+            None,
+        )
+        .await;
+
+        let tokens_after = self.chat_state_handle.get_total_tokens().await;
+        let span = tracing::Span::current();
+        span.record("compaction_tokens_after", tokens_after as i64);
+        span.record("compaction_summary_chars", compacted_history_chars as i64);
+        span.record("compaction_attempts", attempts as i64);
+        span.record("compaction_degenerate_rejections", 0i64);
+        span.record("compaction_input_overflow_rejections", 0i64);
+        span.record("compaction_deterministic_rejections", 0i64);
+        span.record("compaction_transient_rejections", 0i64);
+        span.record("compaction_stop_reason", "responses_compact");
+        span.record("compaction_outcome", CompactionOutcome::Success.as_str());
+        span.record("compaction_delta_count", 0i64);
+        compaction.complete(tokens_after);
+        tracing::info!(
+            session_id = %self.session_info.id.0,
+            tokens_before,
+            tokens_after,
+            attempts,
+            "installed OpenAI responses/compact replacement history"
+        );
+        Ok(())
+    }
     /// Runs the compact operation over here which compresses the current conversation
     /// and helps with saving the context for the model
     #[tracing::instrument(
@@ -608,6 +994,10 @@ impl SessionActor {
         self: &Arc<Self>,
         user_context: Option<String>,
     ) -> Result<(), acp::Error> {
+        // Manual/out-of-turn compaction is its own routing scope. Retain this
+        // cell across compact retries, but never reuse the last model turn's
+        // token or seed a future turn with the compact response.
+        let codex_turn_state = Arc::new(std::sync::OnceLock::new());
         self.record_compaction_variant();
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", total_tokens as i64);
@@ -623,6 +1013,7 @@ impl SessionActor {
                 user_context,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Manual,
+                codex_turn_state,
             )
             .await
         {
@@ -819,6 +1210,7 @@ impl SessionActor {
         user_context: Option<String>,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
+        codex_turn_state: Arc<std::sync::OnceLock<String>>,
     ) -> Result<(), acp::Error> {
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("compaction_tokens_before", tokens_before as i64);
@@ -875,6 +1267,7 @@ impl SessionActor {
             self.chat_state_handle.get_system_message(),
             self.chat_state_handle.get_conversation(),
         );
+        let provider_conversation = full_conversation.clone();
         let segment_messages = if self.compaction.compaction_mode.writes_segments() {
             xai_chat_state::compaction_utils::prepare_conversation_for_segment(
                 full_conversation.clone(),
@@ -935,7 +1328,9 @@ impl SessionActor {
                 .data("Compaction failed: no system message in simplified conversation"));
         }
         let sampling_config = self.reconstruct_full_config().await;
-        let sampling_client = self.prepare_chat_completion(false).await?;
+        let sampling_client = self
+            .prepare_chat_completion_with_codex_turn_state(false, Arc::clone(&codex_turn_state))
+            .await?;
         let use_backend_search =
             self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
         let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
@@ -963,6 +1358,9 @@ impl SessionActor {
                 sampling_config.provider,
             )
         };
+        let estimated_input_tokens =
+            xai_chat_state::estimate_conversation_tokens(&simplified_messages);
+        let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
         tracing::info!(
             num_tools = compaction_tools.len(),
             tool_tokens = compaction_tool_tokens,
@@ -970,6 +1368,89 @@ impl SessionActor {
             &sampling_config.model,
             &sampling_config.model
         );
+        if sampling_config.provider == ModelProvider::Codex
+            && sampling_config.api_backend == ApiBackend::Responses
+        {
+            let base_instruction_count = provider_conversation
+                .iter()
+                .take_while(|item| matches!(item, ConversationItem::System(_)))
+                .count();
+            let system_items = provider_conversation[..base_instruction_count].to_vec();
+            let mut instructions = system_items
+                .iter()
+                .map(ConversationItem::text_content)
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            // Only the leading system prefix represents base instructions.
+            // Preserve any later system/reminder item in its original history
+            // position instead of moving it ahead of prior conversation.
+            let mut compact_input = provider_conversation[base_instruction_count..].to_vec();
+            if let Some(context) = user_context
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                if !instructions.is_empty() {
+                    instructions.push_str("\n\n");
+                }
+                instructions.push_str(&format!(
+                    "<compaction_context>\n{context}\n</compaction_context>"
+                ));
+            }
+            let cross_provider_fallback =
+                xai_grok_sampling_types::codex_cross_provider_fallback(&compact_input, 32_000);
+
+            // codex-rs evaluates remote-compaction input against the model's
+            // effective context window and rewrites only trailing function
+            // outputs when necessary. Base instructions and tools also occupy
+            // that request budget even though they are not history items.
+            let compact_input_budget = context_window
+                .saturating_sub(xai_token_estimation::estimate_tokens(&instructions))
+                .saturating_sub(compaction_tool_tokens);
+            let rewritten_outputs = rewrite_codex_tool_outputs_to_fit_context_window(
+                &mut compact_input,
+                compact_input_budget,
+            );
+            if rewritten_outputs > 0 {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    rewritten_outputs,
+                    "rewrote trailing tool outputs before Codex remote compaction"
+                );
+            }
+
+            let mut request =
+                xai_grok_sampling_types::ConversationRequest::from_items(compact_input)
+                    .with_model(sampling_config.model.clone())
+                    .with_tools(compaction_tools);
+            request.hosted_tools = compaction_hosted_tools;
+            request.reasoning_effort = sampling_config.reasoning_effort;
+            request.x_grok_session_id = Some(self.session_info.id.0.to_string());
+            let (replacement, attempts) = self
+                .run_codex_remote_compact_request(
+                    sampling_client,
+                    codex_turn_state,
+                    request,
+                    &instructions,
+                    auto_trigger,
+                    estimated_input_tokens,
+                    context_window,
+                )
+                .await?;
+            return self
+                .install_codex_remote_compacted_history(
+                    replacement,
+                    cross_provider_fallback,
+                    system_items,
+                    &segment_messages,
+                    tokens_before,
+                    auto_continue,
+                    compact_source,
+                    attempts,
+                    compaction,
+                )
+                .await;
+        }
         let mut last_error: Option<acp::Error> = None;
         let mut last_failure_outcome = CompactionOutcome::Failed;
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -994,9 +1475,6 @@ impl SessionActor {
         };
         let use_short_prompt = false;
         let started_at = chrono::Utc::now().to_rfc3339();
-        let estimated_input_tokens =
-            xai_chat_state::estimate_conversation_tokens(&simplified_messages);
-        let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
         let wall_clock_budget_secs = self
             .agent
             .borrow()
@@ -1728,12 +2206,28 @@ impl SessionActor {
         total_tokens: u64,
         context_window: std::num::NonZeroU64,
     ) -> Option<AutoCompactTriggerInfo> {
-        let cw = context_window.get();
-        if xai_token_estimation::exceeds_threshold(
+        self.should_auto_compact_for_provider(
             total_tokens,
-            cw,
-            self.compaction.threshold_percent.get(),
-        ) {
+            context_window,
+            ModelProvider::Xai,
+            None,
+        )
+    }
+
+    fn should_auto_compact_for_provider(
+        &self,
+        total_tokens: u64,
+        context_window: std::num::NonZeroU64,
+        provider: ModelProvider,
+        model_id: Option<&str>,
+    ) -> Option<AutoCompactTriggerInfo> {
+        let cw = context_window.get();
+        let configured_percent = self.compaction.threshold_percent.get();
+        let codex_model_limit = model_id
+            .and_then(|model_id| self.models_manager.codex_compaction_metadata(model_id))
+            .and_then(|metadata| metadata.auto_compact_token_limit);
+        let limit = auto_compact_token_limit(provider, cw, configured_percent, codex_model_limit);
+        if total_tokens >= limit {
             let percentage = xai_token_estimation::usage_percentage_u8(total_tokens, cw);
             Some(AutoCompactTriggerInfo {
                 tokens_used: total_tokens,
@@ -1826,7 +2320,15 @@ impl SessionActor {
                 percentage,
             });
         }
-        if let Some(trigger_info) = self.should_auto_compact(estimated_total, context_window) {
+        if let Some(trigger_info) = self.should_auto_compact_for_provider(
+            estimated_total,
+            context_window,
+            sampling_cfg
+                .as_ref()
+                .map(|config| config.provider)
+                .unwrap_or_default(),
+            sampling_cfg.as_ref().map(|config| config.model.as_str()),
+        ) {
             tracing::info!(
                 "Pre-sampling auto-compact trigger: model={model}, \
                  {}% full ({}/{} tokens)",
@@ -1880,7 +2382,13 @@ impl SessionActor {
         let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
             return;
         };
-        if cfg.model == prev.model_slug {
+        let current_comp_hash = self
+            .models_manager
+            .codex_compaction_metadata(&cfg.model)
+            .and_then(|metadata| metadata.comp_hash);
+        let comp_hash_changed =
+            comp_hash_changed(prev.comp_hash.as_deref(), current_comp_hash.as_deref());
+        if cfg.model == prev.model_slug && !comp_hash_changed {
             return;
         }
         if self
@@ -1894,11 +2402,38 @@ impl SessionActor {
         self.compaction
             .auto_compact_suppressed
             .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+        let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
+        if comp_hash_changed {
+            let percentage =
+                xai_token_estimation::usage_percentage_u8(total_tokens, cfg.context_window.get());
+            tracing::info!(
+                previous_model = %prev.model_slug,
+                current_model = %cfg.model,
+                previous_comp_hash = ?prev.comp_hash,
+                current_comp_hash = ?current_comp_hash,
+                "Proactive compact: Codex compaction compatibility hash changed"
+            );
+            if let Err(error) = self
+                .run_compact_only(AutoCompactTriggerInfo {
+                    tokens_used: total_tokens,
+                    context_window: cfg.context_window.get(),
+                    percentage,
+                })
+                .await
+            {
+                tracing::error!(%error, "Compaction after Codex comp_hash change failed");
+            }
+            return;
+        }
         if prev.context_window <= cfg.context_window.get() {
             return;
         }
-        let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
-        let Some(trigger_info) = self.should_auto_compact(total_tokens, cfg.context_window) else {
+        let Some(trigger_info) = self.should_auto_compact_for_provider(
+            total_tokens,
+            cfg.context_window,
+            cfg.provider,
+            Some(&cfg.model),
+        ) else {
             return;
         };
         tracing::info!(
@@ -1916,12 +2451,22 @@ impl SessionActor {
     /// Record the current model for model-switch detection on the next turn.
     pub(crate) async fn record_turn_model(&self) {
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
-            self.compaction.previous_model.set(Some(
-                crate::session::compaction_config::PreviousModelInfo {
-                    model_slug: cfg.model.clone(),
-                    context_window: cfg.context_window.get(),
-                },
-            ));
+            let comp_hash = self
+                .models_manager
+                .codex_compaction_metadata(&cfg.model)
+                .and_then(|metadata| metadata.comp_hash);
+            let previous_model = crate::session::compaction_config::PreviousModelInfo {
+                model_slug: cfg.model.clone(),
+                context_window: cfg.context_window.get(),
+                comp_hash,
+            };
+            self.compaction
+                .previous_model
+                .set(Some(previous_model.clone()));
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::PreviousTurnModel(previous_model));
         }
     }
     /// Compact without auto-continue. The outer turn loop rebuilds and retries.
@@ -1973,6 +2518,7 @@ impl SessionActor {
                 None,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Auto,
+                self.sampler_handle.codex_turn_state(),
             )
             .await;
         let elapsed_ms = compact_start.elapsed().as_millis() as i64;
@@ -2570,6 +3116,7 @@ mod inline_auto_compact_flow_tests {
                     actor.compaction.previous_model.set(Some(PreviousModelInfo {
                         model_slug: "old-small-model".to_string(),
                         context_window: 100_000,
+                        comp_hash: None,
                     }));
                     actor.maybe_compact_on_model_switch().await;
                     assert_eq!(
@@ -2608,6 +3155,7 @@ mod inline_auto_compact_flow_tests {
                 actor.compaction.previous_model.set(Some(PreviousModelInfo {
                     model_slug: "old-big-model".to_string(),
                     context_window: 400_000,
+                    comp_hash: None,
                 }));
                 actor.maybe_compact_on_model_switch().await;
                 assert_eq!(
@@ -3286,6 +3834,7 @@ mod inline_auto_compact_flow_tests {
                     crate::session::compaction_config::PreviousModelInfo {
                         model_slug: "large-model".to_string(),
                         context_window: 200_000,
+                        comp_hash: None,
                     },
                 ));
                 let prev = actor.compaction.previous_model.take();
@@ -3301,6 +3850,7 @@ mod inline_auto_compact_flow_tests {
                     crate::session::compaction_config::PreviousModelInfo {
                         model_slug: "small-model".to_string(),
                         context_window: 50_000,
+                        comp_hash: None,
                     },
                 ));
                 let prev = actor.compaction.previous_model.take().unwrap();

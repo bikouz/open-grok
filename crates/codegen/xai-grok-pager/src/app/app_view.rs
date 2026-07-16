@@ -334,6 +334,9 @@ pub struct CardDetail {
 pub enum AuthState {
     /// No login required (API key, cached token, or already authenticated).
     Done,
+    /// No provider is authenticated for the selected startup path yet.
+    /// The welcome screen offers ChatGPT Codex and xAI Grok side by side.
+    ProviderChoice { error: Option<String> },
     /// Login required -- show login menu on welcome screen.
     /// `error` is set after a failed auth attempt so the user sees what went wrong.
     Pending { error: Option<String> },
@@ -348,6 +351,77 @@ pub enum AuthState {
         /// How the auth flow presents itself to the user.
         mode: AuthMode,
     },
+}
+
+/// Provider that owns startup authentication and access gating for this run.
+///
+/// Codex credentials are intentionally independent from xAI credentials. In
+/// particular, an xAI subscription gate must never prevent a Codex-backed
+/// session from starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryProvider {
+    Xai,
+    Codex,
+}
+
+pub const CODEX_STARTUP_MODEL_ID: &str = "gpt-5.6-sol";
+pub const XAI_STARTUP_MODEL_ID: &str = "grok-build";
+
+impl PrimaryProvider {
+    fn from_models(models: &ModelState) -> Self {
+        Self::for_current_model(models).unwrap_or(Self::Xai)
+    }
+
+    /// Resolve the provider of the catalog's actual current model.
+    pub(crate) fn for_current_model(models: &ModelState) -> Option<Self> {
+        models
+            .current
+            .as_ref()
+            .and_then(|current| Self::for_model(models, current))
+    }
+
+    /// Resolve a model's provider from the ACP catalog metadata.
+    ///
+    /// Model IDs are intentionally not used as a fallback: user-defined model
+    /// aliases can look like either provider, while the `provider` metadata is
+    /// the shell's authoritative routing decision.
+    pub(crate) fn for_model(models: &ModelState, model_id: &acp::ModelId) -> Option<Self> {
+        let provider = models
+            .available
+            .get(model_id)
+            .and_then(|info| info.meta.as_ref())
+            .and_then(|meta| meta.get("provider"))
+            .and_then(|value| value.as_str())?;
+        if provider.eq_ignore_ascii_case("codex") {
+            Some(Self::Codex)
+        } else if provider.eq_ignore_ascii_case("xai") {
+            Some(Self::Xai)
+        } else {
+            None
+        }
+    }
+
+    /// Pick a provider-owned model from the already-filtered ACP catalog.
+    ///
+    /// `ModelState::available` is the visible projection after authentication,
+    /// allow/deny lists, and hidden-model filtering. Prefer the product default
+    /// only when that exact visible entry also advertises this provider; then
+    /// fall back to the first visible model owned by the same provider.
+    pub(crate) fn startup_model(
+        self,
+        models: &ModelState,
+        preferred: &str,
+    ) -> Option<acp::ModelId> {
+        let preferred = acp::ModelId::new(preferred);
+        if Self::for_model(models, &preferred) == Some(self) {
+            return Some(preferred);
+        }
+        models
+            .available
+            .keys()
+            .find(|model_id| Self::for_model(models, model_id) == Some(self))
+            .cloned()
+    }
 }
 /// How the auth flow presents itself to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -939,6 +1013,29 @@ pub struct AppView {
     pub auth_methods: Vec<acp::AuthMethod>,
     /// Authentication state for the welcome screen login flow.
     pub auth_state: AuthState,
+    /// Provider whose credentials and access rules own this launch.
+    pub primary_provider: PrimaryProvider,
+    /// Whether ACP already authenticated xAI before the first-run chooser was
+    /// shown for a missing Codex credential.
+    pub startup_xai_ready: bool,
+    /// Cached xAI auth metadata paired with [`Self::startup_xai_ready`]. It is
+    /// applied only if the user chooses xAI, never on the Codex path.
+    pub startup_xai_auth_meta: Option<serde_json::Value>,
+    /// Fresh independently validated Codex account available to the startup
+    /// chooser. Selecting ChatGPT can reuse it without opening OAuth again.
+    pub startup_codex_account: Option<xai_grok_shell::codex_auth::CodexAccountSummary>,
+    /// Model forced into the first newly-created session after provider
+    /// onboarding. It is cleared only after session creation succeeds so a
+    /// transient creation failure can be retried safely.
+    pub startup_model_override: Option<acp::ModelId>,
+    /// Provider choice waiting for authentication to publish its provider-
+    /// filtered model catalog. This distinguishes chooser-driven xAI login
+    /// from the ordinary startup and mid-session authentication paths.
+    pub startup_provider_selection: Option<PrimaryProvider>,
+    /// A persisted Codex session is waiting for provider-local OAuth. This
+    /// keeps retry/cancel/minimal-UI behavior auth-only instead of falling back
+    /// into first-run model selection.
+    pub codex_resume_auth_pending: bool,
     /// Folder-trust state for the welcome screen. Mirrors [`AppView::auth_state`]:
     /// when `Pending`, the welcome screen shows the trust question and session
     /// creation is deferred (gated after auth) until it is answered.
@@ -1079,6 +1176,145 @@ impl AppView {
     pub fn is_zdr_blocked(&self) -> bool {
         self.is_zdr && !self.zdr_access_enabled
     }
+    /// Whether xAI subscription/ZDR access controls apply to this run.
+    pub fn uses_xai_access_controls(&self) -> bool {
+        self.primary_provider == PrimaryProvider::Xai
+    }
+    /// Transition the active session between provider-specific access domains.
+    ///
+    /// xAI auth remains independently available while a Codex model is active,
+    /// but its subscription and ZDR state must not gate that Codex session. A
+    /// compact auth snapshot lets a later switch back to xAI restore the same
+    /// controls without treating Codex as authenticated xAI.
+    pub fn switch_primary_provider(&mut self, provider: PrimaryProvider) -> bool {
+        if provider == self.primary_provider {
+            return false;
+        }
+        match provider {
+            PrimaryProvider::Codex => {
+                self.remember_xai_access_controls();
+                self.primary_provider = PrimaryProvider::Codex;
+                self.clear_xai_access_controls();
+            }
+            PrimaryProvider::Xai => {
+                self.primary_provider = PrimaryProvider::Xai;
+                self.restore_xai_access_controls();
+            }
+        }
+        true
+    }
+    /// Apply a provider transition and return the live refreshes owned by it.
+    ///
+    /// Every real Codex-to-xAI transition revalidates the subscription even
+    /// when the saved xAI snapshot had no gate. Access can change while Codex
+    /// is active, so the snapshot is useful only as immediate UI state, not as
+    /// evidence that a fresh check is unnecessary.
+    pub(crate) fn switch_primary_provider_with_effects(
+        &mut self,
+        provider: PrimaryProvider,
+        agent_id: Option<crate::app::agent::AgentId>,
+    ) -> Vec<crate::app::actions::Effect> {
+        if !self.switch_primary_provider(provider) {
+            return Vec::new();
+        }
+        if provider == PrimaryProvider::Codex {
+            // Credits and polling are xAI-owned UI state. Discard the visible
+            // projection at the provider boundary; a later xAI transition
+            // performs a live billing refresh before repopulating it.
+            self.credit_balance = None;
+            self.auto_topup = None;
+            self.billing_poll_wanted = false;
+            if let Some(agent_id) = agent_id
+                && let Some(agent) = self.agents.get_mut(&agent_id)
+            {
+                agent.apply_credit_balance(None, None);
+            }
+            return Vec::new();
+        }
+        let mut effects = vec![crate::app::actions::Effect::CheckSubscription { verify: None }];
+        if self.usage_visible
+            && let Some(agent_id) = agent_id
+        {
+            effects.push(crate::app::actions::Effect::FetchBilling {
+                agent_id,
+                silent: true,
+            });
+        }
+        effects
+    }
+    /// Re-anchor provider-owned UI and access state to the foreground agent's
+    /// authoritative session model. Call this after a session response updates
+    /// its catalog and whenever a bound agent tab becomes active.
+    pub(crate) fn sync_primary_provider_from_active_agent(
+        &mut self,
+    ) -> Vec<crate::app::actions::Effect> {
+        let ActiveView::Agent(agent_id) = self.active_view else {
+            return Vec::new();
+        };
+        let provider = self
+            .agents
+            .get(&agent_id)
+            .and_then(|agent| PrimaryProvider::for_current_model(&agent.session.models));
+        if let Some(provider) = provider {
+            self.switch_primary_provider_with_effects(provider, Some(agent_id))
+        } else {
+            Vec::new()
+        }
+    }
+    fn remember_xai_access_controls(&mut self) {
+        let auth_meta = xai_grok_shell::auth::AuthMeta {
+            auth_mode: self.is_api_key_auth.then(|| "api_key".to_string()),
+            team_id: self.team_id.clone(),
+            team_name: self.team_name.clone(),
+            is_zdr: self.is_zdr,
+            team_role: self.team_role.clone(),
+            coding_data_retention_opt_out: self.coding_data_retention_opt_out,
+            // A verification in flight is still a potential xAI gate. Restore
+            // it conservatively as a visible gate after a round trip through
+            // Codex; the subscription watcher will re-check it live.
+            gate: self
+                .gate
+                .clone()
+                .or_else(|| self.pending_gate_verification.clone()),
+            subscription_tier: self.subscription_tier.clone(),
+            show_resolved_model: Some(self.show_resolved_model),
+            ..Default::default()
+        };
+        match serde_json::to_value(auth_meta) {
+            Ok(meta) => {
+                self.startup_xai_auth_meta = Some(meta);
+                self.startup_xai_ready = true;
+            }
+            Err(error) => tracing::warn!(%error, "failed to preserve xAI access metadata"),
+        }
+    }
+    fn restore_xai_access_controls(&mut self) {
+        self.clear_xai_access_controls();
+        let Some(meta) = self.startup_xai_auth_meta.clone() else {
+            return;
+        };
+        match serde_json::from_value::<xai_grok_shell::auth::AuthMeta>(meta) {
+            Ok(auth_meta) => self.apply_auth_meta(&auth_meta),
+            Err(error) => tracing::warn!(%error, "failed to restore xAI access metadata"),
+        }
+    }
+    /// Drop xAI-only access state when ChatGPT Codex owns startup. Account
+    /// credentials remain on disk and can still be viewed independently.
+    pub fn clear_xai_access_controls(&mut self) {
+        self.team_id = None;
+        self.team_name = None;
+        self.team_role = None;
+        self.is_zdr = false;
+        self.coding_data_retention_opt_out = false;
+        self.gate = None;
+        self.pending_gate_verification = None;
+        self.paywall_check_started = None;
+        self.last_subscription_check_at = None;
+        self.subscription_tier = None;
+        self.is_api_key_auth = false;
+        self.apply_usage_visibility(true);
+        self.apply_tier_restrictions();
+    }
     /// User is not gated (no gate from remote settings or subscription fallback).
     pub fn has_access(&self) -> bool {
         self.gate.is_none()
@@ -1134,7 +1370,7 @@ impl AppView {
                 .subscription_tier
                 .as_deref()
                 .is_some_and(is_api_key_label);
-        self.usage_visible = meta.team_name.is_none() && !self.is_api_key_auth;
+        self.apply_usage_visibility(meta.team_name.is_none() && !self.is_api_key_auth);
         self.apply_tier_restrictions();
         if self.is_api_key_auth {
             self.ensure_voice_for_api_key();
@@ -1158,6 +1394,7 @@ impl AppView {
         models: ModelState,
         bootstrap_acp_commands: Vec<agent_client_protocol::AvailableCommand>,
     ) -> Self {
+        let primary_provider = PrimaryProvider::from_models(&models);
         let slash_mru =
             std::rc::Rc::new(std::cell::RefCell::new(crate::slash::mru::SlashMru::new()));
         let mut welcome_prompt = PromptWidget::new();
@@ -1275,6 +1512,13 @@ impl AppView {
             bootstrap_acp_commands,
             auth_methods: Vec::new(),
             auth_state: AuthState::Done,
+            primary_provider,
+            startup_xai_ready: false,
+            startup_xai_auth_meta: None,
+            startup_codex_account: None,
+            startup_model_override: None,
+            startup_provider_selection: None,
+            codex_resume_auth_pending: false,
             trust_state: TrustState::Done,
             login_label: None,
             login_method_id: None,
@@ -1388,6 +1632,37 @@ impl AppView {
             dashboard.set_voice_visible(enabled);
         }
     }
+    /// Whether the combined `/usage` command has at least one provider it can
+    /// query. `usage_visible` remains the xAI billing/UI gate; Codex quota is
+    /// independently available whenever its account is connected.
+    pub(crate) fn usage_command_visible(&self) -> bool {
+        self.usage_visible || self.startup_codex_account.is_some()
+    }
+
+    /// Sync combined `/usage` availability into every slash-command surface.
+    /// Provider and auth transitions can happen after agents already exist, so
+    /// this must be called whenever either provider's availability changes.
+    pub(crate) fn sync_usage_command_visibility(&mut self) {
+        let visible = self.usage_command_visible();
+        for agent in self.agents.values_mut() {
+            agent.set_usage_visible(visible);
+        }
+        self.welcome_prompt
+            .slash_controller
+            .registry_mut()
+            .set_usage_visible(visible);
+        if let Some(dashboard) = self.dashboard.as_mut() {
+            dashboard.set_usage_visible(visible);
+        }
+    }
+
+    /// Update xAI billing visibility and then re-evaluate the provider-neutral
+    /// `/usage` command gate. A team/API-key xAI session must not hide Codex
+    /// quota when ChatGPT is also connected.
+    pub fn apply_usage_visibility(&mut self, visible: bool) {
+        self.usage_visible = visible;
+        self.sync_usage_command_visibility();
+    }
     /// Sync the auto permission-mode feature gate into every slash surface.
     /// `/auto` is hard-hidden when `self.auto_mode_gate` is off; otherwise both
     /// `/always-approve` and `/auto` stay offered as true toggles. Mirrors
@@ -1412,7 +1687,8 @@ impl AppView {
     /// `x.ai/settings/update` handler when the subscription tier changes, so
     /// a mid-session upgrade lifts the restrictions without a restart.
     pub fn apply_tier_restrictions(&mut self) {
-        let restricted = self.team_name.is_none()
+        let restricted = self.uses_xai_access_controls()
+            && self.team_name.is_none()
             && !self.is_api_key_auth
             && is_restricted_tier(self.subscription_tier.as_deref());
         let names: Vec<String> = if restricted {
@@ -2112,15 +2388,19 @@ impl AppView {
                     new_worktree_dialog: &mut self.new_worktree_dialog,
                     menu_index: &mut self.welcome_menu_index,
                     menu_rects: &self.welcome_menu_rects,
-                    menu_count: if zdr_blocked {
-                        2
-                    } else {
-                        3 + if self.has_claude_import { 1 } else { 0 }
-                            + if self.welcome_show_changelog_action {
-                                1
-                            } else {
-                                0
-                            }
+                    menu_count: match &self.auth_state {
+                        AuthState::ProviderChoice { .. } => 3,
+                        AuthState::Pending { .. } => 2,
+                        AuthState::Authenticating { .. } => 0,
+                        AuthState::Done if zdr_blocked => 2,
+                        AuthState::Done => {
+                            3 + if self.has_claude_import { 1 } else { 0 }
+                                + if self.welcome_show_changelog_action {
+                                    1
+                                } else {
+                                    0
+                                }
+                        }
                     },
                     prompt_rect: self.welcome_prompt_rect.as_ref(),
                     import_banner_rect: self.welcome_import_banner_rect.as_ref(),
@@ -3160,6 +3440,26 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                     return InputOutcome::Action(Action::Quit);
                 }
             }
+            AuthState::ProviderChoice { .. } => {
+                if key!('q').matches(key)
+                    || key!('c', CONTROL).matches(key)
+                    || key!('d', CONTROL).matches(key)
+                {
+                    return InputOutcome::Action(Action::QuitConfirmed);
+                }
+                if key!('c').matches(key) {
+                    return InputOutcome::Action(Action::ChooseStartupCodex);
+                }
+                if key!('x').matches(key) {
+                    return InputOutcome::Action(Action::ChooseStartupXai);
+                }
+                if let Some(outcome) = handle_menu_nav(key, ctx.menu_index, 3) {
+                    return outcome;
+                }
+                if key!(Enter).matches(key) {
+                    return dispatch_provider_choice_menu_action(ctx.menu_index.unwrap_or(0));
+                }
+            }
             AuthState::Pending { .. } => {
                 if key!('q').matches(key)
                     || key!('c', CONTROL).matches(key)
@@ -3254,6 +3554,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                         && mouse.row >= rect.y
                         && mouse.row < rect.y + rect.height
                     {
+                        if matches!(ctx.auth_state, AuthState::ProviderChoice { .. }) {
+                            return dispatch_provider_choice_menu_action(i);
+                        }
                         if matches!(ctx.auth_state, AuthState::Pending { .. }) {
                             return dispatch_pending_menu_action(i);
                         }
@@ -3438,6 +3741,16 @@ fn handle_menu_nav(
             Some(InputOutcome::Changed)
         }
         _ => None,
+    }
+}
+/// Dispatch an action for the first-run provider chooser.
+/// Menu layout: 0 = ChatGPT Codex, 1 = xAI Grok, 2 = Quit.
+fn dispatch_provider_choice_menu_action(index: usize) -> InputOutcome {
+    match index {
+        0 => InputOutcome::Action(Action::ChooseStartupCodex),
+        1 => InputOutcome::Action(Action::ChooseStartupXai),
+        2 => InputOutcome::Action(Action::Quit),
+        _ => InputOutcome::Unchanged,
     }
 }
 /// Dispatch an action for a welcome menu item when not yet authenticated.
@@ -5100,6 +5413,13 @@ pub(crate) mod tests {
             bootstrap_acp_commands: Vec::new(),
             auth_methods: Vec::new(),
             auth_state: AuthState::Done,
+            primary_provider: PrimaryProvider::Xai,
+            startup_xai_ready: false,
+            startup_xai_auth_meta: None,
+            startup_codex_account: None,
+            startup_model_override: None,
+            startup_provider_selection: None,
+            codex_resume_auth_pending: false,
             trust_state: TrustState::Done,
             login_label: None,
             login_method_id: None,
@@ -8054,6 +8374,43 @@ pub(crate) mod tests {
                 "shift+`{ch}` must not open any modal",
             );
         }
+    }
+    #[test]
+    fn welcome_provider_choice_defaults_enter_to_codex() {
+        let mut app = test_app();
+        app.auth_state = AuthState::ProviderChoice { error: None };
+        app.welcome_prompt_focused = false;
+        app.welcome_menu_index = None;
+        let outcome = app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::ChooseStartupCodex)
+        ));
+    }
+    #[test]
+    fn welcome_provider_choice_x_shortcut_selects_xai() {
+        let mut app = test_app();
+        app.auth_state = AuthState::ProviderChoice { error: None };
+        app.welcome_prompt_focused = false;
+        let outcome = app.handle_input(&key_event(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::ChooseStartupXai)
+        ));
+    }
+    #[test]
+    fn welcome_provider_choice_arrow_navigation_dispatches_selected_row() {
+        let mut app = test_app();
+        app.auth_state = AuthState::ProviderChoice { error: None };
+        app.welcome_prompt_focused = false;
+        app.welcome_menu_index = Some(0);
+        let moved = app.handle_input(&key_event(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(moved, InputOutcome::Changed));
+        let outcome = app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::ChooseStartupXai)
+        ));
     }
     #[test]
     fn welcome_pending_l_triggers_login() {

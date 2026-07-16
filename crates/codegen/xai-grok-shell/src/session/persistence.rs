@@ -323,6 +323,10 @@ pub enum PersistenceMsg {
         agent_name: Option<String>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
     },
+    /// Persist the model compaction contract captured at turn start. Unlike
+    /// `CurrentModel`, this remains the previous turn's contract if the user
+    /// switches models and closes the app before sampling again.
+    PreviousTurnModel(crate::session::compaction_config::PreviousModelInfo),
     /// Observe provider use without changing the parent session's active
     /// model. Codex-backed subagents use this to close and persist the parent
     /// tree's cumulative xAI export boundary.
@@ -808,6 +812,10 @@ pub struct Summary {
     #[serde(default)]
     pub num_chat_messages: usize,
     pub current_model_id: acp::ModelId,
+    /// Compaction contract used by the most recently started model turn.
+    /// Restored so live Codex `comp_hash` changes are detected after resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_turn_model: Option<crate::session::compaction_config::PreviousModelInfo>,
     /// Once true, this session has carried Codex-backed content. The flag is
     /// monotonic and prevents cumulative session data from later being sent
     /// to xAI-only persistence, relay, feedback, or trace services.
@@ -937,6 +945,7 @@ impl Summary {
             num_messages: 0,
             num_chat_messages: 0,
             current_model_id: model_id,
+            previous_turn_model: None,
             ever_used_codex: false,
             parent_session_id: None,
             forked_at: None,
@@ -1054,6 +1063,23 @@ mod is_hidden_tests {
             let back: Summary = serde_json::from_str(&json).unwrap();
             assert_eq!(back.reasoning_effort, Some(effort));
         }
+    }
+
+    #[test]
+    fn summary_round_trips_previous_turn_compaction_contract() {
+        let mut summary = summary_with_kind(None);
+        summary.previous_turn_model = Some(crate::session::compaction_config::PreviousModelInfo {
+            model_slug: "gpt-5.6-sol".to_owned(),
+            context_window: 353_400,
+            comp_hash: Some("3000".to_owned()),
+        });
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let restored: Summary = serde_json::from_str(&json).unwrap();
+        let previous = restored.previous_turn_model.unwrap();
+        assert_eq!(previous.model_slug, "gpt-5.6-sol");
+        assert_eq!(previous.context_window, 353_400);
+        assert_eq!(previous.comp_hash.as_deref(), Some("3000"));
     }
 
     #[test]
@@ -1745,6 +1771,15 @@ impl SessionPersistence {
                         && let Some(sync) = &self.remote_sync
                     {
                         sync.set_model_id(model_id.0.to_string());
+                    }
+                }
+                PersistenceMsg::PreviousTurnModel(previous_model) => {
+                    if let Err(e) = self
+                        .storage
+                        .update_previous_turn_model(&self.info, previous_model)
+                        .await
+                    {
+                        tracing::warn!(?e, "failed to update previous-turn model metadata");
                     }
                 }
                 PersistenceMsg::ObserveProvider(provider) => {

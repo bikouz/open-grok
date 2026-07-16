@@ -2,6 +2,28 @@
 
 use super::*;
 
+fn add_provider_model(app: &mut AppView, model: &str, provider: &str) -> acp::ModelId {
+    let model_id = acp::ModelId::new(model.to_string());
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!(provider));
+    app.models.available.insert(
+        model_id.clone(),
+        acp::ModelInfo::new(model_id.clone(), model.to_string()).meta(Some(meta)),
+    );
+    model_id
+}
+
+fn set_agent_provider(app: &mut AppView, agent_id: AgentId, model: &str, provider: &str) {
+    let model_id = acp::ModelId::new(model.to_string());
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!(provider));
+    let models = acp::SessionModelState::new(
+        model_id.clone(),
+        vec![acp::ModelInfo::new(model_id, model.to_string()).meta(Some(meta))],
+    );
+    app.agents.get_mut(&agent_id).unwrap().session.models = Some(models).into();
+}
+
 #[test]
 fn codex_login_keeps_xai_session_active_and_emits_independent_effect() {
     let mut app = test_app_with_agent();
@@ -10,7 +32,8 @@ fn codex_login_keeps_xai_session_active_and_emits_independent_effect() {
     assert!(matches!(
         effects.as_slice(),
         [Effect::LoginCodex {
-            agent_id: Some(AgentId(0))
+            agent_id: Some(AgentId(0)),
+            purpose: CodexLoginPurpose::Independent,
         }]
     ));
     assert!(last_system_text(&app, AgentId(0)).contains("OpenAI Codex"));
@@ -24,27 +47,816 @@ fn codex_logout_keeps_xai_session_active_and_emits_independent_effect() {
     assert!(matches!(
         effects.as_slice(),
         [Effect::LogoutCodex {
-            agent_id: Some(AgentId(0))
+            agent_id: Some(AgentId(0)),
+            targets,
+            primary_was_codex: false,
         }]
+            if targets.is_empty()
     ));
 }
 
 #[test]
 fn codex_auth_completion_does_not_change_xai_auth_state() {
     let mut app = test_app_with_agent();
+    app.startup_codex_account = Some(xai_grok_shell::codex_auth::CodexAccountSummary {
+        email: Some("codex@example.com".into()),
+        account_id: Some("acct".into()),
+        plan_type: Some("Pro".into()),
+    });
     let before = format!("{:?}", app.auth_state);
     dispatch(
         Action::TaskComplete(TaskResult::CodexLogoutComplete {
             agent_id: Some(AgentId(0)),
+            targets: vec![],
+            primary_was_codex: false,
             result: Ok(true),
         }),
         &mut app,
     );
     assert_eq!(format!("{:?}", app.auth_state), before);
+    assert!(app.startup_codex_account.is_none());
     assert_eq!(
         last_system_text(&app, AgentId(0)),
         "OpenAI Codex disconnected."
     );
+}
+
+#[test]
+fn codex_login_keeps_combined_usage_available_when_xai_usage_is_hidden() {
+    let mut app = test_app_with_agent();
+    app.dashboard = Some(crate::views::dashboard::DashboardState::new());
+    app.apply_usage_visibility(false);
+    assert!(
+        app.agents[&AgentId(0)]
+            .prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
+    assert!(
+        app.welcome_prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
+
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: Some(AgentId(0)),
+            purpose: CodexLoginPurpose::Independent,
+            result: Ok(xai_grok_shell::codex_auth::CodexAccountSummary {
+                email: Some("codex@example.com".into()),
+                account_id: Some("acct".into()),
+                plan_type: Some("Pro".into()),
+            }),
+            models: None,
+        }),
+        &mut app,
+    );
+
+    assert!(!app.usage_visible, "xAI billing visibility stays disabled");
+    assert!(app.startup_codex_account.is_some());
+    assert!(
+        app.agents[&AgentId(0)]
+            .prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_some()
+    );
+    assert!(
+        app.welcome_prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_some()
+    );
+    let dashboard = app.dashboard.as_ref().unwrap();
+    assert!(
+        dashboard
+            .dispatch
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_some()
+    );
+    assert!(
+        dashboard
+            .peek_reply
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_some()
+    );
+
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexLogoutComplete {
+            agent_id: Some(AgentId(0)),
+            targets: vec![],
+            primary_was_codex: false,
+            result: Ok(true),
+        }),
+        &mut app,
+    );
+    assert!(app.startup_codex_account.is_none());
+    assert!(
+        app.agents[&AgentId(0)]
+            .prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
+    assert!(
+        app.welcome_prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
+    let dashboard = app.dashboard.as_ref().unwrap();
+    assert!(
+        dashboard
+            .dispatch
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
+    assert!(
+        dashboard
+            .peek_reply
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
+}
+
+#[test]
+fn codex_primary_logout_without_xai_fallback_returns_to_provider_choice() {
+    let mut app = test_app_with_agent();
+    app.primary_provider = PrimaryProvider::Codex;
+    app.startup_xai_ready = false;
+    app.startup_codex_account = Some(xai_grok_shell::codex_auth::CodexAccountSummary {
+        email: Some("codex@example.com".into()),
+        account_id: Some("acct".into()),
+        plan_type: Some("Pro".into()),
+    });
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLogoutComplete {
+            agent_id: Some(AgentId(0)),
+            targets: vec![ProviderSessionTarget {
+                agent_id: AgentId(0),
+                session_id: Some(acp::SessionId::new("test-session")),
+            }],
+            primary_was_codex: true,
+            result: Ok(true),
+        }),
+        &mut app,
+    );
+
+    assert!(app.startup_codex_account.is_none());
+    assert!(matches!(app.active_view, ActiveView::Welcome));
+    assert!(!app.agents.contains_key(&AgentId(0)));
+    assert!(matches!(app.auth_state, AuthState::ProviderChoice { .. }));
+    assert_eq!(app.welcome_menu_index, Some(0));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::UnregisterActiveSession { .. }))
+    );
+}
+
+#[test]
+fn codex_logout_removes_all_codex_tabs_and_preserves_xai_tab() {
+    for model_update_first in [false, true] {
+        let mut app = test_app_with_agent();
+        let codex_one = AgentId(0);
+        set_agent_provider(&mut app, codex_one, "gpt-5.6-sol", "codex");
+        for (id, sid, model, provider) in [
+            (AgentId(1), "codex-two", "gpt-5.6-terra", "codex"),
+            (AgentId(2), "xai-one", "grok-build", "xai"),
+        ] {
+            let session = make_test_agent_session(&app, id, sid);
+            app.agents
+                .insert(id, AgentView::new(session, ScrollbackState::new()));
+            set_agent_provider(&mut app, id, model, provider);
+        }
+        app.next_agent_id = 3;
+        app.primary_provider = PrimaryProvider::Codex;
+        app.startup_xai_ready = true;
+        app.active_view = ActiveView::Agent(codex_one);
+
+        let logout_effects = dispatch(Action::LogoutCodex, &mut app);
+        let (targets, primary_was_codex) = match logout_effects.as_slice() {
+            [
+                Effect::LogoutCodex {
+                    targets,
+                    primary_was_codex,
+                    ..
+                },
+            ] => (targets.clone(), *primary_was_codex),
+            other => panic!("expected one Codex logout effect, got {other:?}"),
+        };
+        if model_update_first {
+            // Simulate catalog clear winning the race and rewriting both Codex
+            // tabs/global provider to the visible xAI fallback.
+            set_agent_provider(&mut app, AgentId(0), "grok-build", "xai");
+            set_agent_provider(&mut app, AgentId(1), "grok-build", "xai");
+            app.primary_provider = PrimaryProvider::Xai;
+        }
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::CodexLogoutComplete {
+                agent_id: Some(codex_one),
+                targets,
+                primary_was_codex,
+                result: Ok(true),
+            }),
+            &mut app,
+        );
+
+        assert!(!app.agents.contains_key(&AgentId(0)));
+        assert!(!app.agents.contains_key(&AgentId(1)));
+        assert!(app.agents.contains_key(&AgentId(2)));
+        assert_eq!(app.active_view, ActiveView::Agent(AgentId(2)));
+        assert_eq!(app.primary_provider, PrimaryProvider::Xai);
+        let unregistered = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::UnregisterActiveSession { session_id } => Some(session_id.0.as_ref()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            unregistered,
+            std::collections::HashSet::from(["test-session", "codex-two"])
+        );
+        assert!(!unregistered.contains("xai-one"));
+    }
+}
+
+#[test]
+fn xai_logout_preserves_valid_codex_regardless_of_model_update_order() {
+    for model_update_first in [false, true] {
+        let mut app = test_app_with_agent();
+        let xai = AgentId(0);
+        let codex = AgentId(1);
+        set_agent_provider(&mut app, xai, "grok-build", "xai");
+        let session = make_test_agent_session(&app, codex, "codex-session");
+        app.agents
+            .insert(codex, AgentView::new(session, ScrollbackState::new()));
+        set_agent_provider(&mut app, codex, "gpt-5.6-sol", "codex");
+        app.next_agent_id = 2;
+        app.primary_provider = PrimaryProvider::Xai;
+        app.active_view = ActiveView::Agent(xai);
+
+        let plan = dispatch(Action::Logout, &mut app);
+        let (xai_targets, codex_targets) = match plan.as_slice() {
+            [
+                Effect::Logout {
+                    xai_targets,
+                    codex_targets,
+                },
+            ] => (xai_targets.clone(), codex_targets.clone()),
+            other => panic!("expected xAI logout plan, got {other:?}"),
+        };
+        if model_update_first {
+            // Simulate xAI disappearing from the catalog before the task result;
+            // the foreground model/provider now looks Codex even though this
+            // exact tab was xAI-owned when logout began.
+            set_agent_provider(&mut app, xai, "gpt-5.6-sol", "codex");
+            app.primary_provider = PrimaryProvider::Codex;
+        }
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::LogoutComplete {
+                xai_targets,
+                codex_targets,
+                codex_account: Some(xai_grok_shell::codex_auth::CodexAccountSummary {
+                    email: None,
+                    account_id: Some("acct".into()),
+                    plan_type: Some("Plus".into()),
+                }),
+            }),
+            &mut app,
+        );
+
+        assert!(
+            !app.agents.contains_key(&xai),
+            "ordering={model_update_first}"
+        );
+        assert!(
+            app.agents.contains_key(&codex),
+            "ordering={model_update_first}"
+        );
+        assert_eq!(app.active_view, ActiveView::Agent(codex));
+        assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+        assert!(matches!(app.auth_state, AuthState::Done));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::UnregisterActiveSession { session_id }
+                if session_id.0.as_ref() == "test-session"
+        )));
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::UnregisterActiveSession { session_id }
+                if session_id.0.as_ref() == "codex-session"
+        )));
+    }
+}
+
+#[test]
+fn independent_codex_login_completion_does_not_open_xai_auth_gate() {
+    let mut app = test_app_with_agent();
+    app.auth_state = AuthState::Pending { error: None };
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: Some(AgentId(0)),
+            purpose: CodexLoginPurpose::Independent,
+            result: Ok(xai_grok_shell::codex_auth::CodexAccountSummary {
+                email: Some("codex@example.com".into()),
+                account_id: Some("acct".into()),
+                plan_type: Some("Pro".into()),
+            }),
+            models: None,
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert!(matches!(app.auth_state, AuthState::Pending { .. }));
+    assert!(last_system_text(&app, AgentId(0)).contains("codex@example.com"));
+}
+
+#[test]
+fn independent_codex_login_applies_fallback_catalog_for_model_picker() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let xai_id = acp::ModelId::new("grok-build");
+    let codex_id = acp::ModelId::new("gpt-5.6-sol");
+    let mut xai_meta = acp::Meta::new();
+    xai_meta.insert("provider".to_string(), serde_json::json!("xai"));
+    let mut codex_meta = acp::Meta::new();
+    codex_meta.insert("provider".to_string(), serde_json::json!("codex"));
+    let models = acp::SessionModelState::new(
+        xai_id.clone(),
+        vec![
+            acp::ModelInfo::new(xai_id.clone(), "Grok Build".to_string()).meta(Some(xai_meta)),
+            acp::ModelInfo::new(codex_id.clone(), "GPT-5.6 Sol".to_string()).meta(Some(codex_meta)),
+        ],
+    );
+    app.agents.get_mut(&agent_id).unwrap().session.models = Some(models.clone()).into();
+
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: Some(agent_id),
+            purpose: CodexLoginPurpose::Independent,
+            result: Ok(xai_grok_shell::codex_auth::CodexAccountSummary {
+                email: None,
+                account_id: Some("acct".into()),
+                plan_type: Some("Plus".into()),
+            }),
+            models: Some(models),
+        }),
+        &mut app,
+    );
+
+    assert!(app.models.available.contains_key(&codex_id));
+    assert!(
+        app.agents[&agent_id]
+            .session
+            .models
+            .available
+            .contains_key(&codex_id),
+        "the /model catalog must include the embedded Codex fallback"
+    );
+    assert_eq!(app.primary_provider, PrimaryProvider::Xai);
+}
+
+#[test]
+fn stale_xai_subscription_result_does_not_gate_codex_provider() {
+    let mut app = test_app_with_agent();
+    app.primary_provider = PrimaryProvider::Codex;
+    app.clear_xai_access_controls();
+    let meta = serde_json::to_value(xai_grok_shell::auth::AuthMeta {
+        gate: Some(xai_grok_shell::auth::GateInfo {
+            message: "xAI subscription required".into(),
+            url: None,
+            label: None,
+        }),
+        subscription_tier: Some("Free".into()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CheckSubscriptionComplete {
+            verify: None,
+            meta: Some(meta),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(app.gate.is_none());
+    assert!(app.subscription_tier.is_none());
+    assert!(app.startup_xai_auth_meta.is_some());
+}
+
+#[test]
+fn startup_codex_choice_uses_separate_oauth_purpose_and_clears_xai_gate() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.gate = Some(xai_grok_shell::auth::GateInfo {
+        message: "xAI subscription required".into(),
+        url: None,
+        label: None,
+    });
+
+    let effects = dispatch(Action::ChooseStartupCodex, &mut app);
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::LoginCodex {
+            agent_id: None,
+            purpose: CodexLoginPurpose::Startup { request_seq: 1 },
+        }]
+    ));
+    assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+    assert!(app.gate.is_none());
+    assert!(matches!(
+        app.auth_state,
+        AuthState::Authenticating { request_seq: 1, .. }
+    ));
+}
+
+#[test]
+fn startup_codex_choice_reuses_fresh_cached_account_without_browser_login() {
+    let mut app = test_app();
+    add_provider_model(&mut app, "gpt-5.6-sol", "codex");
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.startup_codex_account = Some(xai_grok_shell::codex_auth::CodexAccountSummary {
+        email: Some("codex@example.com".into()),
+        account_id: Some("acct".into()),
+        plan_type: Some("Plus".into()),
+    });
+    app.deferred_startup.new_session = true;
+
+    let effects = dispatch(Action::ChooseStartupCodex, &mut app);
+
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LoginCodex { .. } | Effect::Authenticate { .. }
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateSession {
+            model_id: Some(model),
+            ..
+        } if model.0.as_ref() == "gpt-5.6-sol"
+    )));
+}
+
+#[test]
+fn startup_codex_success_selects_sol_and_drains_without_xai_effects() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.deferred_startup.new_session = true;
+    let _ = dispatch(Action::ChooseStartupCodex, &mut app);
+    let model_id = acp::ModelId::new("gpt-5.6-sol");
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!("codex"));
+    let refreshed_models = acp::SessionModelState::new(
+        model_id.clone(),
+        vec![acp::ModelInfo::new(model_id, "GPT-5.6 Sol".to_string()).meta(Some(meta))],
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: None,
+            purpose: CodexLoginPurpose::Startup { request_seq: 1 },
+            result: Ok(xai_grok_shell::codex_auth::CodexAccountSummary {
+                email: None,
+                account_id: Some("acct".into()),
+                plan_type: Some("Plus".into()),
+            }),
+            models: Some(refreshed_models),
+        }),
+        &mut app,
+    );
+
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+    assert_eq!(
+        app.startup_model_override.as_ref().map(|id| id.0.as_ref()),
+        Some("gpt-5.6-sol")
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::PersistSetting {
+            key: "default_model",
+            value: crate::settings::SettingValue::String(value),
+            ..
+        } if value == "gpt-5.6-sol"
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateSession {
+            model_id: Some(model),
+            ..
+        } if model.0.as_ref() == "gpt-5.6-sol"
+    )));
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CheckSubscription { .. } | Effect::FetchAppBilling
+        )),
+        "Codex startup must not enter xAI subscription or billing gates: {effects:?}"
+    );
+}
+
+#[test]
+fn startup_codex_preserves_configured_default_after_oauth() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.startup_model_override = Some(acp::ModelId::new("gpt-5.6-terra"));
+    let _ = dispatch(Action::ChooseStartupCodex, &mut app);
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!("codex"));
+    let terra = acp::ModelId::new("gpt-5.6-terra");
+    let sol = acp::ModelId::new("gpt-5.6-sol");
+    let models = acp::SessionModelState::new(
+        sol.clone(),
+        vec![
+            acp::ModelInfo::new(sol, "GPT-5.6 Sol".to_string()).meta(Some(meta.clone())),
+            acp::ModelInfo::new(terra.clone(), "GPT-5.6 Terra".to_string()).meta(Some(meta)),
+        ],
+    );
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: None,
+            purpose: CodexLoginPurpose::Startup { request_seq: 1 },
+            result: Ok(xai_grok_shell::codex_auth::CodexAccountSummary {
+                email: None,
+                account_id: Some("acct".into()),
+                plan_type: Some("Plus".into()),
+            }),
+            models: Some(models),
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.startup_model_override, Some(terra));
+}
+
+#[test]
+fn stale_configured_codex_default_falls_back_within_codex() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.startup_model_override = Some(acp::ModelId::new("codex-no-longer-listed"));
+    let _ = dispatch(Action::ChooseStartupCodex, &mut app);
+    let visible = acp::ModelId::new("codex-visible");
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!("codex"));
+    let models = acp::SessionModelState::new(
+        visible.clone(),
+        vec![acp::ModelInfo::new(visible.clone(), "Codex Visible".to_string()).meta(Some(meta))],
+    );
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: None,
+            purpose: CodexLoginPurpose::Startup { request_seq: 1 },
+            result: Ok(xai_grok_shell::codex_auth::CodexAccountSummary {
+                email: None,
+                account_id: Some("acct".into()),
+                plan_type: Some("Plus".into()),
+            }),
+            models: Some(models),
+        }),
+        &mut app,
+    );
+
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert_eq!(app.startup_model_override, Some(visible));
+}
+
+#[test]
+fn startup_codex_falls_back_only_to_a_visible_codex_model() {
+    let mut app = test_app();
+    add_provider_model(&mut app, "gpt-5.6-sol", "xai");
+    add_provider_model(&mut app, "codex-visible", "codex");
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.startup_codex_account = Some(xai_grok_shell::codex_auth::CodexAccountSummary {
+        email: None,
+        account_id: Some("acct".into()),
+        plan_type: Some("Plus".into()),
+    });
+
+    let effects = dispatch(Action::ChooseStartupCodex, &mut app);
+
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert_eq!(
+        app.startup_model_override.as_ref().map(|id| id.0.as_ref()),
+        Some("codex-visible")
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::PersistSetting {
+            key: "default_model",
+            value: crate::settings::SettingValue::String(value),
+            ..
+        } if value == "codex-visible"
+    )));
+}
+
+#[test]
+fn startup_codex_without_a_visible_codex_model_returns_to_chooser() {
+    let mut app = test_app();
+    add_provider_model(&mut app, "grok-visible", "xai");
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.startup_codex_account = Some(xai_grok_shell::codex_auth::CodexAccountSummary {
+        email: None,
+        account_id: Some("acct".into()),
+        plan_type: Some("Plus".into()),
+    });
+    app.deferred_startup.new_session = true;
+
+    let effects = dispatch(Action::ChooseStartupCodex, &mut app);
+
+    assert!(effects.is_empty());
+    assert!(app.startup_model_override.is_none());
+    assert!(matches!(
+        &app.auth_state,
+        AuthState::ProviderChoice { error: Some(error) }
+            if error.contains("No visible ChatGPT Codex model")
+    ));
+    assert!(app.deferred_startup.new_session);
+}
+
+#[test]
+fn startup_codex_failure_returns_to_provider_choice() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    let _ = dispatch(Action::ChooseStartupCodex, &mut app);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginComplete {
+            agent_id: None,
+            purpose: CodexLoginPurpose::Startup { request_seq: 1 },
+            result: Err("browser cancelled".into()),
+            models: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(matches!(
+        &app.auth_state,
+        AuthState::ProviderChoice { error: Some(error) }
+            if error.contains("browser cancelled")
+    ));
+    assert_eq!(app.welcome_menu_index, Some(0));
+}
+
+#[test]
+fn startup_xai_authenticates_before_selecting_from_post_auth_catalog() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+
+    let login_effects = dispatch(Action::ChooseStartupXai, &mut app);
+
+    assert_eq!(app.primary_provider, PrimaryProvider::Xai);
+    assert!(app.startup_model_override.is_none());
+    assert!(
+        login_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Authenticate { .. }))
+    );
+    let model_id = acp::ModelId::new("grok-visible");
+    let mut model_meta = acp::Meta::new();
+    model_meta.insert("provider".to_string(), serde_json::json!("xai"));
+    let models = acp::SessionModelState::new(
+        model_id.clone(),
+        vec![acp::ModelInfo::new(model_id, "Grok Visible".to_string()).meta(Some(model_meta))],
+    );
+    let complete_effects = dispatch(
+        Action::TaskComplete(TaskResult::AuthComplete {
+            request_seq: 1,
+            meta: Some(serde_json::json!({ "models": models })),
+        }),
+        &mut app,
+    );
+
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert_eq!(
+        app.startup_model_override.as_ref().map(|id| id.0.as_ref()),
+        Some("grok-visible")
+    );
+    assert!(complete_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::PersistSetting {
+            key: "default_model",
+            value: crate::settings::SettingValue::String(value),
+            ..
+        } if value == "grok-visible"
+    )));
+}
+
+#[test]
+fn startup_xai_preserves_configured_default_after_auth() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.startup_model_override = Some(acp::ModelId::new("grok-configured"));
+    let _ = dispatch(Action::ChooseStartupXai, &mut app);
+    let configured = acp::ModelId::new("grok-configured");
+    let fallback = acp::ModelId::new("grok-build");
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!("xai"));
+    let models = acp::SessionModelState::new(
+        fallback.clone(),
+        vec![
+            acp::ModelInfo::new(fallback, "Grok Build".to_string()).meta(Some(meta.clone())),
+            acp::ModelInfo::new(configured.clone(), "Grok Configured".to_string()).meta(Some(meta)),
+        ],
+    );
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::AuthComplete {
+            request_seq: 1,
+            meta: Some(serde_json::json!({ "models": models })),
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.startup_model_override, Some(configured));
+}
+
+#[test]
+fn startup_xai_choice_reuses_already_authenticated_acp_without_browser_login() {
+    let mut app = test_app();
+    add_provider_model(&mut app, "grok-build", "xai");
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.startup_xai_ready = true;
+    app.deferred_startup.new_session = true;
+    app.models
+        .set_current(acp::ModelId::new("gpt-5.6-sol"), None);
+
+    let effects = dispatch(Action::ChooseStartupXai, &mut app);
+
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Authenticate { .. } | Effect::PollAuthUrl { .. }
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateSession {
+            model_id: Some(model),
+            ..
+        } if model.0.as_ref() == "grok-build"
+    )));
+}
+
+#[test]
+fn startup_xai_without_a_visible_xai_model_stays_on_provider_chooser() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+
+    let login_effects = dispatch(Action::ChooseStartupXai, &mut app);
+    assert!(
+        login_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Authenticate { .. }))
+    );
+    let codex_id = acp::ModelId::new("codex-visible");
+    let mut model_meta = acp::Meta::new();
+    model_meta.insert("provider".to_string(), serde_json::json!("codex"));
+    let models = acp::SessionModelState::new(
+        codex_id.clone(),
+        vec![acp::ModelInfo::new(codex_id, "Codex Visible".to_string()).meta(Some(model_meta))],
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::AuthComplete {
+            request_seq: 1,
+            meta: Some(serde_json::json!({ "models": models })),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(app.startup_model_override.is_none());
+    assert!(matches!(
+        &app.auth_state,
+        AuthState::ProviderChoice { error: Some(error) }
+            if error.contains("No visible xAI Grok model")
+    ));
+    assert_eq!(app.welcome_menu_index, Some(1));
 }
 
 #[test]

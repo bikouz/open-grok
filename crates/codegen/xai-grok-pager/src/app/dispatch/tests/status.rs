@@ -914,6 +914,7 @@ fn show_usage_with_redirect_url_skips_only_xai_fetch() {
             effects.as_slice(),
             [Effect::FetchUsage {
                 agent_id: AgentId(0),
+                include_xai: true,
                 xai_redirect_url: Some(url),
             }] if url == "https://billing.example.com/me"
         ),

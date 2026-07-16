@@ -167,7 +167,7 @@ impl AgentRebuildSpec {
     /// discovery in subagents.
     ///
     /// Both are consumed once — the rebuild path (`build_agent`) passes
-    /// `None` for both so zero-turn model switches get fresh discovery.
+    /// `None` for both so between-turn harness switches get fresh discovery.
     pub async fn build_agent_with_initial_overrides(
         self: &Arc<Self>,
         definition: AgentDefinition,

@@ -180,6 +180,7 @@ fn dispatch_load_session_ungated(
         scrollback,
     );
     app.agents.insert(agent_id, agent);
+    let usage_command_visible = app.usage_command_visible();
     let agent_mut = app.agents.get_mut(&agent_id).unwrap();
     agent_mut.attached_as_viewer = true;
     agent_mut.begin_replay_window();
@@ -198,7 +199,7 @@ fn dispatch_load_session_ungated(
     }
     agent_mut.apply_app_scoped_gates(
         app.sharing_enabled,
-        app.usage_visible,
+        usage_command_visible,
         app.chat_mode,
         app.screen_mode,
         &app.active_announcements,
@@ -830,6 +831,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
         scrollback,
     );
     app.agents.insert(agent_id, agent);
+    let usage_command_visible = app.usage_command_visible();
     {
         let agent = app.agents.get_mut(&agent_id).unwrap();
         agent.attached_as_viewer = true;
@@ -843,7 +845,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
         agent.set_voice_mode_available(app.voice_mode_enabled);
         agent.apply_app_scoped_gates(
             app.sharing_enabled,
-            app.usage_visible,
+            usage_command_visible,
             app.chat_mode,
             app.screen_mode,
             &app.active_announcements,
@@ -880,10 +882,20 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         agent_id,
         session_id,
     );
-    if let Some(agent) = app.agents.get_mut(&agent_id) {
-        if defer_to_open_reload_window(agent, agent_id, "SessionLoaded") {
-            return vec![];
+    if let Some(agent) = app.agents.get_mut(&agent_id)
+        && defer_to_open_reload_window(agent, agent_id, "SessionLoaded")
+    {
+        return vec![];
+    }
+    if let Some(models) = new_models {
+        app.models = Some(models).into();
+        if let Some(agent) = app.agents.get_mut(&agent_id) {
+            agent.session.models = app.models.clone();
         }
+    }
+    let provider_effects = app.sync_primary_provider_from_active_agent();
+    let fetch_xai_billing = app.uses_xai_access_controls() && provider_effects.is_empty();
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
         let hydrate_sid = session_id.clone();
         agent.bind_session_id(session_id);
         agent.scrollback.end_batch();
@@ -893,10 +905,6 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         agent.mark_turn_finished();
         if let Some(placeholder_id) = agent.loading_placeholder_id.take() {
             agent.scrollback.remove_entry(placeholder_id);
-        }
-        if let Some(m) = new_models {
-            app.models = Some(m).into();
-            agent.session.models = app.models.clone();
         }
         let deferred = crate::app::dispatch::session::lifecycle::apply_deferred_model_switch(
             agent,
@@ -943,7 +951,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
                 child.scrollback.finish_all_running();
             }
         }
-        let mut effects = Vec::new();
+        let mut effects = provider_effects;
         if let Some(directive) = agent.pending_first_prompt.take() {
             agent.session.enqueue_prompt_front(directive);
         }
@@ -970,10 +978,12 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
                 session_id: hydrate_sid.clone(),
             });
         }
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-        });
+        if fetch_xai_billing {
+            effects.push(Effect::FetchBilling {
+                agent_id,
+                silent: true,
+            });
+        }
         if let Some((model_id, effort)) = deferred {
             agent.session.model_switch_pending = true;
             effects.push(Effect::SwitchModel {
@@ -1027,6 +1037,40 @@ pub(in crate::app::dispatch) fn handle_session_load_failed(
             }));
     }
     vec![]
+}
+
+/// Resume a persisted Codex session only after its independent provider auth
+/// is restored. The failed placeholder is never left promptable, and the exact
+/// load request is retained for the normal post-login startup drain.
+pub(in crate::app::dispatch) fn handle_codex_session_load_auth_required(
+    app: &mut AppView,
+    agent_id: AgentId,
+    session_id: acp::SessionId,
+) -> Vec<Effect> {
+    let (session_cwd, chat_kind) = app
+        .agents
+        .get(&agent_id)
+        .map(|agent| (Some(agent.session.cwd.clone()), agent.chat_kind))
+        .unwrap_or_else(|| (Some(app.cwd.clone()), app.chat_mode));
+    let session_id_string = session_id.0.to_string();
+
+    app.deferred_startup.session =
+        Some(crate::app::session_startup::DeferredSessionStartup::Load {
+            session_id: session_id_string,
+            session_cwd,
+            chat_kind,
+        });
+    // Do not trust a launch-time account summary after the shell has reported
+    // that the on-disk credential is absent. Force a real OAuth check.
+    app.startup_codex_account = None;
+    app.sync_usage_command_visibility();
+    app.startup_provider_selection = None;
+    app.codex_resume_auth_pending = true;
+    super::modal::remove_agent_and_cleanup(app, agent_id);
+    super::super::ctx::show_welcome(app);
+    let mut effects = vec![Effect::UnregisterActiveSession { session_id }];
+    effects.extend(super::super::auth::dispatch_codex_session_resume_auth(app));
+    effects
 }
 pub(in crate::app::dispatch) fn handle_session_search_debounce_expired(
     app: &mut AppView,

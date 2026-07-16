@@ -589,6 +589,10 @@ pub struct FeedbackContext {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartupHints {
+    /// Runtime-only previous-turn compaction metadata restored from summary.
+    /// Never accepted from ACP client metadata.
+    #[serde(skip)]
+    pub previous_turn_model: Option<crate::session::compaction_config::PreviousModelInfo>,
     #[serde(default)]
     pub non_interactive: bool,
     #[serde(default)]

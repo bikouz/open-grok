@@ -491,9 +491,29 @@ fn show_usage_returns_combined_fetch_usage_effect() {
     // `FetchBilling` independently.
     assert_eq!(effects.len(), 1, "got: {effects:?}");
     assert!(
-        matches!(&effects[0], Effect::FetchUsage { agent_id, xai_redirect_url: None } if *agent_id == AgentId(0)),
+        matches!(&effects[0], Effect::FetchUsage { agent_id, include_xai: true, xai_redirect_url: None } if *agent_id == AgentId(0)),
         "effect should fetch both providers, got: {effects:?}"
     );
+}
+
+#[test]
+fn show_usage_skips_hidden_xai_billing_but_still_fetches_codex() {
+    let mut app = test_app_with_agent();
+    app.startup_codex_account = Some(xai_grok_shell::codex_auth::CodexAccountSummary {
+        email: None,
+        account_id: Some("acct".into()),
+        plan_type: Some("Pro".into()),
+    });
+    app.apply_usage_visibility(false);
+    let effects = dispatch(Action::ShowUsage, &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::FetchUsage {
+            agent_id: AgentId(0),
+            include_xai: false,
+            xai_redirect_url: None,
+        }]
+    ));
 }
 
 #[test]

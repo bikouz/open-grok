@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::commands::SamplerCommand;
 use crate::config::{RetryPolicy, SamplerConfig};
 use crate::events::SamplingEvent;
+use crate::handle::CodexTurnState;
 use crate::handle::SamplerHandle;
 use state::{ActiveRequest, ActorState};
 
@@ -45,6 +46,7 @@ impl SamplerActor {
         event_tx: mpsc::UnboundedSender<SamplingEvent>,
     ) -> SamplerHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let codex_turn_state = CodexTurnState::default();
         let actor = Self {
             cmd_rx,
             event_tx,
@@ -52,7 +54,7 @@ impl SamplerActor {
             tasks: JoinSet::new(),
         };
         tokio::spawn(actor.run());
-        SamplerHandle::new(cmd_tx)
+        SamplerHandle::new(cmd_tx, codex_turn_state)
     }
 
     async fn run(mut self) {
@@ -101,6 +103,7 @@ impl SamplerActor {
                 request_id,
                 request,
                 config,
+                codex_turn_state,
                 completion_tx,
             } => {
                 let cancel_token = CancellationToken::new();
@@ -126,6 +129,7 @@ impl SamplerActor {
                     event_tx,
                     cancel_token,
                     completion_tx,
+                    codex_turn_state,
                 ));
             }
             SamplerCommand::Cancel { request_id } => {

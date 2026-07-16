@@ -242,13 +242,16 @@ pub(super) fn dispatch_exit_dashboard(app: &mut AppView) -> Vec<Effect> {
     }
     log_dashboard_closed(app);
     // Return to either Welcome or the most recently active agent.
-    if let Some(id) = app.agents.keys().next().copied() {
+    let effects = if let Some(id) = app.agents.keys().next().copied() {
         app.active_view = ActiveView::Agent(id);
+        let effects = app.sync_primary_provider_from_active_agent();
         surface_yolo_launch_block_notice(app, id);
+        effects
     } else {
         show_welcome(app);
-    }
-    vec![]
+        Vec::new()
+    };
+    effects
 }
 
 pub(super) fn dispatch_dashboard_attach(
@@ -268,6 +271,7 @@ pub(super) fn dispatch_dashboard_attach(
     // on a previously attached agent (legacy popup row-click path
     // reaches here without a key press) must not follow the user in.
     clear_pending_overlay_stop(app);
+    let mut provider_effects = Vec::new();
     match id {
         DashboardRowId::TopLevel(agent_id) => {
             if !app.agents.contains_key(&agent_id) {
@@ -293,6 +297,7 @@ pub(super) fn dispatch_dashboard_attach(
                 d.attached_agent = Some(agent_id);
             }
             app.active_view = ActiveView::Agent(agent_id);
+            provider_effects.extend(app.sync_primary_provider_from_active_agent());
             log_dashboard_attached(&DashboardRowId::TopLevel(agent_id));
             surface_yolo_launch_block_notice(app, agent_id);
         }
@@ -330,6 +335,7 @@ pub(super) fn dispatch_dashboard_attach(
                 d.attached_agent = Some(parent);
             }
             app.active_view = ActiveView::Agent(parent);
+            provider_effects.extend(app.sync_primary_provider_from_active_agent());
             log_dashboard_attached(&row_id);
             surface_yolo_launch_block_notice(app, parent);
         }
@@ -386,7 +392,7 @@ pub(super) fn dispatch_dashboard_attach(
             return effects;
         }
     }
-    vec![]
+    provider_effects
 }
 
 /// Exit the dashboard's session-overlay: dismiss the bordered
@@ -1034,8 +1040,9 @@ pub(super) fn dispatch_dashboard_overlay_cycle(app: &mut AppView, delta: i32) ->
         d.focus_row(DashboardRowId::TopLevel(next_id));
     }
     app.active_view = ActiveView::Agent(next_id);
+    let effects = app.sync_primary_provider_from_active_agent();
     surface_yolo_launch_block_notice(app, next_id);
-    vec![]
+    effects
 }
 
 pub(super) fn dispatch_dashboard_dispatch(
@@ -1679,7 +1686,7 @@ pub(super) fn dispatch_dashboard_peek_reply(
             entry.images = images;
         }
     }
-    let effects = maybe_drain_queue(agent);
+    let mut effects = maybe_drain_queue(agent);
 
     // Clear the reply draft now that it's been accepted, and drop any
     // stale error toast.
@@ -1697,6 +1704,7 @@ pub(super) fn dispatch_dashboard_peek_reply(
             d.attached_agent = Some(agent_id);
         }
         app.active_view = ActiveView::Agent(agent_id);
+        effects.extend(app.sync_primary_provider_from_active_agent());
         surface_yolo_launch_block_notice(app, agent_id);
     }
 

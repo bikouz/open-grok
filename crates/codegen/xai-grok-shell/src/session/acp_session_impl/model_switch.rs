@@ -141,13 +141,15 @@ impl SessionActor {
     /// rewrites the system message in the conversation, persists the
     /// new prompt artifacts, and updates `active_agent_type`.
     ///
-    /// Triggered from `MvpAgent::set_session_model` only when the new
-    /// model's `agent_type` differs from the session's current
-    /// `active_agent_type` AND `turn_count == 0` (no user message has
-    /// been sent yet). Defense-in-depth: rejects if a turn is in flight.
+    /// Triggered from `MvpAgent::set_session_model` when the new model's
+    /// `agent_type` differs from the session's current `active_agent_type`.
+    /// Defense-in-depth: rejects if a turn is in flight. When
+    /// `preserve_history` is true, the existing first user/prefix item is not
+    /// rewritten because it is no longer safe to infer its role by position.
     pub(super) async fn handle_rebuild_agent_for_definition(
         &self,
         definition: xai_grok_agent::AgentDefinition,
+        preserve_history: bool,
     ) -> Result<(), acp::Error> {
         {
             let state = self.state.lock().await;
@@ -167,7 +169,7 @@ impl SessionActor {
             "handle_rebuild_agent_for_definition: rebuilding harness"
         );
         // The model switch resolves metadata-first tool mode before requesting
-        // a zero-turn harness rebuild. Preserve that resolved session mode;
+        // a between-turn harness rebuild. Preserve that resolved session mode;
         // the rebuild spec only owns the Settings fallback and cannot infer
         // which model is currently active.
         let current_tool_mode = self.agent.borrow().tool_mode();
@@ -263,16 +265,22 @@ impl SessionActor {
         if let Some(old_handle) = self.deferred_prefix.take() {
             old_handle.abort();
         }
-        let new_user_prefix = self.build_user_message_prefix().await;
+        let new_user_prefix = if preserve_history {
+            None
+        } else {
+            Some(self.build_user_message_prefix().await)
+        };
         {
             let mut conversation = self.chat_state_handle.get_conversation().await;
             let _ = replace_or_insert_system_head(&mut conversation, &new_system_prompt);
-            let drop_startup_skill_reminder = false;
-            Self::rewrite_zero_turn_prefix(
-                &mut conversation,
-                new_user_prefix,
-                drop_startup_skill_reminder,
-            );
+            if let Some(new_user_prefix) = new_user_prefix {
+                let drop_startup_skill_reminder = false;
+                Self::rewrite_zero_turn_prefix(
+                    &mut conversation,
+                    new_user_prefix,
+                    drop_startup_skill_reminder,
+                );
+            }
             if !conversation_has_project_instructions(&conversation)
                 && let Some(agents_md_reminder) = self.agent.borrow().agents_md_user_reminder()
             {

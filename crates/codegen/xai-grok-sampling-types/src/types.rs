@@ -1139,6 +1139,12 @@ pub struct CreateResponseWrapper {
     /// async-openai 0.33.1 does not yet model. The sampler restores these exact
     /// content positions after typed request serialization.
     pub original_detail_custom_output_images: Vec<crate::OriginalDetailCustomOutputImageOccurrence>,
+
+    /// Provider-native Codex replacement-history items returned by
+    /// `/responses/compact`. The typed request carries placeholders at these
+    /// positions; the Codex transport restores the exact raw items after
+    /// serialization.
+    pub raw_input_replacements: Vec<crate::RawInputItemReplacement>,
 }
 
 impl CreateResponseWrapper {
@@ -1158,6 +1164,7 @@ impl CreateResponseWrapper {
             extra_raw_tools: vec![],
             named_custom_tool_outputs: vec![],
             original_detail_custom_output_images: vec![],
+            raw_input_replacements: vec![],
         }
     }
 

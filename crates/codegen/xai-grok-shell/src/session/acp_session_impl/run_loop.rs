@@ -313,8 +313,9 @@ pub(super) async fn run_session(
             .handle_set_session_model(model_id, sampling_config, use_concise,
             apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).
             await; let _ = responds_to.send(updated_model_id); }
-            SessionCommand::RebuildAgentForDefinition { definition, responds_to } => {
-            let outcome = session.handle_rebuild_agent_for_definition(definition). await;
+            SessionCommand::RebuildAgentForDefinition { definition, preserve_history,
+            responds_to } => { let outcome = session
+            .handle_rebuild_agent_for_definition(definition, preserve_history). await;
             let _ = responds_to.send(outcome); } SessionCommand::OverrideModelName {
             model_name, extra_headers, context_window } => { if let Some(mut cfg) =
             session.chat_state_handle.get_sampling_config(). await {

@@ -622,6 +622,22 @@ impl SessionActor {
             xai_grok_sampler::SamplingClient::new(full_config).map_err(|e| self.to_acp_error(e))?;
         Ok(sampling_client)
     }
+
+    /// Build a direct client that participates in the active logical Codex
+    /// turn. This is reserved for the remote compact endpoint; auxiliary
+    /// sampling clients deliberately remain detached from main-turn sticky
+    /// routing state.
+    pub(super) async fn prepare_chat_completion_with_codex_turn_state(
+        &self,
+        force_http1: bool,
+        codex_turn_state: std::sync::Arc<std::sync::OnceLock<String>>,
+    ) -> Result<xai_grok_sampler::SamplingClient, acp::Error> {
+        self.refresh_token_if_expired().await;
+        let mut full_config = self.reconstruct_full_config().await;
+        full_config.force_http1 = force_http1;
+        xai_grok_sampler::SamplingClient::new_with_codex_turn_state(full_config, codex_turn_state)
+            .map_err(|e| self.to_acp_error(e))
+    }
     /// Push a fresh `SamplerConfig` into the per-session sampler actor
     /// before each turn. Mirrors `prepare_chat_completion`'s
     /// auth-refresh + config rebuild, but routes the result to the

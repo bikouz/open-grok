@@ -46,7 +46,8 @@ impl AppView {
     /// Consumer xAI session auth: not an API key, not an enterprise team.
     /// Subscription gates and the watch only apply to these sessions.
     fn is_consumer_session(&self) -> bool {
-        matches!(self.auth_state, AuthState::Done)
+        self.uses_xai_access_controls()
+            && matches!(self.auth_state, AuthState::Done)
             && !self.is_api_key_auth
             && self.team_name.is_none()
     }

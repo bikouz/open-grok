@@ -44,6 +44,12 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
                 .models
                 .update_catalog(new_models.available.clone(), shell_fallback_current.clone());
         }
+        // Catalog refreshes can remove the active model and make the shell's
+        // fallback current. Re-anchor provider state after every agent has
+        // applied that fallback, and queue the same live xAI revalidation used
+        // by explicit model/session transitions.
+        let effects = app.sync_primary_provider_from_active_agent();
+        app.pending_effects.extend(effects);
         true
     } else {
         tracing::warn!("Failed to parse x.ai/models/update");
@@ -118,11 +124,13 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     // Tier before voice: same payload may set "API Key" and voice_mode_enabled=false.
     // Always recompute is_api_key_auth from the tier so a later Free/SuperGrok
     // stamp does not leave API-key bypass / hidden `/usage` stuck.
-    if let Some(v) = update.subscription_tier_display {
+    if app.uses_xai_access_controls()
+        && let Some(v) = update.subscription_tier_display
+    {
         let was_api_key = app.is_api_key_auth;
         let is_key = super::super::app_view::is_api_key_label(&v);
         app.is_api_key_auth = is_key;
-        app.usage_visible = !is_key && app.team_name.is_none();
+        app.apply_usage_visibility(!is_key && app.team_name.is_none());
         app.subscription_tier = Some(v);
         app.apply_tier_restrictions();
         // Leaving API Key → free/X Basic without a voice field: drop force-on.

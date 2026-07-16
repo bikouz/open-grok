@@ -9,6 +9,26 @@
 use super::agent::AgentId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
+
+/// Why the independent Codex OAuth flow was started.
+///
+/// Mid-session `/login codex` must remain independent from the xAI ACP auth
+/// gate. Startup onboarding, on the other hand, owns the welcome-screen auth
+/// state and opens the deferred session gate when it succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexLoginPurpose {
+    Independent,
+    Startup { request_seq: u64 },
+    SessionResume { request_seq: u64 },
+}
+
+/// Immutable snapshot of a Codex-backed tab captured before logout clears the
+/// provider catalog and model-update notifications can rewrite live state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSessionTarget {
+    pub agent_id: AgentId,
+    pub session_id: Option<acp::SessionId>,
+}
 /// Typed error for model switch failures. Replaces the raw `String` in
 /// `TaskResult::SwitchModelComplete` so dispatch can match on the variant
 /// instead of parsing strings.
@@ -602,6 +622,10 @@ pub enum Action {
     Login,
     /// Connect the independent OpenAI Codex OAuth account in the browser.
     LoginCodex,
+    /// Use ChatGPT Codex as the provider for this first-run TUI launch.
+    ChooseStartupCodex,
+    /// Use xAI Grok as the provider for this first-run TUI launch.
+    ChooseStartupXai,
     /// Cancel an in-progress login that was started from inside a session
     /// (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit
@@ -1880,12 +1904,23 @@ pub enum Effect {
         /// interjections — the wire shape stays byte-identical to legacy.
         blocks: Option<Vec<acp::ContentBlock>>,
     },
-    /// Log out via `x.ai/auth/logout` (shell clears auth.json + in-memory state).
-    Logout,
+    /// Log out via `x.ai/auth/logout` with provider ownership snapshotted
+    /// before shell model updates can rewrite the live catalogs.
+    Logout {
+        xai_targets: Vec<ProviderSessionTarget>,
+        codex_targets: Vec<ProviderSessionTarget>,
+    },
     /// Run the independent OpenAI Codex browser OAuth flow.
-    LoginCodex { agent_id: Option<AgentId> },
+    LoginCodex {
+        agent_id: Option<AgentId>,
+        purpose: CodexLoginPurpose,
+    },
     /// Revoke and remove the independent OpenAI Codex OAuth credentials.
-    LogoutCodex { agent_id: Option<AgentId> },
+    LogoutCodex {
+        agent_id: Option<AgentId>,
+        targets: Vec<ProviderSessionTarget>,
+        primary_was_codex: bool,
+    },
     /// Re-check subscription status via `x.ai/auth/check_subscription`.
     /// `verify` scopes the result to a deferred-gate verification (see
     /// [`crate::app::subscription`]); `None` for generic checks.
@@ -1989,6 +2024,9 @@ pub enum Effect {
     /// manual `/usage` summary. Each provider reports success independently.
     FetchUsage {
         agent_id: AgentId,
+        /// Whether this xAI account exposes billing usage. Codex quota remains
+        /// independently fetchable when this is false.
+        include_xai: bool,
         /// Remote xAI kill switch: show this management URL instead of
         /// calling `x.ai/billing`, while still fetching Codex usage.
         xai_redirect_url: Option<String>,
@@ -2126,6 +2164,13 @@ pub enum TaskResult {
         agent_id: AgentId,
         session_id: acp::SessionId,
         error: String,
+    },
+    /// A persisted Codex session was selected without provider-local auth.
+    /// The pager removes the inert placeholder, runs Codex OAuth, and retries
+    /// the same deferred load after login succeeds.
+    CodexSessionLoadAuthRequired {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
     },
     /// Local `summary.json` title read for [`Effect::HydrateSessionTitleFromDisk`].
     SessionTitleFromDisk {
@@ -2570,15 +2615,26 @@ pub enum TaskResult {
         commands: Vec<acp::AvailableCommand>,
     },
     /// Shell acknowledged logout (auth cleared).
-    LogoutComplete,
+    LogoutComplete {
+        xai_targets: Vec<ProviderSessionTarget>,
+        codex_targets: Vec<ProviderSessionTarget>,
+        codex_account: Option<xai_grok_shell::codex_auth::CodexAccountSummary>,
+    },
     /// Independent OpenAI Codex browser OAuth finished.
     CodexLoginComplete {
         agent_id: Option<AgentId>,
+        purpose: CodexLoginPurpose,
         result: Result<xai_grok_shell::codex_auth::CodexAccountSummary, String>,
+        /// Provider-filtered catalog returned synchronously by the post-login
+        /// refresh. Startup must use this instead of racing the independent
+        /// `x.ai/models/update` notification.
+        models: Option<acp::SessionModelState>,
     },
     /// Independent OpenAI Codex logout finished.
     CodexLogoutComplete {
         agent_id: Option<AgentId>,
+        targets: Vec<ProviderSessionTarget>,
+        primary_was_codex: bool,
         result: Result<bool, String>,
     },
     /// Shell responded to `x.ai/auth/check_subscription`. `verify` echoes

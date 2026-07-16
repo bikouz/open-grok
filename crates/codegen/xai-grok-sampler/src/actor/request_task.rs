@@ -84,6 +84,7 @@ pub(crate) async fn run_request_task(
     event_tx: mpsc::UnboundedSender<SamplingEvent>,
     cancel_token: CancellationToken,
     completion_tx: Option<oneshot::Sender<CompletionResult>>,
+    codex_turn_state: Arc<std::sync::OnceLock<String>>,
 ) -> RequestId {
     let mut completion_tx = completion_tx;
     let idle_timeout = Duration::from_secs(
@@ -95,7 +96,10 @@ pub(crate) async fn run_request_task(
 
     // Build the initial client. Configuration errors here are fatal
     // (no point retrying with the same broken config).
-    let mut client = match SamplingClient::new(config.clone()) {
+    let mut client = match SamplingClient::new_with_codex_turn_state(
+        config.clone(),
+        Arc::clone(&codex_turn_state),
+    ) {
         Ok(c) => c,
         Err(err) => {
             emit_failed(&event_tx, &request_id, &err);
@@ -205,6 +209,7 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    &codex_turn_state,
                     &mut completion_tx,
                 )
                 .await
@@ -247,6 +252,7 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    &codex_turn_state,
                     &mut completion_tx,
                 )
                 .await
@@ -269,6 +275,7 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    &codex_turn_state,
                     &mut completion_tx,
                 )
                 .await
@@ -296,6 +303,7 @@ async fn apply_retry_decision(
     request: &mut ConversationRequest,
     client: &mut SamplingClient,
     config: &SamplerConfig,
+    codex_turn_state: &Arc<std::sync::OnceLock<String>>,
     completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
 ) -> bool {
     let rate_limit_threshold = if retry_policy.rate_limit_retry_threshold == 0 {
@@ -353,7 +361,10 @@ async fn apply_retry_decision(
             // HTTP/2 connection pools.
             let mut http1_config = config.clone();
             http1_config.force_http1 = true;
-            match SamplingClient::new(http1_config) {
+            match SamplingClient::new_with_codex_turn_state(
+                http1_config,
+                Arc::clone(codex_turn_state),
+            ) {
                 Ok(fresh) => {
                     *client = fresh;
                     tracing::info!("rebuilt sampling client with HTTP/1.1 fallback for retry");

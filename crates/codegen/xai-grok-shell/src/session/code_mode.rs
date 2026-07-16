@@ -30,6 +30,17 @@ use crate::sampling::{ClientTool, CustomToolOutputContent, CustomToolOutputImage
 
 pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 
+/// The model uses these tools as an implementation detail for the persistent
+/// JavaScript runtime. They must remain in the model conversation, but they are
+/// not user-facing tool calls: the nested tools dispatched by `exec` already
+/// emit ordinary ACP tool cards with their decoded inputs and results.
+pub(crate) fn is_code_mode_transport_tool(name: &str) -> bool {
+    matches!(
+        name,
+        xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME | xai_grok_code_mode_protocol::WAIT_TOOL_NAME
+    )
+}
+
 /// Human-interaction tools must remain model-visible in Code Mode Only: a
 /// JavaScript callback cannot safely own an ACP question whose answer pauses
 /// the model turn. Collaboration lifecycle tools also stay direct, matching
@@ -52,10 +63,9 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
 
 /// Apply Code Mode Only's provider-specific hosted-tool policy.
 ///
-/// xAI retains the established behavior of exposing no top-level hosted tools
-/// in Code Mode Only. Codex keeps its native web search alongside the `exec`
-/// custom tool; `x_search` is intentionally excluded even before the sampler's
-/// provider boundary applies its defense-in-depth filter.
+/// Provider-hosted search remains top-level beside `exec` for both providers:
+/// xAI keeps native web/X search, while Codex keeps native OpenAI web search
+/// and excludes `x_search` at the provider boundary.
 pub(crate) fn hosted_tools_for_code_mode(
     hosted_tools: &[xai_grok_sampling_types::HostedTool],
     tool_mode: xai_grok_sampling_types::ToolMode,
@@ -66,7 +76,7 @@ pub(crate) fn hosted_tools_for_code_mode(
         return provider_tools;
     }
     if provider != xai_grok_sampling_types::ModelProvider::Codex {
-        return Vec::new();
+        return provider_tools;
     }
     provider_tools
         .into_iter()
@@ -78,16 +88,15 @@ pub(crate) fn hosted_tools_for_code_mode(
 /// Code Mode `exec` tool.
 pub(crate) fn nested_tool_definitions_for_provider(
     definitions: &[GrokToolDefinition],
-    provider: xai_grok_sampling_types::ModelProvider,
+    _provider: xai_grok_sampling_types::ModelProvider,
     hosted_tools: &[xai_grok_sampling_types::HostedTool],
 ) -> Vec<GrokToolDefinition> {
-    let codex_has_hosted_web = provider == xai_grok_sampling_types::ModelProvider::Codex
-        && hosted_tools
-            .iter()
-            .any(|tool| matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }));
+    let has_hosted_web = hosted_tools
+        .iter()
+        .any(|tool| matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }));
     definitions
         .iter()
-        .filter(|definition| !codex_has_hosted_web || definition.function.name != "web_search")
+        .filter(|definition| !has_hosted_web || definition.function.name != "web_search")
         .cloned()
         .collect()
 }
@@ -789,6 +798,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn only_exec_and_wait_are_hidden_transport_tools() {
+        assert!(is_code_mode_transport_tool(
+            xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
+        ));
+        assert!(is_code_mode_transport_tool(
+            xai_grok_code_mode_protocol::WAIT_TOOL_NAME
+        ));
+        assert!(!is_code_mode_transport_tool("exec_command"));
+        assert!(!is_code_mode_transport_tool("apply_patch"));
+        assert!(!is_code_mode_transport_tool("web_search"));
+    }
+
+    #[test]
     fn exec_tool_uses_pinned_lark_grammar_and_description() {
         let tools = vec![GrokToolDefinition::function(
             "update-plan",
@@ -974,18 +996,49 @@ mod tests {
     }
 
     #[test]
-    fn xai_code_mode_only_preserves_no_hosted_tools_behavior() {
+    fn xai_code_mode_only_preserves_native_hosted_search() {
         let hosted = vec![
             xai_grok_sampling_types::HostedTool::web_search(None),
             xai_grok_sampling_types::HostedTool::XSearch,
         ];
-        assert!(
-            hosted_tools_for_code_mode(
-                &hosted,
-                xai_grok_sampling_types::ToolMode::CodeModeOnly,
-                xai_grok_sampling_types::ModelProvider::Xai,
-            )
-            .is_empty()
+        let effective = hosted_tools_for_code_mode(
+            &hosted,
+            xai_grok_sampling_types::ToolMode::CodeModeOnly,
+            xai_grok_sampling_types::ModelProvider::Xai,
+        );
+        assert_eq!(effective.len(), 2);
+        assert!(matches!(
+            effective[0],
+            xai_grok_sampling_types::HostedTool::WebSearch { .. }
+        ));
+        assert!(matches!(
+            effective[1],
+            xai_grok_sampling_types::HostedTool::XSearch
+        ));
+
+        let definitions = vec![
+            GrokToolDefinition::function(
+                "web_search",
+                Some("Local search"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "read_file",
+                Some("Read a file"),
+                json!({"type": "object"}),
+            ),
+        ];
+        let nested = nested_tool_definitions_for_provider(
+            &definitions,
+            xai_grok_sampling_types::ModelProvider::Xai,
+            &effective,
+        );
+        assert_eq!(
+            nested
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file"]
         );
     }
 

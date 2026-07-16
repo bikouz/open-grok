@@ -25,11 +25,14 @@ pub(crate) const SUPPRESS_STICKY: u8 = 2;
 /// the account can sample again (see the `ModelResponseReceived` site in `turn.rs`).
 pub(crate) const SUPPRESS_UNTIL_SUCCESS: u8 = 3;
 
-/// Model slug and context window from the previous turn.
-#[derive(Clone, Debug)]
+/// Model compaction contract captured for the previous turn. The hash is
+/// opaque; only a change between two present values has meaning.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PreviousModelInfo {
     pub model_slug: String,
     pub context_window: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comp_hash: Option<String>,
 }
 
 /// Cached result of an **async** (background / prefire) pass-1 sample for

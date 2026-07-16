@@ -343,7 +343,7 @@ impl ChatStateActor {
                         }
                     })
                     .sum(),
-                ConversationItem::BackendToolCall(b) => b.text_summary().len(),
+                ConversationItem::BackendToolCall(b) => b.estimated_content_len(),
                 ConversationItem::Reasoning(r) => {
                     xai_grok_sampling_types::reasoning_item_text(r).len()
                         + r.encrypted_content.as_deref().map(str::len).unwrap_or(0)

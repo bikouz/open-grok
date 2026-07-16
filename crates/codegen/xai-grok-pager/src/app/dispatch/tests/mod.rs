@@ -55,11 +55,13 @@ use super::task_result::dispatch_task_result;
 use super::*;
 use crate::acp::model_state::ModelState;
 use crate::acp::tracker::AcpUpdateTracker;
-use crate::app::actions::{Action, Effect, SubagentKillOutcome, SwitchModelError, TaskResult};
+use crate::app::actions::{
+    Action, CodexLoginPurpose, Effect, SubagentKillOutcome, SwitchModelError, TaskResult,
+};
 use crate::app::agent::{AgentId, AgentSession, AgentState};
 use crate::app::agent_view::{ActivePane, AgentView, PromptMode};
 use crate::app::app_view::{
-    ActiveView, AppView, AuthMode, AuthState, TrustState, VoiceState, VoiceTarget,
+    ActiveView, AppView, AuthMode, AuthState, PrimaryProvider, TrustState, VoiceState, VoiceTarget,
     WelcomeAnnouncementState,
 };
 use crate::scrollback::block::RenderBlock;
@@ -135,6 +137,13 @@ fn test_app() -> AppView {
             "Grok".to_string(),
         ))],
         auth_state: AuthState::Done,
+        primary_provider: crate::app::app_view::PrimaryProvider::Xai,
+        startup_xai_ready: false,
+        startup_xai_auth_meta: None,
+        startup_codex_account: None,
+        startup_model_override: None,
+        startup_provider_selection: None,
+        codex_resume_auth_pending: false,
         trust_state: TrustState::Done,
         login_label: None,
         login_method_id: None,

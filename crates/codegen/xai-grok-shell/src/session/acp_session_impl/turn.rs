@@ -252,6 +252,11 @@ impl SessionActor {
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
     ) -> PromptTurnResult {
         let handle_prompt_start = std::time::Instant::now();
+        // Allocate Codex's sticky-routing cell at the outer prompt boundary,
+        // including manual `/compact` prompts that return before inference.
+        // Auxiliary clients remain detached from this state; pre-turn compact
+        // and main sampler requests intentionally share it.
+        self.sampler_handle.begin_codex_turn();
         let prompt_length: usize = prompt_blocks
             .iter()
             .map(|b| match b {
@@ -1722,25 +1727,29 @@ impl SessionActor {
         enabled_tools: &[ToolDefinition],
     ) {
         let ui_call_id = call.call_id().to_string();
-        let raw_input = if call.is_custom() {
-            serde_json::Value::String(call.arguments.as_ref().to_owned())
-        } else {
-            serde_json::from_str(call.arguments.as_ref())
-                .unwrap_or_else(|_| serde_json::Value::String(call.arguments.as_ref().to_owned()))
-        };
-        self.send_update(
-            acp::SessionUpdate::ToolCall(
-                acp::ToolCall::new(
-                    acp::ToolCallId::new(Arc::from(ui_call_id.as_str())),
-                    call.name.clone(),
-                )
-                .kind(acp::ToolKind::Other)
-                .status(acp::ToolCallStatus::InProgress)
-                .raw_input(Some(raw_input)),
-            ),
-            None,
-        )
-        .await;
+        let show_transport = !crate::session::code_mode::is_code_mode_transport_tool(&call.name);
+        if show_transport {
+            let raw_input = if call.is_custom() {
+                serde_json::Value::String(call.arguments.as_ref().to_owned())
+            } else {
+                serde_json::from_str(call.arguments.as_ref()).unwrap_or_else(|_| {
+                    serde_json::Value::String(call.arguments.as_ref().to_owned())
+                })
+            };
+            self.send_update(
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(
+                        acp::ToolCallId::new(Arc::from(ui_call_id.as_str())),
+                        call.name.clone(),
+                    )
+                    .kind(acp::ToolKind::Other)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(Some(raw_input)),
+                ),
+                None,
+            )
+            .await;
+        }
         self.emit_event(crate::session::events::Event::ToolStarted {
             tool_name: call.name.clone(),
         });
@@ -1821,21 +1830,23 @@ impl SessionActor {
         };
         self.chat_state_handle.push_tool_result(conversation_output);
 
-        let acp_content = content
-            .iter()
-            .map(code_mode_content_to_acp)
-            .collect::<Vec<_>>();
-        self.send_update(
-            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                acp::ToolCallId::new(Arc::from(ui_call_id.as_str())),
-                acp::ToolCallUpdateFields::new()
-                    .status(Some(status))
-                    .content(Some(acp_content))
-                    .raw_output(Some(raw_output)),
-            )),
-            None,
-        )
-        .await;
+        if show_transport {
+            let acp_content = content
+                .iter()
+                .map(code_mode_content_to_acp)
+                .collect::<Vec<_>>();
+            self.send_update(
+                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                    acp::ToolCallId::new(Arc::from(ui_call_id.as_str())),
+                    acp::ToolCallUpdateFields::new()
+                        .status(Some(status))
+                        .content(Some(acp_content))
+                        .raw_output(Some(raw_output)),
+                )),
+                None,
+            )
+            .await;
+        }
         self.events.tool_finished();
         self.signals_handle()
             .record_tool_duration(&call.name, duration_ms);

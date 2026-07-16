@@ -34,6 +34,10 @@ pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_ISSUER: &str = "https://auth.openai.com";
 pub const CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const CODEX_INFERENCE_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+/// Machine-readable ACP error kind used when a Codex-backed session cannot be
+/// started or resumed until the provider-local credential is restored.
+pub const CODEX_AUTH_REQUIRED_ERROR_KIND: &str = "open_grok_codex_auth_required";
+pub const CODEX_AUTH_REQUIRED_MESSAGE: &str = "Codex authentication required; run `open-grok login --codex` or configure an API key for this model";
 const CODEX_SCOPE: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const DEFAULT_CALLBACK_PORT: u16 = 1455;
@@ -403,6 +407,24 @@ pub fn load_credentials() -> io::Result<Option<CodexCredentials>> {
 
 pub fn is_logged_in() -> bool {
     load_credentials().ok().flatten().is_some()
+}
+
+/// A Codex sampler is authenticated either by the isolated ChatGPT OAuth
+/// resolver or by a provider-local OpenAI API key. xAI's auth cell never
+/// satisfies this predicate.
+pub fn sampling_config_has_credentials(config: &crate::sampling::SamplerConfig) -> bool {
+    let has_oauth = config.bearer_resolver.is_some() && is_logged_in();
+    let has_byok = config.bearer_resolver.is_none() && config.api_key.is_some();
+    has_oauth || has_byok
+}
+
+/// Return an ACP auth-required error that the pager can distinguish from an
+/// ordinary session-load failure without parsing user-facing prose.
+pub fn auth_required_error() -> agent_client_protocol::Error {
+    agent_client_protocol::Error::auth_required().data(serde_json::json!({
+        "kind": CODEX_AUTH_REQUIRED_ERROR_KIND,
+        "message": CODEX_AUTH_REQUIRED_MESSAGE,
+    }))
 }
 
 fn load_store_at(path: &Path) -> io::Result<Option<CodexAuthStore>> {

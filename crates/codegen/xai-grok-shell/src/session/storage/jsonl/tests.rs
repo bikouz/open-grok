@@ -1816,6 +1816,7 @@ fn write_test_summary(
         num_messages: 1,
         num_chat_messages: 1,
         current_model_id: default_model_id(),
+        previous_turn_model: None,
         ever_used_codex: false,
         parent_session_id: None,
         forked_at: None,

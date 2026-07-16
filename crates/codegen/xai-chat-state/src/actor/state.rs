@@ -99,7 +99,7 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
                 + xai_token_estimation::estimate_image_tokens(images)
         }
         ConversationItem::BackendToolCall(b) => {
-            xai_token_estimation::estimate_tokens(&b.text_summary())
+            (b.estimated_content_len() as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
         ConversationItem::Reasoning(r) => {
             // Summary + content text follow the standard bytes-per-token
@@ -332,6 +332,25 @@ mod tests {
                 "counter must report the same trusted count as estimate_item_tokens"
             );
         }
+    }
+
+    #[test]
+    fn codex_compact_item_accounts_for_hidden_provider_payload() {
+        let raw = serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "x".repeat(4_000)
+        });
+        let item =
+            xai_grok_sampling_types::codex_compact_output_to_conversation_items(vec![raw.clone()])
+                .unwrap()
+                .remove(0);
+
+        assert_eq!(
+            estimate_item_tokens(&item),
+            ((4_000usize * 3 / 4).saturating_sub(650) as u64)
+                / xai_token_estimation::BYTES_PER_TOKEN,
+            "automatic compaction must count the opaque replacement item without rendering it"
+        );
     }
 
     #[test]

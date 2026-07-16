@@ -21,7 +21,8 @@ use xai_acp_lib::acp_send;
 
 use super::actions::{Action, Effect, TaskResult};
 use super::app_view::{
-    ActiveView, AppView, AuthState, InputOutcome, PasteProvenance, TrustState, VoiceState,
+    ActiveView, AppView, AuthState, InputOutcome, PasteProvenance, PrimaryProvider, TrustState,
+    VoiceState,
 };
 use super::{PagerArgs, PagerTerminal, acp_handler, dispatch, effects};
 
@@ -48,6 +49,80 @@ pub(crate) struct RunResult {
     /// When set, the process should re-exec into the other screen mode after
     /// terminal restore. See `/minimal` and `/fullscreen`.
     pub relaunch: Option<super::app_view::ScreenModeRelaunch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAuthPlan {
+    Ready,
+    ReadyWithCodex,
+    ChooseProvider,
+    RequireCodexLogin,
+    RequireXaiLogin,
+    ForceXaiLogin,
+}
+
+fn requested_model_provider(
+    requested: Option<&acp::ModelId>,
+    visible_models: &crate::acp::model_state::ModelState,
+    configured_providers: &std::collections::HashMap<String, String>,
+) -> Option<PrimaryProvider> {
+    let requested = requested?;
+    PrimaryProvider::for_model(visible_models, requested).or_else(|| {
+        let provider = configured_providers.get(requested.0.as_ref())?;
+        if provider.eq_ignore_ascii_case("codex") {
+            Some(PrimaryProvider::Codex)
+        } else if provider.eq_ignore_ascii_case("xai") {
+            Some(PrimaryProvider::Xai)
+        } else {
+            None
+        }
+    })
+}
+
+fn effective_startup_model<'a>(
+    cli_model: Option<&'a acp::ModelId>,
+    configured_default: Option<&'a acp::ModelId>,
+) -> Option<&'a acp::ModelId> {
+    cli_model.or(configured_default)
+}
+
+fn reusable_startup_codex_credential<'a, T>(
+    freshness_required: bool,
+    fresh: Option<&'a T>,
+    local: Option<&'a T>,
+) -> Option<&'a T> {
+    if freshness_required { fresh } else { local }
+}
+
+fn plan_startup_auth(
+    xai_needs_login: bool,
+    force_xai_login: bool,
+    selected_provider: PrimaryProvider,
+    codex_credentials_ready: bool,
+    required_provider: Option<PrimaryProvider>,
+) -> StartupAuthPlan {
+    if force_xai_login {
+        return StartupAuthPlan::ForceXaiLogin;
+    }
+    if let Some(required_provider) = required_provider {
+        return match required_provider {
+            PrimaryProvider::Codex if codex_credentials_ready => StartupAuthPlan::ReadyWithCodex,
+            PrimaryProvider::Codex => StartupAuthPlan::RequireCodexLogin,
+            PrimaryProvider::Xai if xai_needs_login => StartupAuthPlan::RequireXaiLogin,
+            PrimaryProvider::Xai => StartupAuthPlan::Ready,
+        };
+    }
+    if selected_provider == PrimaryProvider::Codex {
+        if codex_credentials_ready {
+            StartupAuthPlan::ReadyWithCodex
+        } else {
+            StartupAuthPlan::ChooseProvider
+        }
+    } else if xai_needs_login {
+        StartupAuthPlan::ChooseProvider
+    } else {
+        StartupAuthPlan::Ready
+    }
 }
 
 /// In-flight reconnect re-initialization, tied to the agents whose reload
@@ -482,6 +557,7 @@ pub(crate) async fn run(
 
     crate::unified_log::init(connection.tx.clone());
     crate::unified_log::info("pager started", None, None);
+    let configured_model_providers = connection.model_providers.clone();
     let mut app = AppView::new(
         connection.tx,
         connection.models,
@@ -594,6 +670,23 @@ pub(crate) async fn run(
         .model
         .as_deref()
         .map(agent_client_protocol::ModelId::new);
+    // `InitializeResponse.modelState` is provider-auth filtered. Resolve an
+    // explicit model against the shell's full non-secret provider map so an
+    // auth-hidden Codex request cannot inherit an xAI-ready startup plan.
+    let desired_startup_model = effective_startup_model(
+        app.cli_model_override.as_ref(),
+        connection.configured_default_model.as_ref(),
+    )
+    .cloned();
+    let required_startup_provider = requested_model_provider(
+        desired_startup_model.as_ref(),
+        &app.models,
+        &configured_model_providers,
+    );
+    if let Some(provider) = required_startup_provider {
+        app.primary_provider = provider;
+        app.startup_model_override = desired_startup_model;
+    }
     app.cli_effort_token = args.reasoning_effort.clone();
     app.auth_use_oauth = args.oauth;
     app.show_resolved_model = remote_settings
@@ -639,110 +732,162 @@ pub(crate) async fn run(
     // Preserve auth methods so logout→re-login works without restarting.
     app.auth_methods = connection.auth_methods.clone();
 
-    // Seed auth state from ACP connection metadata.
-    // --force-login overrides: show the login screen even when credentials exist.
+    // Seed auth from both independent account stores. xAI remains the ACP
+    // authentication mechanism, while Codex OAuth is pager-owned and may open
+    // startup without any xAI credential or subscription.
     let force_login = args.force_login && !connection.auth_methods.is_empty();
-    let needs_interactive_login = connection.needs_login || force_login;
-    if needs_interactive_login {
-        app.welcome_prompt_focused = false;
+    app.startup_xai_ready = !connection.needs_login;
+    app.startup_xai_auth_meta = connection.auth_meta.clone();
+    // Always seed independent Codex presence from Open Grok's isolated local
+    // store so an xAI-first launch can still expose Codex models and `/usage`.
+    // Only perform network freshness when Codex could own this startup; a
+    // transient refresh must not erase an otherwise valid side-by-side login.
+    let local_codex_credentials = match xai_grok_shell::codex_auth::load_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            tracing::warn!(%error, "could not read cached Codex credentials at startup");
+            None
+        }
+    };
+    let codex_required_for_startup =
+        !force_login && (app.primary_provider == PrimaryProvider::Codex || connection.needs_login);
+    let fresh_codex_credentials = if codex_required_for_startup {
+        match xai_grok_shell::codex_auth::fresh_credentials().await {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                tracing::warn!(%error, "could not refresh cached Codex credentials at startup");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let codex_credentials_ready = if codex_required_for_startup {
+        fresh_codex_credentials.is_some()
+    } else {
+        local_codex_credentials.is_some()
+    };
+    // A required Codex startup may reuse only the credential that passed the
+    // freshness check. Keeping an expired local summary here would let the
+    // chooser bypass OAuth and mark an unusable session authenticated.
+    let startup_codex_credentials = reusable_startup_codex_credential(
+        codex_required_for_startup,
+        fresh_codex_credentials.as_ref(),
+        local_codex_credentials.as_ref(),
+    );
+    app.startup_codex_account =
+        startup_codex_credentials.map(xai_grok_shell::codex_auth::CodexAccountSummary::from);
+    app.sync_usage_command_visibility();
+    let auth_plan = plan_startup_auth(
+        connection.needs_login,
+        force_login,
+        app.primary_provider,
+        codex_credentials_ready,
+        required_startup_provider,
+    );
 
-        if connection.needs_login {
-            // Normal path: use the metadata from startup_auth_metadata()
-            app.login_label = connection.login_label;
-            app.login_method_id = connection.login_method_id;
-            app.auth_start_mode = match connection.auth_start_mode {
-                crate::acp::AuthStartMode::Pending => super::app_view::AuthMode::Pending,
-                crate::acp::AuthStartMode::Command => super::app_view::AuthMode::Command,
-            };
-        } else {
-            // --force-login: find the grok.com method from the advertised list
-            let grok_com = connection
-                .auth_methods
-                .iter()
-                .find(|m| m.id().0.as_ref() == "grok.com");
-            if let Some(method) = grok_com {
-                app.login_label = Some(method.name().to_string());
-                app.login_method_id = Some(method.id().clone());
-                let is_provider = method
-                    .meta()
-                    .as_ref()
-                    .and_then(|v| v.get("external_provider"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                app.auth_start_mode = if is_provider {
-                    super::app_view::AuthMode::Command
-                } else {
-                    super::app_view::AuthMode::Pending
-                };
+    // Preserve xAI login metadata even while the provider chooser is visible;
+    // choosing xAI later reuses the exact existing ACP login dispatcher.
+    if connection.needs_login {
+        app.login_label = connection.login_label;
+        app.login_method_id = connection.login_method_id;
+        app.auth_start_mode = match connection.auth_start_mode {
+            crate::acp::AuthStartMode::Pending => super::app_view::AuthMode::Pending,
+            crate::acp::AuthStartMode::Command => super::app_view::AuthMode::Command,
+        };
+    } else if matches!(auth_plan, StartupAuthPlan::ForceXaiLogin) {
+        let grok_com = connection
+            .auth_methods
+            .iter()
+            .find(|method| method.id().0.as_ref() == "grok.com");
+        if let Some(method) = grok_com {
+            app.login_label = Some(method.name().to_string());
+            app.login_method_id = Some(method.id().clone());
+            let is_external = method
+                .meta()
+                .as_ref()
+                .and_then(|value| value.get("external_provider"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            app.auth_start_mode = if is_external {
+                super::app_view::AuthMode::Command
             } else {
-                // No grok.com method available, use the first method as fallback
-                let first = &connection.auth_methods[0];
-                app.login_label = Some(first.name().to_string());
-                app.login_method_id = Some(first.id().clone());
-                app.auth_start_mode = super::app_view::AuthMode::Pending;
+                super::app_view::AuthMode::Pending
+            };
+        } else if let Some(first) = connection.auth_methods.first() {
+            app.login_label = Some(first.name().to_string());
+            app.login_method_id = Some(first.id().clone());
+            app.auth_start_mode = super::app_view::AuthMode::Pending;
+        }
+    }
+
+    let mut post_render_effects = match auth_plan {
+        StartupAuthPlan::Ready => vec![],
+        StartupAuthPlan::ReadyWithCodex => {
+            app.primary_provider = PrimaryProvider::Codex;
+            app.clear_xai_access_controls();
+            vec![]
+        }
+        StartupAuthPlan::ChooseProvider => {
+            app.clear_xai_access_controls();
+            app.auth_state = AuthState::ProviderChoice { error: None };
+            app.welcome_prompt_focused = false;
+            app.welcome_menu_index = Some(0);
+            vec![]
+        }
+        StartupAuthPlan::RequireCodexLogin => {
+            app.clear_xai_access_controls();
+            app.auth_state = AuthState::ProviderChoice { error: None };
+            dispatch::dispatch(Action::ChooseStartupCodex, &mut app)
+        }
+        StartupAuthPlan::RequireXaiLogin => {
+            app.auth_state = AuthState::ProviderChoice { error: None };
+            dispatch::dispatch(Action::ChooseStartupXai, &mut app)
+        }
+        StartupAuthPlan::ForceXaiLogin => {
+            app.primary_provider = PrimaryProvider::Xai;
+            app.welcome_prompt_focused = false;
+            tracing::info!(
+                method_id = ?app.login_method_id,
+                "force-login: auto-triggering xAI login at startup"
+            );
+            dispatch::dispatch(Action::Login, &mut app)
+        }
+    };
+
+    // xAI account metadata is useful only when xAI owns this launch. Keeping
+    // it out of Codex/choice paths prevents stale xAI paywalls and ZDR state
+    // from blocking a valid ChatGPT session.
+    let xai_access_controls_active = app.uses_xai_access_controls()
+        && !matches!(&app.auth_state, AuthState::ProviderChoice { .. });
+    if xai_access_controls_active {
+        if let Some(meta) = connection.auth_meta.as_ref() {
+            match serde_json::from_value::<xai_grok_shell::auth::AuthMeta>(meta.clone()) {
+                Ok(auth_meta) => app.apply_auth_meta(&auth_meta),
+                Err(e) => tracing::warn!("failed to deserialize auth_meta: {e}"),
+            }
+        } else {
+            // No cached session — check if the API key is the active credential.
+            app.is_api_key_auth = app.auth_methods.iter().any(|method| {
+                method.id().0.as_ref() == xai_grok_shell::agent::auth_method::XAI_API_KEY_METHOD_ID
+            });
+            if app.is_api_key_auth {
+                app.apply_usage_visibility(false);
+                app.ensure_voice_for_api_key();
             }
         }
 
-        // Skip the login splash screen — auto-trigger login immediately
-        // by reusing dispatch_login. Effects are stashed and drained after
-        // the initial render so the user sees the auth UI right away.
-        // Empty auth_methods (preferred_method pin with no credentials) is
-        // fail-closed: do not invent grok.com / auto-start OIDC.
-        tracing::info!(
-            method_id = ?app.login_method_id,
-            methods_empty = connection.auth_methods.is_empty(),
-            "auto-triggering login at startup"
-        );
-    }
-    // else: auth_state defaults to Done (already authenticated eagerly)
-    // Effects stashed until after the initial render, so the user sees the
-    // welcome/auth UI right away.
-    let mut post_render_effects = if needs_interactive_login {
-        if connection.auth_methods.is_empty() {
-            // preferred_method pin unavailable — no advertised method to start.
-            app.auth_state = super::app_view::AuthState::Pending {
-                error: Some(
-                    xai_grok_shell::agent::auth_method::PREFERRED_API_KEY_UNAVAILABLE.to_string(),
-                ),
-            };
-            vec![]
-        } else {
-            dispatch::dispatch(Action::Login, &mut app)
+        // Fallback: prefetch may have gate info the shell's AuthMeta missed.
+        if app.gate.is_none()
+            && let Some(settings) = remote_settings.as_ref()
+        {
+            app.gate = AppView::gate_from_settings(settings);
+        }
+        if let Some(gate) = app.gate.take() {
+            post_render_effects.extend(app.impose_gate(gate));
         }
     } else {
-        vec![]
-    };
-
-    if let Some(meta) = connection.auth_meta.as_ref() {
-        match serde_json::from_value::<xai_grok_shell::auth::AuthMeta>(meta.clone()) {
-            Ok(auth_meta) => app.apply_auth_meta(&auth_meta),
-            Err(e) => tracing::warn!("failed to deserialize auth_meta: {e}"),
-        }
-    } else {
-        // No cached session — check if the API key is the active credential.
-        app.is_api_key_auth = app.auth_methods.iter().any(|m| {
-            m.id().0.as_ref() == xai_grok_shell::agent::auth_method::XAI_API_KEY_METHOD_ID
-        });
-        // No AuthMeta on this path — hide `/usage` and enable voice for API keys.
-        if app.is_api_key_auth {
-            app.usage_visible = false;
-            app.ensure_voice_for_api_key();
-        }
-    }
-
-    // Fallback: prefetch may have gate info the shell's AuthMeta missed.
-    // Errs on the side of blocking if stale.
-    if app.gate.is_none()
-        && let Some(rs) = remote_settings.as_ref()
-    {
-        app.gate = AppView::gate_from_settings(rs);
-    }
-
-    // Re-impose the startup gate through the chokepoint: cached auth meta
-    // and the settings prefetch are both possibly stale, so a consumer
-    // session's gate is deferred for live verification before first paint.
-    if let Some(gate) = app.gate.take() {
-        post_render_effects.extend(app.impose_gate(gate));
+        app.clear_xai_access_controls();
     }
 
     // Load persisted per-ID hidden state
@@ -1222,7 +1367,7 @@ pub(crate) async fn run(
             return Ok(make_run_result(&app));
         }
         // Fetch billing early so the welcome screen can show a credit warning.
-        if app.usage_visible {
+        if app.uses_xai_access_controls() && app.usage_visible {
             let effs = vec![super::actions::Effect::FetchAppBilling];
             if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                 return Ok(make_run_result(&app));
@@ -1737,7 +1882,12 @@ pub(crate) async fn run(
             Some(join_result) = tasks.join_next() => {
                 match join_result {
                     Ok(result) => {
-                        let effs = dispatch::dispatch(Action::TaskComplete(result), &mut app);
+                        let mut effs = dispatch::dispatch(Action::TaskComplete(result), &mut app);
+                        if !app.pending_effects.is_empty() {
+                            let mut pending = std::mem::take(&mut app.pending_effects);
+                            pending.append(&mut effs);
+                            effs = pending;
+                        }
                         if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                             break;
                         }
@@ -1776,7 +1926,12 @@ pub(crate) async fn run(
                     agent_id: msg.agent_id,
                     message: msg.message,
                 };
-                let effs = dispatch::dispatch(Action::TaskComplete(result), &mut app);
+                let mut effs = dispatch::dispatch(Action::TaskComplete(result), &mut app);
+                if !app.pending_effects.is_empty() {
+                    let mut pending = std::mem::take(&mut app.pending_effects);
+                    pending.append(&mut effs);
+                    effs = pending;
+                }
                 if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                     break;
                 }
@@ -3224,6 +3379,110 @@ fn process_effects(
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
+
+    #[test]
+    fn startup_auth_plan_offers_provider_choice_when_xai_is_missing() {
+        assert_eq!(
+            plan_startup_auth(true, false, PrimaryProvider::Xai, false, None),
+            StartupAuthPlan::ChooseProvider
+        );
+        assert_eq!(
+            plan_startup_auth(true, false, PrimaryProvider::Codex, false, None),
+            StartupAuthPlan::ChooseProvider
+        );
+    }
+
+    #[test]
+    fn startup_auth_plan_does_not_treat_xai_auth_as_codex_auth() {
+        assert_eq!(
+            plan_startup_auth(false, false, PrimaryProvider::Codex, false, None),
+            StartupAuthPlan::ChooseProvider
+        );
+        assert_eq!(
+            plan_startup_auth(false, false, PrimaryProvider::Xai, false, None),
+            StartupAuthPlan::Ready
+        );
+    }
+
+    #[test]
+    fn startup_auth_plan_uses_selected_codex_when_its_credentials_are_fresh() {
+        assert_eq!(
+            plan_startup_auth(true, false, PrimaryProvider::Codex, true, None),
+            StartupAuthPlan::ReadyWithCodex
+        );
+    }
+
+    #[test]
+    fn required_codex_startup_never_reuses_an_unvalidated_local_summary() {
+        let stale_local = 7;
+        assert_eq!(
+            reusable_startup_codex_credential(true, None, Some(&stale_local)),
+            None
+        );
+        assert_eq!(
+            reusable_startup_codex_credential(false, None, Some(&stale_local)),
+            Some(&stale_local),
+            "xAI-first startup may still expose the independent Codex account"
+        );
+    }
+
+    #[test]
+    fn startup_auth_plan_force_login_remains_xai_specific() {
+        assert_eq!(
+            plan_startup_auth(false, true, PrimaryProvider::Codex, true, None),
+            StartupAuthPlan::ForceXaiLogin
+        );
+    }
+
+    #[test]
+    fn auth_hidden_cli_codex_model_requires_codex_login() {
+        let requested = acp::ModelId::new("gpt-5.6-sol");
+        let visible = crate::acp::model_state::ModelState::default();
+        let configured =
+            std::collections::HashMap::from([("gpt-5.6-sol".to_string(), "codex".to_string())]);
+
+        let provider = requested_model_provider(Some(&requested), &visible, &configured);
+        assert_eq!(provider, Some(PrimaryProvider::Codex));
+        assert_eq!(
+            plan_startup_auth(false, false, PrimaryProvider::Codex, false, provider),
+            StartupAuthPlan::RequireCodexLogin,
+            "an xAI-ready connection must not skip the independent Codex OAuth"
+        );
+    }
+
+    #[test]
+    fn auth_hidden_configured_codex_default_requires_codex_login() {
+        let configured_default = acp::ModelId::new("gpt-5.6-sol");
+        let visible = crate::acp::model_state::ModelState::default();
+        let providers =
+            std::collections::HashMap::from([("gpt-5.6-sol".to_string(), "codex".to_string())]);
+        let effective = effective_startup_model(None, Some(&configured_default));
+        let provider = requested_model_provider(effective, &visible, &providers);
+
+        assert_eq!(provider, Some(PrimaryProvider::Codex));
+        assert_eq!(
+            plan_startup_auth(false, false, PrimaryProvider::Xai, false, provider),
+            StartupAuthPlan::RequireCodexLogin
+        );
+    }
+
+    #[test]
+    fn cli_model_takes_precedence_over_configured_default_provider() {
+        let cli = acp::ModelId::new("grok-build");
+        let configured_default = acp::ModelId::new("gpt-5.6-sol");
+        let visible = crate::acp::model_state::ModelState::default();
+        let providers = std::collections::HashMap::from([
+            ("grok-build".to_string(), "xai".to_string()),
+            ("gpt-5.6-sol".to_string(), "codex".to_string()),
+        ]);
+
+        let effective = effective_startup_model(Some(&cli), Some(&configured_default));
+        assert_eq!(effective, Some(&cli));
+        assert_eq!(
+            requested_model_provider(effective, &visible, &providers),
+            Some(PrimaryProvider::Xai)
+        );
+    }
 
     // ── is_voice_chord ───────────────────────────────────────────────────
 

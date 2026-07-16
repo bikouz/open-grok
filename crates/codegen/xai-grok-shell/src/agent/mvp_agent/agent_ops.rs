@@ -2928,6 +2928,7 @@ impl MvpAgent {
             persisted_plan_mode,
             persisted_goal_mode,
             persisted_announcement_state,
+            previous_turn_model,
             session_meta,
             managed_mcp_expires_at,
             model_agent_type,
@@ -3010,7 +3011,7 @@ impl MvpAgent {
             std::sync::Arc::new(TerminalRunner::new(notifier, session_info.id.clone()))
         };
         let load_envrc = self.cfg.borrow().session.load_envrc.unwrap_or(true);
-        let startup_hints = init
+        let mut startup_hints = init
             .meta
             .as_ref()
             .and_then(|m| m.get("startupHints"))
@@ -3018,6 +3019,7 @@ impl MvpAgent {
                 serde_json::from_value::<crate::session::StartupHints>(v.clone()).ok()
             })
             .unwrap_or_default();
+        startup_hints.previous_turn_model = previous_turn_model;
         let hunk_plan = plan_hunk_tracking(
             init
                 .client_capabilities
@@ -3281,14 +3283,8 @@ impl MvpAgent {
         // Authenticate the effective model after agent-profile pinning. The
         // preliminary/default model may belong to the other provider.
         if sampling_config.provider == xai_grok_sampling_types::ModelProvider::Codex {
-            let has_codex_oauth = sampling_config.bearer_resolver.is_some()
-                && crate::codex_auth::load_credentials().ok().flatten().is_some();
-            let has_codex_byok = sampling_config.bearer_resolver.is_none()
-                && sampling_config.api_key.is_some();
-            if !has_codex_oauth && !has_codex_byok {
-                return Err(acp::Error::auth_required().data(
-                    "Codex authentication required; run `open-grok login --codex` or configure an API key for this model",
-                ));
+            if !crate::codex_auth::sampling_config_has_credentials(&sampling_config) {
+                return Err(crate::codex_auth::auth_required_error());
             }
             // Keep sharing the agent's live xAI auth cell even while it is
             // empty. Codex provenance lives in the resolved sampler, and a

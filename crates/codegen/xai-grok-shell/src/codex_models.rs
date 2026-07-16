@@ -89,12 +89,39 @@ impl CodexModelVisibility {
 pub(crate) struct CodexCatalogModel {
     pub(crate) priority: i32,
     pub(crate) visibility: CodexModelVisibility,
+    /// Raw provider override. Resolution clamps this to 90% of the raw
+    /// context window, matching codex-rs `ModelInfo::auto_compact_token_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_compact_token_limit: Option<i64>,
+    /// Opaque compatibility identifier used to compact before a model's
+    /// compaction contract changes between turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) comp_hash: Option<String>,
+    /// `context_window.or(max_context_window)` before the 95%-effective picker
+    /// projection. Needed because upstream clamps against the raw window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved_context_window: Option<i64>,
     pub(crate) entry: ModelEntry,
 }
 
 impl CodexCatalogModel {
     pub(crate) fn slug(&self) -> &str {
         &self.entry.info.model
+    }
+
+    pub(crate) fn resolved_auto_compact_token_limit(&self) -> Option<u64> {
+        let context_limit = self
+            .resolved_context_window
+            .map(|context_window| (context_window * 9) / 10);
+        let resolved = match (context_limit, self.auto_compact_token_limit) {
+            (Some(context_limit), Some(config_limit)) => Some(config_limit.min(context_limit)),
+            (Some(context_limit), None) => Some(context_limit),
+            (None, config_limit) => config_limit,
+        }?;
+        // Provider metadata is expected to be positive. Treat a malformed
+        // non-positive limit as zero, which preserves codex-rs's immediate
+        // threshold behavior without wrapping into an enormous u64.
+        Some(u64::try_from(resolved).unwrap_or(0))
     }
 }
 
@@ -107,6 +134,12 @@ pub(crate) struct CodexModelsCatalog {
     /// this snapshot. The manager checks it again immediately before publish
     /// so an account switch cannot expose account A's in-flight catalog to B.
     account_fingerprint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodexCompactionMetadata {
+    pub(crate) auto_compact_token_limit: Option<u64>,
+    pub(crate) comp_hash: Option<String>,
 }
 
 impl CodexModelsCatalog {
@@ -139,6 +172,16 @@ impl CodexModelsCatalog {
     fn account_fingerprint(&self) -> &str {
         &self.account_fingerprint
     }
+
+    pub(crate) fn compaction_metadata(&self, slug: &str) -> Option<CodexCompactionMetadata> {
+        self.models
+            .iter()
+            .find(|model| model.slug() == slug)
+            .map(|model| CodexCompactionMetadata {
+                auto_compact_token_limit: model.resolved_auto_compact_token_limit(),
+                comp_hash: model.comp_hash.clone(),
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -168,6 +211,10 @@ struct CodexWireModel {
     context_window: Option<i64>,
     #[serde(default)]
     max_context_window: Option<i64>,
+    #[serde(default)]
+    auto_compact_token_limit: Option<i64>,
+    #[serde(default)]
+    comp_hash: Option<String>,
     #[serde(default = "default_effective_context_window_percent")]
     effective_context_window_percent: i64,
     #[serde(default)]
@@ -521,8 +568,9 @@ impl CodexModelsClient {
         info.supported_in_api = false;
         info.supports_backend_search = wire.supports_search_tool;
 
+        let resolved_context_window = wire.context_window.or(wire.max_context_window);
         if let Some(context_window) = effective_context_window(
-            wire.context_window.or(wire.max_context_window),
+            resolved_context_window,
             wire.effective_context_window_percent,
         ) {
             info.context_window = context_window;
@@ -575,6 +623,9 @@ impl CodexModelsClient {
         Some(CodexCatalogModel {
             priority: wire.priority,
             visibility: wire.visibility,
+            auto_compact_token_limit: wire.auto_compact_token_limit,
+            comp_hash: wire.comp_hash,
+            resolved_context_window,
             entry: ModelEntry {
                 info,
                 api_key: None,
@@ -861,6 +912,8 @@ mod tests {
                     "priority": 1,
                     "context_window": 372000,
                     "max_context_window": 400000,
+                    "auto_compact_token_limit": 300123,
+                    "comp_hash": "comp-v3",
                     "effective_context_window_percent": 95,
                     "supports_search_tool": true,
                     "tool_mode": "code_mode_only",
@@ -1049,6 +1102,9 @@ mod tests {
         assert_eq!(live.slug(), "gpt-5.6-sol");
         assert_eq!(live.entry.info.name.as_deref(), Some("GPT-5.6 Sol Live"));
         assert_eq!(live.entry.info.context_window.get(), 353_400);
+        assert_eq!(live.auto_compact_token_limit, Some(300_123));
+        assert_eq!(live.resolved_auto_compact_token_limit(), Some(300_123));
+        assert_eq!(live.comp_hash.as_deref(), Some("comp-v3"));
         assert_eq!(live.entry.info.provider, ModelProvider::Codex);
         assert_eq!(live.entry.info.api_backend, ApiBackend::Responses);
         assert_eq!(live.entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
@@ -1395,6 +1451,42 @@ mod tests {
         assert_eq!(
             v1_with_ultra.info.reasoning_efforts[0].value,
             ReasoningEffort::Ultra
+        );
+    }
+
+    #[test]
+    fn auto_compact_limit_matches_upstream_raw_context_clamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = test_client(
+            &temp,
+            "https://chatgpt.example/codex".to_owned(),
+            "1.2.3",
+            Duration::from_secs(300),
+            auth_source(credentials("token", "workspace-1", false)),
+        );
+        let convert = |limit: Option<i64>| {
+            let wire: CodexWireModel = serde_json::from_value(json!({
+                "slug": "clamped",
+                "display_name": "Clamped",
+                "visibility": "list",
+                "context_window": 100000,
+                "auto_compact_token_limit": limit,
+            }))
+            .unwrap();
+            client.convert_model(wire).unwrap()
+        };
+
+        assert_eq!(
+            convert(None).resolved_auto_compact_token_limit(),
+            Some(90_000)
+        );
+        assert_eq!(
+            convert(Some(70_123)).resolved_auto_compact_token_limit(),
+            Some(70_123)
+        );
+        assert_eq!(
+            convert(Some(95_000)).resolved_auto_compact_token_limit(),
+            Some(90_000)
         );
     }
 

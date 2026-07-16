@@ -5,6 +5,12 @@ use super::super::task_result::{
 };
 use super::*;
 
+fn provider_model_info(model_id: &acp::ModelId, name: &str, provider: &str) -> acp::ModelInfo {
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!(provider));
+    acp::ModelInfo::new(model_id.clone(), name.to_string()).meta(Some(meta))
+}
+
 fn foreign_resume_hint(
     tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool,
 ) -> xai_grok_workspace::foreign_sessions::RecentForeignSession {
@@ -603,6 +609,154 @@ fn switch_model_complete_success_updates_model_and_pushes_message() {
         &effects[0],
         Effect::PersistPreferredModel { model_id: mid, .. } if *mid == model_id.clone()
     ));
+}
+
+#[test]
+fn successful_model_switch_updates_provider_and_round_trips_xai_access_state() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let xai_model = acp::ModelId::new("grok-visible");
+    let codex_model = acp::ModelId::new("codex-visible");
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.models.available.insert(
+            xai_model.clone(),
+            provider_model_info(&xai_model, "Grok Visible", "xai"),
+        );
+        agent.session.models.available.insert(
+            codex_model.clone(),
+            provider_model_info(&codex_model, "Codex Visible", "codex"),
+        );
+        agent.session.models.set_current(xai_model.clone(), None);
+        agent.session.model_switch_pending = true;
+    }
+    app.primary_provider = PrimaryProvider::Xai;
+    app.team_id = Some("xai-team".into());
+    app.subscription_tier = Some("Free".into());
+    app.gate = Some(xai_grok_shell::auth::GateInfo {
+        message: "xAI subscription required".into(),
+        url: None,
+        label: None,
+    });
+    app.apply_tier_restrictions();
+
+    let codex_effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: codex_model,
+            effort: None,
+            result: Ok(()),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+    assert!(app.gate.is_none());
+    assert!(app.team_id.is_none());
+    assert!(app.subscription_tier.is_none());
+    assert!(app.tier_restricted_commands.is_empty());
+    assert!(app.startup_xai_auth_meta.is_some());
+    assert!(!codex_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CheckSubscription { .. } | Effect::FetchBilling { .. }
+    )));
+
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .model_switch_pending = true;
+    let xai_effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: xai_model,
+            effort: None,
+            result: Ok(()),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.primary_provider, PrimaryProvider::Xai);
+    assert_eq!(app.team_id.as_deref(), Some("xai-team"));
+    assert_eq!(app.subscription_tier.as_deref(), Some("Free"));
+    assert_eq!(
+        app.gate.as_ref().map(|gate| gate.message.as_str()),
+        Some("xAI subscription required")
+    );
+    assert!(!app.tier_restricted_commands.is_empty());
+    assert!(
+        xai_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::CheckSubscription { .. }))
+    );
+    assert!(xai_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::FetchBilling {
+            agent_id: fetched_agent,
+            silent: true,
+        } if *fetched_agent == id
+    )));
+}
+
+#[test]
+fn provider_transition_fans_usage_visibility_into_existing_slash_surfaces() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.primary_provider = PrimaryProvider::Xai;
+    app.apply_auth_meta(&xai_grok_shell::auth::AuthMeta {
+        team_id: Some("team-id".into()),
+        team_name: Some("Team Account".into()),
+        subscription_tier: Some("Business".into()),
+        ..Default::default()
+    });
+    assert!(!app.usage_visible);
+    assert!(
+        app.agents[&id]
+            .prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
+    assert!(
+        app.welcome_prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
+
+    assert!(app.switch_primary_provider(PrimaryProvider::Codex));
+    assert!(app.usage_visible);
+    assert!(app.tier_restricted_commands.is_empty());
+    assert!(
+        app.agents[&id]
+            .prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_some()
+    );
+    assert!(
+        app.welcome_prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_some()
+    );
+
+    assert!(app.switch_primary_provider(PrimaryProvider::Xai));
+    assert!(!app.usage_visible);
+    assert!(
+        app.agents[&id]
+            .prompt
+            .slash_controller
+            .registry()
+            .get("usage")
+            .is_none()
+    );
 }
 
 #[test]
@@ -1997,7 +2151,14 @@ fn logout_clears_pending_gate_verification() {
     let mut app = test_app();
     let _effs = app.impose_gate(test_gate());
 
-    dispatch_task_result(TaskResult::LogoutComplete, &mut app);
+    dispatch_task_result(
+        TaskResult::LogoutComplete {
+            xai_targets: vec![],
+            codex_targets: vec![],
+            codex_account: None,
+        },
+        &mut app,
+    );
 
     assert!(app.pending_gate_verification.is_none());
     assert!(app.last_subscription_check_at.is_none());

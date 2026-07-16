@@ -3,6 +3,23 @@
 //! [`acp::Agent`] trait implementation for [`MvpAgent`].
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
+
+/// Build the post-login Codex catalog response without coupling OAuth success
+/// to the optional live fetch. `models` is sampled after the login attempt, so
+/// on refresh failure it still contains auth-visible cached/embedded fallbacks.
+pub(super) fn codex_models_refresh_payload(
+    refreshed: Result<bool, String>,
+    models: acp::SessionModelState,
+) -> serde_json::Value {
+    match refreshed {
+        Ok(refreshed) => serde_json::json!({ "refreshed": refreshed, "models": models }),
+        Err(warning) => {
+            tracing::warn!(%warning, "Codex live model refresh failed; returning cached/embedded models");
+            serde_json::json!({ "refreshed": false, "warning": warning, "models": models })
+        }
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide
@@ -391,6 +408,35 @@ impl acp::Agent for MvpAgent {
         } else {
             self.model_state(None)
         };
+        let configured_default_model = {
+            let cfg = self.cfg.borrow();
+            crate::agent::models::resolved_default_model_preference(&cfg)
+                .map(|preference| preference.value)
+        };
+        // Authentication filtering intentionally removes provider-owned OAuth
+        // models from `modelState`. Keep a non-secret provider lookup beside it
+        // so a client's explicit `--model` can plan the matching login before
+        // that model becomes visible. Catalog keys win over routing-slug aliases.
+        let init_model_provider_map = {
+            let catalog = self.models_manager.models();
+            let mut providers = serde_json::Map::new();
+            for (key, entry) in &catalog {
+                providers.insert(
+                    key.clone(),
+                    serde_json::to_value(entry.info.provider).unwrap_or_default(),
+                );
+            }
+            for entry in catalog.values() {
+                let provider = serde_json::to_value(entry.info.provider).unwrap_or_default();
+                if let Some(id) = entry.info.id.as_ref() {
+                    providers.entry(id.clone()).or_insert_with(|| provider.clone());
+                }
+                providers
+                    .entry(entry.info.model.clone())
+                    .or_insert(provider);
+            }
+            providers
+        };
         Ok(
             acp::InitializeResponse::new(acp::ProtocolVersion::V1)
                 .agent_capabilities(
@@ -424,6 +470,8 @@ impl acp::Agent for MvpAgent {
                         xai_grok_version::VERSION, "agentId" : agent_id(),
                         "agentInstanceId" : agent_instance_id(), "hostname" : hostname
                         .to_string_lossy().to_string(), "modelState" : init_model_state,
+                        "configuredDefaultModel" : configured_default_model,
+                        "modelProviders" : init_model_provider_map,
                         "mcpServers" : mcp_servers, "mcpApps" : client_supports_mcp_apps,
                         "metadata" : metadata, "availableCommands" : crate
                         ::session::slash_commands::builtin_commands(self
@@ -1066,6 +1114,7 @@ impl acp::Agent for MvpAgent {
                         persisted_plan_mode: None,
                         persisted_goal_mode: None,
                         persisted_announcement_state: None,
+                        previous_turn_model: None,
                         session_meta: arguments.meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
@@ -1436,6 +1485,16 @@ impl acp::Agent for MvpAgent {
         let startup_model_id = requested_model_id
             .clone()
             .unwrap_or_else(|| summary.current_model_id.clone());
+        let startup_sampling =
+            self.resolve_sampling_config_for_model(&startup_model_id, origin_client.clone());
+        if startup_sampling.provider == xai_grok_sampling_types::ModelProvider::Codex
+            && !crate::codex_auth::sampling_config_has_credentials(&startup_sampling)
+        {
+            // Fail before replay or spawning a promptable session. The pager
+            // recognizes this provider-local error, runs Codex OAuth, and
+            // retries the same deferred load.
+            return Err(crate::codex_auth::auth_required_error());
+        }
         self.session_turn_numbers
             .borrow_mut()
             .insert(session_id.clone(), summary.next_trace_turn);
@@ -1655,6 +1714,7 @@ impl acp::Agent for MvpAgent {
                         persisted_plan_mode,
                         persisted_goal_mode: _persisted_goal_mode,
                         persisted_announcement_state,
+                        previous_turn_model: summary.previous_turn_model.clone(),
                         session_meta: request_meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
@@ -3245,15 +3305,19 @@ impl acp::Agent for MvpAgent {
         let method = args.method.clone();
         let result = match method.as_ref() {
             "open-grok/codex/models/refresh" => {
-                let refreshed = self.models_manager.refresh_codex_models(true).await;
-                crate::extensions::to_ext_response(refreshed.map(|refreshed| {
-                    let available = self.models_manager.available();
-                    let models = acp::SessionModelState::new(
-                        self.models_manager.current_model_id(),
-                        available.values().cloned().collect(),
-                    );
-                    serde_json::json!({ "refreshed": refreshed, "models": models })
-                }))
+                let refreshed = self
+                    .models_manager
+                    .refresh_codex_models(true)
+                    .await
+                    .map_err(|error| error.to_string());
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(codex_models_refresh_payload(
+                    refreshed, models,
+                )))
             }
             "open-grok/codex/models/clear" => crate::extensions::to_ext_response(Ok(
                 serde_json::json!({

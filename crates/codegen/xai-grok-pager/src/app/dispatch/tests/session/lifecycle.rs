@@ -1,5 +1,16 @@
 //! Tests for session create, exit, trust, startup actions, worktree creation, and cloud lifecycle.
 use super::*;
+
+fn provider_session_models(model: &str, provider: &str) -> acp::SessionModelState {
+    let model_id = acp::ModelId::new(model.to_string());
+    let mut meta = acp::Meta::new();
+    meta.insert("provider".to_string(), serde_json::json!(provider));
+    acp::SessionModelState::new(
+        model_id.clone(),
+        vec![acp::ModelInfo::new(model_id, model.to_string()).meta(Some(meta))],
+    )
+}
+
 /// Simulate a release-stamped build so folder-trust is active (a local/dev
 /// build auto-trusts and persists nothing). Mirrors this module's raw env idiom.
 fn simulate_release_build() {
@@ -60,6 +71,46 @@ fn voice_final_dropped_after_recording_session_cleared() {
         },
     );
     assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "");
+}
+
+#[test]
+fn switching_bound_session_tabs_reanchors_provider_access_state() {
+    let mut app = test_app_with_agent();
+    let xai_id = AgentId(0);
+    let codex_id = AgentId(1);
+    app.agents.get_mut(&xai_id).unwrap().session.models =
+        Some(provider_session_models("grok-build", "xai")).into();
+    let mut codex_session = make_test_agent_session(&app, codex_id, "codex-session");
+    codex_session.models = Some(provider_session_models("gpt-5.6-sol", "codex")).into();
+    app.agents.insert(
+        codex_id,
+        AgentView::new(codex_session, ScrollbackState::new()),
+    );
+    app.primary_provider = PrimaryProvider::Xai;
+    app.team_id = Some("xai-team".into());
+    app.subscription_tier = Some("Free".into());
+    app.gate = Some(xai_grok_shell::auth::GateInfo {
+        message: "xAI subscription required".into(),
+        url: None,
+        label: None,
+    });
+    app.apply_tier_restrictions();
+
+    switch_to_agent(&mut app, codex_id, SwitchCause::Picker);
+    assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+    assert!(app.gate.is_none());
+    assert!(app.team_id.is_none());
+    assert!(app.tier_restricted_commands.is_empty());
+
+    switch_to_agent(&mut app, xai_id, SwitchCause::Picker);
+    assert_eq!(app.primary_provider, PrimaryProvider::Xai);
+    assert_eq!(app.team_id.as_deref(), Some("xai-team"));
+    assert_eq!(app.subscription_tier.as_deref(), Some("Free"));
+    assert_eq!(
+        app.gate.as_ref().map(|gate| gate.message.as_str()),
+        Some("xAI subscription required")
+    );
+    assert!(!app.tier_restricted_commands.is_empty());
 }
 #[test]
 fn voice_auto_stops_when_leaving_recording_session() {
@@ -162,6 +213,39 @@ fn session_created_sets_session_id() {
             .as_ref()
             .map(|s| s.0.as_ref()),
         Some("new-session-123")
+    );
+}
+
+#[test]
+fn session_created_reanchors_provider_before_provider_specific_effects() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.primary_provider = PrimaryProvider::Xai;
+    app.team_id = Some("xai-team".into());
+    app.gate = Some(xai_grok_shell::auth::GateInfo {
+        message: "xAI subscription required".into(),
+        url: None,
+        label: None,
+    });
+    app.agents.get_mut(&id).unwrap().session.session_id = None;
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: "codex-session".into(),
+            models: Some(provider_session_models("gpt-5.6-sol", "codex")),
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+    assert!(app.gate.is_none());
+    assert!(app.team_id.is_none());
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::FetchBilling { .. })),
+        "Codex session creation must not schedule xAI billing: {effects:?}"
     );
 }
 #[test]
@@ -623,7 +707,16 @@ fn switch_model_without_session_does_nothing() {
 #[test]
 fn agent_type_mismatch_start_new_creates_session_with_model_id() {
     let mut app = test_app_with_agent();
-    let model_id = acp::ModelId::new(std::sync::Arc::from("cursor-model"));
+    let model_id = acp::ModelId::new(std::sync::Arc::from("codex-mismatch"));
+    let models: ModelState = Some(provider_session_models("codex-mismatch", "codex")).into();
+    app.models = models.clone();
+    app.agents.get_mut(&AgentId(0)).unwrap().session.models = models;
+    app.primary_provider = PrimaryProvider::Xai;
+    app.gate = Some(xai_grok_shell::auth::GateInfo {
+        message: "xAI subscription required".into(),
+        url: None,
+        label: None,
+    });
     let effects = dispatch(
         Action::AgentTypeMismatchAnswered {
             start_new: true,
@@ -655,6 +748,8 @@ fn agent_type_mismatch_start_new_creates_session_with_model_id() {
     } else {
         panic!("expected active view to be an Agent");
     }
+    assert_eq!(app.primary_provider, PrimaryProvider::Codex);
+    assert!(app.gate.is_none());
 }
 #[test]
 fn new_session_seeds_mcp_init_progress() {
@@ -687,6 +782,64 @@ fn new_session_without_model_switch_has_no_model_id() {
         }
         _ => unreachable!(),
     }
+}
+#[test]
+fn startup_provider_model_override_is_sent_once_and_cleared_on_success() {
+    let mut app = test_app();
+    app.primary_provider = PrimaryProvider::Codex;
+    app.startup_model_override = Some(acp::ModelId::new("gpt-5.6-sol"));
+    let effects = dispatch(Action::NewSession, &mut app);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateSession {
+            model_id: Some(model),
+            ..
+        } if model.0.as_ref() == "gpt-5.6-sol"
+    )));
+
+    let completed = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: AgentId(0),
+            session_id: acp::SessionId::new("codex-session"),
+            models: None,
+        }),
+        &mut app,
+    );
+    assert!(app.startup_model_override.is_none());
+    assert!(
+        !completed
+            .iter()
+            .any(|effect| matches!(effect, Effect::FetchBilling { .. })),
+        "Codex-primary session must not fetch xAI billing: {completed:?}"
+    );
+}
+#[test]
+fn startup_provider_model_override_is_handed_to_first_worktree_session() {
+    let mut app = test_app_git();
+    app.primary_provider = PrimaryProvider::Codex;
+    app.startup_model_override = Some(acp::ModelId::new("codex-visible"));
+
+    let effects = dispatch(
+        Action::NewWorktreeSession {
+            load_session_id: None,
+            label: None,
+            git_ref: None,
+        },
+        &mut app,
+    );
+
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateWorktreeSession {
+            model_id: Some(model),
+            ..
+        } if model.0.as_ref() == "codex-visible"
+    )));
+    assert_eq!(
+        app.startup_model_override.as_ref().map(|id| id.0.as_ref()),
+        Some("codex-visible"),
+        "the override is retained until worktree creation succeeds"
+    );
 }
 #[test]
 fn new_session_seeds_available_commands_from_bootstrap() {

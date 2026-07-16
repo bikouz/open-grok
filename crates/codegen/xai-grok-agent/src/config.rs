@@ -346,8 +346,18 @@ fn codex_toolset() -> ToolServerConfig {
             kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             task_output_tool_config(),
+            wait_tasks_tool_config(),
+            task_tool_config(),
+            (&grok_build::SchedulerCreateTool).into(),
+            (&grok_build::SchedulerDeleteTool).into(),
+            (&grok_build::SchedulerListTool).into(),
+            (&grok_build::MonitorTool).into(),
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
+            (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::EnterPlanModeTool).into(),
+            (&grok_build::ExitPlanModeTool).into(),
+            (&grok_build::AskUserQuestionTool).into(),
         ],
         behavior_preset: None,
     }
@@ -1634,6 +1644,35 @@ impl AgentDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_toolset_keeps_grok_harness_orchestration_features() {
+        let toolset = codex_toolset();
+        let short_names = toolset
+            .tools
+            .iter()
+            .filter_map(|tool| tool.id.rsplit(':').next())
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "task",
+            "wait_tasks",
+            "get_task_output",
+            "kill_task",
+            "scheduler_create",
+            "scheduler_delete",
+            "scheduler_list",
+            "monitor",
+            "update_goal",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "ask_user_question",
+        ] {
+            assert!(
+                short_names.contains(required),
+                "Codex harness is missing provider-neutral feature tool {required}"
+            );
+        }
+    }
     /// Native presets only.
     #[test]
     fn toolset_for_preset_resolves_known_names() {

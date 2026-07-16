@@ -380,6 +380,16 @@ pub(super) fn handle_billing_fetched(
     subscription_tier: Option<String>,
     autotopup: crate::views::credit_bar::AutoTopupFetch,
 ) -> Vec<Effect> {
+    // A background xAI request may finish after its agent has switched to a
+    // Codex model. Provider-owned billing state must not leak across that
+    // boundary; the next real transition back to xAI schedules a fresh fetch.
+    if !app.uses_xai_access_controls() {
+        tracing::debug!(
+            ?agent_id,
+            "ignoring stale xAI billing result while Codex is active"
+        );
+        return vec![];
+    }
     // Parse/transport failures route to `BillingError`, so a `None`
     // balance here means the response carried no billing config. Clear
     // the cached balance + polling so the status bar agrees with the
@@ -434,15 +444,21 @@ pub(super) fn handle_usage_fetched(
             autotopup,
         }) => {
             let summary_balance = balance.clone();
-            // Silent here means "do not render the xAI-only block". All of
-            // the existing xAI state updates still run before we render the
-            // combined provider summary below.
-            handle_billing_fetched(app, agent_id, balance, true, subscription_tier, autotopup);
+            // Manual combined usage always renders the xAI half. When Codex
+            // owns the active session, format from a local snapshot so this
+            // one-off request cannot repopulate xAI access/billing UI state.
+            let summary_topup = if app.uses_xai_access_controls() {
+                handle_billing_fetched(app, agent_id, balance, true, subscription_tier, autotopup);
+                app.auto_topup.clone()
+            } else {
+                let mut topup = app.auto_topup.clone();
+                apply_auto_topup(&mut topup, &autotopup);
+                topup
+            };
             match summary_balance {
-                Some(balance) => crate::views::credit_bar::format_usage_summary(
-                    &balance,
-                    app.auto_topup.as_ref(),
-                ),
+                Some(balance) => {
+                    crate::views::credit_bar::format_usage_summary(&balance, summary_topup.as_ref())
+                }
                 None => "No billing data available.".to_string(),
             }
         }
@@ -474,6 +490,9 @@ pub(super) fn handle_gate_refreshed(
     if let Some(secs) = rs.subscription_watch_interval_secs {
         app.subscription_watch_interval_secs = Some(secs);
     }
+    if !app.uses_xai_access_controls() {
+        return vec![];
+    }
     match AppView::gate_from_settings(&rs) {
         Some(gate) => app.impose_gate(gate),
         None => app.lift_gate(),
@@ -489,6 +508,13 @@ pub(super) fn handle_check_subscription_complete(
     verify: Option<u64>,
     meta: Option<serde_json::Value>,
 ) -> Vec<Effect> {
+    if !app.uses_xai_access_controls() {
+        if let Some(meta) = meta {
+            app.startup_xai_ready = true;
+            app.startup_xai_auth_meta = Some(meta);
+        }
+        return vec![];
+    }
     let was_blocked = !app.has_access();
     let applied = match meta {
         Some(meta_val) => {
@@ -559,6 +585,13 @@ pub(super) fn handle_credit_limit_recheck_complete(
     agent_id: AgentId,
     meta: Option<serde_json::Value>,
 ) -> Vec<Effect> {
+    if !app.uses_xai_access_controls() {
+        if let Some(meta) = meta {
+            app.startup_xai_ready = true;
+            app.startup_xai_auth_meta = Some(meta);
+        }
+        return vec![];
+    }
     let old_tier = app.subscription_tier.clone();
     if let Some(meta_val) = meta
         && let Ok(auth_meta) = serde_json::from_value::<xai_grok_shell::auth::AuthMeta>(meta_val)

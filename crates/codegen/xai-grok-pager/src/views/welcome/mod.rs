@@ -674,6 +674,52 @@ pub fn render_welcome(
     render_top_bar(top_bar_inner, buf, &theme, None);
 
     let mut result = match params.auth_state {
+        AuthState::ProviderChoice { error } => {
+            let menu = [
+                ("c", "Continue with ChatGPT Codex"),
+                ("x", "Continue with xAI Grok"),
+                ("q", "Quit"),
+            ];
+            let provider_prompt = "Choose the account that will power this session.";
+            let msg = error
+                .as_deref()
+                .map(|value| (value, theme.accent_error))
+                .or(Some((provider_prompt, theme.gray_bright)));
+            let info = PromptInfo {
+                model_name: params.model_name,
+                flags: params.flags,
+                multiline: false,
+                usage_warning: None,
+                usage_warning_critical: false,
+            };
+            let (menu_rects, post_flush_escapes) = render_welcome_blocked(
+                content_area,
+                buf,
+                msg,
+                &menu,
+                params.selected,
+                Some((prompt, &info)),
+                h_margin,
+                params.compact,
+            );
+            WelcomeRenderResult {
+                cursor_pos: None,
+                post_flush_escapes,
+                menu_rects,
+                prompt_rect: None,
+                session_picker_hit_areas: None,
+                import_banner_rect: None,
+                auth_url_rect: None,
+                auth_fallback_rect: None,
+                refresh_rect: None,
+                gate_url_rect: None,
+                changelog_action_present: false,
+                changelog_cta_rect: None,
+                announcement_truncated: false,
+                announcement_rect: None,
+                upgrade_cta_rect: None,
+            }
+        }
         AuthState::Pending { error } => {
             let label = params.login_label.unwrap_or("grok.com");
             let login_text = format!("Login with {}", label);

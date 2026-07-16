@@ -355,7 +355,7 @@ impl SessionActor {
     }
 
     /// Re-register MCP tools onto a freshly-built `ToolBridge` after a
-    /// zero-turn harness rebuild.
+    /// between-turn harness rebuild.
     ///
     /// Snapshots the live MCP `Client` connections from `mcp_state` and
     /// (eventually) re-walks each client's `list_tools` to mirror its

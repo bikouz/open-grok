@@ -277,6 +277,10 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
     app: &mut AppView,
     model_id: Option<acp::ModelId>,
 ) -> (AgentId, Vec<Effect>) {
+    // ACP was connected before first-run provider onboarding. Carry the
+    // chosen provider model explicitly on the first fresh session so the
+    // running shell does not fall back to its pre-onboarding default.
+    let model_id = model_id.or_else(|| app.startup_model_override.clone());
     let mut effects =
         unregister_session_effect(get_active_agent(app).and_then(|a| a.session.session_id.clone()));
     let (effective_cwd, inherit_worktree) = get_active_agent(app)
@@ -326,6 +330,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         scrollback,
     );
     app.agents.insert(agent_id, agent);
+    let usage_command_visible = app.usage_command_visible();
     {
         let agent = app.agents.get_mut(&agent_id).unwrap();
         agent.prompt.set_compact(app.appearance.prompt.compact);
@@ -337,7 +342,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         agent.set_voice_mode_available(app.voice_mode_enabled);
         agent.apply_app_scoped_gates(
             app.sharing_enabled,
-            app.usage_visible,
+            usage_command_visible,
             app.chat_mode,
             app.screen_mode,
             &app.active_announcements,
@@ -607,6 +612,11 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         }
         return vec![];
     }
+    let model_id = if load_session_id.is_none() {
+        model_id.or_else(|| app.startup_model_override.clone())
+    } else {
+        model_id
+    };
     if load_session_id.is_none() {
         reseed_tip_for_new_session(app);
     }
@@ -665,6 +675,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
     } else {
         app.deferred_startup.pending_chat
     };
+    let usage_command_visible = app.usage_command_visible();
     {
         let agent = app.agents.get_mut(&agent_id).unwrap();
         agent.prompt.set_compact(app.appearance.prompt.compact);
@@ -676,7 +687,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         agent.set_voice_mode_available(app.voice_mode_enabled);
         agent.apply_app_scoped_gates(
             app.sharing_enabled,
-            app.usage_visible,
+            usage_command_visible,
             app.chat_mode,
             app.screen_mode,
             &app.active_announcements,
@@ -787,7 +798,7 @@ pub(in crate::app::dispatch) fn skip_picker_and_create_session(
     vec![Effect::CreateSession {
         agent_id,
         cwd: app.cwd.clone(),
-        model_id: None,
+        model_id: app.startup_model_override.clone(),
         preferred_session_id,
         chat_kind,
     }]
@@ -798,6 +809,15 @@ pub(in crate::app::dispatch) fn handle_session_created(
     session_id: acp::SessionId,
     new_models: Option<acp::SessionModelState>,
 ) -> Vec<Effect> {
+    app.startup_model_override = None;
+    if let Some(models) = new_models {
+        app.models = Some(models).into();
+        if let Some(agent) = app.agents.get_mut(&agent_id) {
+            agent.session.models = app.models.clone();
+        }
+    }
+    let provider_effects = app.sync_primary_provider_from_active_agent();
+    let fetch_xai_billing = app.uses_xai_access_controls() && provider_effects.is_empty();
     let agent_count = app.agents.len();
     let switch_hint =
         crate::views::dashboard::session_switch_hint_command(app.screen_mode.is_minimal());
@@ -818,10 +838,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
             )));
         }
         agent.bind_session_id(session_id);
-        if let Some(m) = new_models {
-            app.models = Some(m).into();
-            agent.session.models = app.models.clone();
-        }
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
@@ -829,9 +845,11 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent.session.model_switch_pending = true;
         }
         let mut effects = if app.reconnect_pending {
-            vec![]
+            provider_effects
         } else {
-            maybe_drain_queue(agent)
+            let mut effects = provider_effects;
+            effects.extend(maybe_drain_queue(agent));
+            effects
         };
         agent.session.prompt_history_loading = true;
         effects.push(Effect::FetchPromptHistory {
@@ -854,10 +872,12 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 session_id: session_id_clone.clone(),
             });
         }
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-        });
+        if fetch_xai_billing {
+            effects.push(Effect::FetchBilling {
+                agent_id,
+                silent: true,
+            });
+        }
         if let Some((model_id, effort)) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
@@ -896,6 +916,15 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
     session_cwd: std::path::PathBuf,
     new_models: Option<acp::SessionModelState>,
 ) -> Vec<Effect> {
+    app.startup_model_override = None;
+    if let Some(models) = new_models {
+        app.models = Some(models).into();
+        if let Some(agent) = app.agents.get_mut(&agent_id) {
+            agent.session.models = app.models.clone();
+        }
+    }
+    let provider_effects = app.sync_primary_provider_from_active_agent();
+    let fetch_xai_billing = app.uses_xai_access_controls() && provider_effects.is_empty();
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.session.finish_command();
         agent.mark_turn_finished();
@@ -903,10 +932,6 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         agent.bind_session_id(session_id);
         agent.session.cwd = session_cwd.clone();
         agent.session.is_worktree = true;
-        if let Some(m) = new_models {
-            app.models = Some(m).into();
-            agent.session.models = app.models.clone();
-        }
         agent.prompt.file_search.retarget(&session_cwd);
         agent.scrollback.push_block(RenderBlock::system(format!(
             "Worktree ready: {}",
@@ -919,9 +944,11 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             agent.session.model_switch_pending = true;
         }
         let mut effects = if app.reconnect_pending {
-            vec![]
+            provider_effects
         } else {
-            maybe_drain_queue(agent)
+            let mut effects = provider_effects;
+            effects.extend(maybe_drain_queue(agent));
+            effects
         };
         agent.session.prompt_history_loading = true;
         effects.push(Effect::FetchPromptHistory {
@@ -944,10 +971,12 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 session_id: session_id_clone.clone(),
             });
         }
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-        });
+        if fetch_xai_billing {
+            effects.push(Effect::FetchBilling {
+                agent_id,
+                silent: true,
+            });
+        }
         if let Some((model_id, effort)) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
@@ -1037,7 +1066,8 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
 ) -> Vec<Effect> {
-    if let Some(agent) = app.agents.get_mut(&agent_id) {
+    let switch_succeeded = result.is_ok();
+    let mut effects = if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.session.model_switch_pending = false;
         let mut effects = match result {
             Ok(()) => {
@@ -1091,7 +1121,17 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
         effects
     } else {
         vec![]
+    };
+
+    // The shell accepted the model before this completion is emitted, so its
+    // catalog metadata is authoritative for provider-specific UI/access state.
+    // Failed or metadata-less switches leave the prior provider untouched.
+    if switch_succeeded
+        && matches!(app.active_view, ActiveView::Agent(active) if active == agent_id)
+    {
+        effects.extend(app.sync_primary_provider_from_active_agent());
     }
+    effects
 }
 pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
     app: &mut AppView,
@@ -1100,7 +1140,7 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
     effort: Option<ReasoningEffort>,
 ) -> Vec<Effect> {
     if start_new {
-        let effects = dispatch_new_session_inner(app, Some(model_id.clone()));
+        let mut effects = dispatch_new_session_inner(app, Some(model_id.clone()));
         if let ActiveView::Agent(new_aid) = app.active_view
             && let Some(agent) = app.agents.get_mut(&new_aid)
         {
@@ -1109,6 +1149,11 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
                 agent.session.deferred_model_switch = Some((model_id, effort));
             }
         }
+        // The new placeholder was cloned from the previous tab before the
+        // incompatible target model was applied. Re-anchor immediately so its
+        // provider cannot inherit the old tab's access controls while
+        // `session/new` is in flight.
+        effects.extend(app.sync_primary_provider_from_active_agent());
         effects
     } else {
         vec![]

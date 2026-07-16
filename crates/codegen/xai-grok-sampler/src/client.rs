@@ -18,7 +18,8 @@ use futures_util::stream::BoxStream;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, OnceLock};
 
 use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
@@ -40,6 +41,7 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
 const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
 const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
@@ -117,20 +119,9 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
         Err(first_err) => {
-            // Try sanitizing: parse as Value, strip unknown tools, retry.
+            // Try sanitizing provider extensions at the typed SDK boundary.
             if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
                 normalize_response_event_compat(&mut value);
-
-                // Strip tools that async_openai's rs::Tool can't deserialize
-                // (e.g., xAI-specific "x_search"). Instead of maintaining a
-                // hardcoded allowlist, try deserializing each tool entry —
-                // if it fails, drop it.
-                if let Some(tools) = value
-                    .pointer_mut("/response/tools")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    tools.retain(|t| serde_json::from_value::<rs::Tool>(t.clone()).is_ok());
-                }
                 if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
                     apply_terminal_event_overrides(&mut event, data);
                     return Ok(event);
@@ -157,24 +148,65 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
 fn normalize_response_event_compat(value: &mut serde_json::Value) {
     normalize_response_reasoning_effort(value);
 
-    let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+    let Some(mut event_type) = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
         return;
     };
 
-    match event_type {
-        "response.output_item.added" => {
+    // xAI's Responses stream does not require OpenAI's sequence number.
+    // async-openai does, so supply a neutral local value when it is absent.
+    if event_type.starts_with("response.")
+        && let Some(event) = value.as_object_mut()
+    {
+        event
+            .entry("sequence_number".to_owned())
+            .or_insert_with(|| serde_json::Value::Number(0_u64.into()));
+    }
+
+    // xAI also accepts `response.done` as its terminal spelling. The local
+    // stream transformer already treats ResponseCompleted as the successful
+    // terminal event, so normalize only at this dependency boundary.
+    if event_type == "response.done" {
+        value["type"] = serde_json::Value::String("response.completed".to_owned());
+        event_type = "response.completed".to_owned();
+    }
+
+    // async-openai 0.33.1 does not model xAI's hosted X-search progress
+    // events. OutputItemAdded/Done carry the actual lifecycle and payload, so
+    // preserve these frames as recognized no-op progress events rather than
+    // failing the whole stream or mislabeling them as web search.
+    if matches!(
+        event_type.as_str(),
+        "response.x_search_call.in_progress"
+            | "response.x_search_call.searching"
+            | "response.x_search_call.completed"
+    ) {
+        value["type"] = serde_json::Value::String("response.web_search_call.searching".to_owned());
+        event_type = "response.web_search_call.searching".to_owned();
+    }
+
+    match event_type.as_str() {
+        "response.output_item.added" | "response.output_item.done" => {
             if let Some(item) = value.get_mut("item") {
-                fill_missing_custom_tool_call_id(item);
+                normalize_response_output_item(item);
             }
         }
-        "response.completed" | "response.failed" | "response.incomplete" => {
-            if let Some(output) = value
-                .pointer_mut("/response/output")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for item in output {
-                    fill_missing_custom_tool_call_id(item);
-                }
+        "response.created"
+        | "response.in_progress"
+        | "response.completed"
+        | "response.failed"
+        | "response.incomplete" => {
+            let default_status = match event_type.as_str() {
+                "response.completed" => "completed",
+                "response.failed" => "failed",
+                "response.incomplete" => "incomplete",
+                _ => "in_progress",
+            };
+            if let Some(response) = value.get_mut("response") {
+                normalize_response_compat(response, default_status);
             }
         }
         "response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done" => {
@@ -192,6 +224,140 @@ fn normalize_response_event_compat(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+/// Normalize a complete Responses object before handing it to async-openai.
+/// This supports both synchronous responses and response objects nested in SSE
+/// terminal frames without changing the provider-native conversation model.
+fn normalize_response_compat(value: &mut serde_json::Value, default_status: &str) {
+    normalize_response_reasoning_effort(value);
+    let Some(response) = value.as_object_mut() else {
+        return;
+    };
+
+    insert_json_default(response, "created_at", serde_json::json!(0));
+    insert_json_default(response, "id", serde_json::json!(""));
+    insert_json_default(response, "model", serde_json::json!(""));
+    insert_json_default(response, "object", serde_json::json!("response"));
+    insert_json_default(response, "output", serde_json::json!([]));
+    insert_json_default(response, "status", serde_json::json!(default_status));
+
+    if let Some(output) = response
+        .get_mut("output")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in output {
+            normalize_response_output_item(item);
+        }
+    }
+
+    // The response may echo xAI-only hosted tool declarations such as
+    // `{"type":"x_search"}`. Retain every tool the typed SDK understands and
+    // drop only declarations it cannot represent.
+    if let Some(tools) = response
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        tools.retain(|tool| serde_json::from_value::<rs::Tool>(tool.clone()).is_ok());
+    }
+
+    if let Some(usage) = response
+        .get_mut("usage")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        insert_json_default(usage, "input_tokens", serde_json::json!(0));
+        insert_json_default(usage, "output_tokens", serde_json::json!(0));
+        let total_tokens = usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            .saturating_add(
+                usage
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+            )
+            .min(u64::from(u32::MAX));
+        insert_json_default(usage, "total_tokens", serde_json::json!(total_tokens));
+        insert_json_default(
+            usage,
+            "input_tokens_details",
+            serde_json::json!({"cached_tokens": 0}),
+        );
+        insert_json_default(
+            usage,
+            "output_tokens_details",
+            serde_json::json!({"reasoning_tokens": 0}),
+        );
+        if let Some(details) = usage
+            .get_mut("input_tokens_details")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            insert_json_default(details, "cached_tokens", serde_json::json!(0));
+        }
+        if let Some(details) = usage
+            .get_mut("output_tokens_details")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            insert_json_default(details, "reasoning_tokens", serde_json::json!(0));
+        }
+    }
+}
+
+fn insert_json_default(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: serde_json::Value,
+) {
+    if object.get(key).is_none_or(serde_json::Value::is_null) {
+        object.insert(key.to_owned(), default);
+    }
+}
+
+fn normalize_response_output_item(item: &mut serde_json::Value) {
+    normalize_x_search_call(item);
+    fill_missing_custom_tool_call_id(item);
+}
+
+/// Project xAI's current hosted `x_search_call` output item into the legacy
+/// backend CustomToolCall shape already used throughout Open Grok. This is a
+/// typed-SDK adapter only: the tool remains provider-executed and is never
+/// exposed to the local tool dispatcher.
+fn normalize_x_search_call(item: &mut serde_json::Value) {
+    let Some(item) = item.as_object_mut() else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("x_search_call") {
+        return;
+    }
+
+    let nonempty_string = |key: &str| {
+        item.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let id = nonempty_string("id")
+        .or_else(|| nonempty_string("call_id"))
+        .unwrap_or_else(|| "x_search".to_owned());
+    let call_id = nonempty_string("call_id").unwrap_or_else(|| id.clone());
+    let name = nonempty_string("name").unwrap_or_else(|| "x_search".to_owned());
+    let input = nonempty_string("input")
+        .or_else(|| nonempty_string("arguments"))
+        .or_else(|| {
+            item.get("action")
+                .and_then(|action| serde_json::to_string(action).ok())
+        })
+        .unwrap_or_else(|| "{}".to_owned());
+
+    item.insert(
+        "type".to_owned(),
+        serde_json::Value::String("custom_tool_call".to_owned()),
+    );
+    item.insert("id".to_owned(), serde_json::Value::String(id));
+    item.insert("call_id".to_owned(), serde_json::Value::String(call_id));
+    item.insert("name".to_owned(), serde_json::Value::String(name));
+    item.insert("input".to_owned(), serde_json::Value::String(input));
 }
 
 /// async-openai 0.33.1 stops at `xhigh`, while Codex may echo the accepted
@@ -363,6 +529,59 @@ fn patch_custom_tool_output_wire_fields(
     }
 }
 
+/// Restore opaque provider-native input items after async-openai serializes
+/// their typed placeholders. This is used only for Codex replacement history
+/// returned by `/responses/compact`.
+fn patch_raw_input_replacements(
+    request_body: &mut serde_json::Value,
+    replacements: &[xai_grok_sampling_types::RawInputItemReplacement],
+) -> Result<()> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let input = request_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or(SamplingError::InvalidConfiguration(
+            "Codex raw input replacements require an input array",
+        ))?;
+    for replacement in replacements {
+        let slot = input.get_mut(replacement.input_item_index).ok_or(
+            SamplingError::InvalidConfiguration(
+                "Codex raw input replacement index is out of range",
+            ),
+        )?;
+        *slot = replacement.value.clone();
+    }
+    Ok(())
+}
+
+fn retain_codex_compact_request_fields(request_body: &mut serde_json::Value) -> Result<()> {
+    let body = request_body
+        .as_object_mut()
+        .ok_or(SamplingError::InvalidConfiguration(
+            "Codex compact request did not serialize to an object",
+        ))?;
+    body.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "model"
+                | "input"
+                | "instructions"
+                | "tools"
+                | "parallel_tool_calls"
+                | "reasoning"
+                | "service_tier"
+                | "prompt_cache_key"
+                | "text"
+        )
+    });
+    body.retain(|key, value| {
+        !value.is_null() || matches!(key.as_str(), "model" | "input" | "parallel_tool_calls")
+    });
+    Ok(())
+}
+
 /// On terminal Responses API events (`response.completed` /
 /// `response.incomplete`), rewrite `response.usage.total_tokens` to the
 /// live context length when the wire includes
@@ -506,6 +725,11 @@ struct StreamOptions {
     include_usage: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct CodexCompactHistoryResponse {
+    output: Vec<serde_json::Value>,
+}
+
 /// HTTP client for sampling. Cheap to clone; carries an `Arc`-backed
 /// `reqwest::Client` and the default headers/request-defaults computed
 /// from a [`SamplerConfig`] at construction time.
@@ -524,6 +748,9 @@ pub struct SamplingClient {
     bearer_resolver: Option<crate::config::SharedBearerResolver>,
     /// Per-request header injection (OTel traceparent).
     header_injector: Option<crate::config::SharedHeaderInjector>,
+    /// First-value-wins sticky-routing token for one logical Codex turn.
+    /// `None` for every non-Codex/non-Responses client.
+    codex_turn_state: Option<Arc<OnceLock<String>>>,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -536,6 +763,7 @@ impl std::fmt::Debug for SamplingClient {
                 &self.attribution_callback.is_some(),
             )
             .field("has_bearer_resolver", &self.bearer_resolver.is_some())
+            .field("has_codex_turn_state", &self.codex_turn_state.is_some())
             .finish()
     }
 }
@@ -550,6 +778,7 @@ struct ClientDefaults {
     provider: xai_grok_sampling_types::ModelProvider,
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
+    idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
@@ -635,6 +864,28 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        Self::new_inner(config, None)
+    }
+
+    /// Construct a client attached to a single logical Codex turn.
+    ///
+    /// The state is ignored unless this is a Codex Responses client, so the
+    /// provider-private header can never cross onto xAI or another backend.
+    pub fn new_with_codex_turn_state(
+        config: SamplerConfig,
+        codex_turn_state: Arc<OnceLock<String>>,
+    ) -> Result<Self> {
+        Self::new_inner(config, Some(codex_turn_state))
+    }
+
+    fn new_inner(
+        config: SamplerConfig,
+        codex_turn_state: Option<Arc<OnceLock<String>>>,
+    ) -> Result<Self> {
+        let codex_turn_state = (config.provider == ModelProvider::Codex
+            && config.api_backend == ApiBackend::Responses)
+            .then(|| codex_turn_state)
+            .flatten();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(ref api_key) = config.api_key {
@@ -772,6 +1023,7 @@ impl SamplingClient {
             provider: config.provider,
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
+            idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
             doom_loop_recovery: config.doom_loop_recovery,
         };
@@ -784,6 +1036,7 @@ impl SamplingClient {
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
+            codex_turn_state,
         })
     }
 
@@ -795,6 +1048,21 @@ impl SamplingClient {
     /// Provider selected when this client was constructed.
     pub fn provider(&self) -> xai_grok_sampling_types::ModelProvider {
         self.defaults.provider
+    }
+
+    fn capture_codex_turn_state(&self, headers: &HeaderMap) {
+        let Some(state) = self.codex_turn_state.as_ref() else {
+            return;
+        };
+        let Some(value) = headers
+            .get(X_CODEX_TURN_STATE_HEADER)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return;
+        };
+        // Codex's contract is immutable within a turn. Compact and later
+        // Responses calls may echo other values, but the first one wins.
+        let _ = state.set(value.to_owned());
     }
 
     /// Replace a live bearer resolver without rebuilding the client's model,
@@ -878,6 +1146,21 @@ impl SamplingClient {
         );
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
+        }
+
+        // This header is an internal Codex routing token, never operator
+        // configuration. Remove any value supplied through extra headers,
+        // live auth metadata, or tracing injection, then install at most the
+        // exact first value captured for this logical turn.
+        headers.remove(X_CODEX_TURN_STATE_HEADER);
+        if let Some(mut value) = self
+            .codex_turn_state
+            .as_ref()
+            .and_then(|state| state.get())
+            .and_then(|state| HeaderValue::from_str(state).ok())
+        {
+            value.set_sensitive(true);
+            headers.insert(X_CODEX_TURN_STATE_HEADER, value);
         }
         self.http.post(url).headers(headers)
     }
@@ -966,6 +1249,7 @@ impl SamplingClient {
             || lower.contains("apikey")
             || lower.contains("token")
             || lower.contains("secret")
+            || lower == X_CODEX_TURN_STATE_HEADER
     }
 
     /// Format a single header for error messages, redacting sensitive values.
@@ -1361,6 +1645,132 @@ impl SamplingClient {
     // Responses API
     // =========================================================================
 
+    /// Replace a Codex conversation history through OpenAI's unary
+    /// `/responses/compact` endpoint.
+    ///
+    /// The endpoint accepts the same model/input/tools/reasoning controls as a
+    /// normal Responses turn, but returns input-ready replacement items rather
+    /// than a `Response`. Authentication and account routing flow through the
+    /// same live bearer resolver as inference, keeping bearer, account ID, and
+    /// FedRAMP headers on one credential snapshot.
+    pub async fn compact_codex_conversation(
+        &self,
+        mut request: ConversationRequest,
+        instructions: &str,
+    ) -> Result<Vec<xai_grok_sampling_types::ConversationItem>> {
+        if self.defaults.provider != ModelProvider::Codex
+            || self.defaults.api_backend != ApiBackend::Responses
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "responses/compact is available only for the Codex Responses provider",
+            ));
+        }
+        if request.items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.apply_conversation_defaults(&mut request)?;
+        request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
+            &request.hosted_tools,
+            self.defaults.provider,
+        );
+        let extra_raw_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
+        let named_custom_tool_outputs = request.named_custom_tool_outputs();
+        let mut original_detail_custom_output_images =
+            request.original_detail_custom_output_images();
+        original_detail_custom_output_images
+            .extend(request.original_detail_function_output_images());
+        let raw_input_replacements = request.raw_codex_input_replacements();
+        let local_reasoning_effort = request.reasoning_effort;
+
+        let mut inner: rs::CreateResponse = (&request).into();
+        inner.instructions = (!instructions.is_empty()).then(|| instructions.to_owned());
+        inner.parallel_tool_calls = Some(true);
+        let mut request_body = serde_json::to_value(inner).map_err(|error| {
+            tracing::error!(%error, "failed to serialize Codex compact request");
+            SamplingError::Serialization(error)
+        })?;
+        if !extra_raw_tools.is_empty() {
+            if let Some(tools) = request_body
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.extend(extra_raw_tools);
+            } else {
+                request_body["tools"] = serde_json::Value::Array(extra_raw_tools);
+            }
+        }
+        xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        patch_custom_tool_output_wire_fields(
+            &mut request_body,
+            &named_custom_tool_outputs,
+            &original_detail_custom_output_images,
+        );
+        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
+        patch_codex_request_compat(
+            &mut request_body,
+            self.defaults.provider,
+            self.defaults.codex_multi_agent_v2,
+            local_reasoning_effort,
+        );
+        retain_codex_compact_request_fields(&mut request_body)?;
+
+        let endpoint = self.endpoint("responses/compact");
+        let timeout_secs = self
+            .defaults
+            .idle_timeout_secs
+            .unwrap_or(300)
+            .saturating_mul(4)
+            .max(1);
+        tracing::debug!(%endpoint, timeout_secs, "sending Codex compact request");
+        let response = self
+            .post(&endpoint)
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(SamplingError::Http)?;
+        let status = response.status();
+        if status.is_success() {
+            self.capture_codex_turn_state(response.headers());
+        }
+        let model_metadata = extract_model_metadata(response.headers());
+        let retry_after_secs = extract_retry_after(response.headers());
+        let should_retry = extract_should_retry(response.headers());
+        let bytes = response.bytes().await.map_err(SamplingError::Http)?;
+        if !status.is_success() {
+            let server_message = parse_error_bytes(bytes.as_ref());
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.record_401_attribution(crate::attribution::SamplingConsumer::Responses);
+                return Err(SamplingError::Auth(format!(
+                    "Unauthorized (401) from {endpoint}: {server_message}"
+                )));
+            }
+            return Err(SamplingError::Api {
+                status,
+                message: self.build_api_error_message(
+                    status,
+                    &server_message,
+                    &endpoint,
+                    &[],
+                    None,
+                ),
+                model_metadata,
+                retry_after_secs,
+                should_retry,
+            });
+        }
+        let response: CodexCompactHistoryResponse =
+            serde_json::from_slice(&bytes).map_err(SamplingError::Serialization)?;
+        if response.output.is_empty() {
+            return Err(SamplingError::serialization_message(
+                "Codex compact response contained no replacement history",
+            ));
+        }
+        xai_grok_sampling_types::codex_compact_output_to_conversation_items(response.output)
+            .map_err(SamplingError::serialization_message)
+    }
+
     /// Apply default configuration to a Responses API request.
     fn apply_response_defaults(&self, request: &mut CreateResponseWrapper) -> Result<()> {
         // Apply model default if not specified
@@ -1451,6 +1861,7 @@ impl SamplingClient {
             &request.named_custom_tool_outputs,
             &request.original_detail_custom_output_images,
         );
+        patch_raw_input_replacements(&mut request_body, &request.raw_input_replacements)?;
         patch_codex_request_compat(
             &mut request_body,
             self.defaults.provider,
@@ -1470,6 +1881,9 @@ impl SamplingClient {
         })?;
 
         let status = response.status();
+        if status.is_success() {
+            self.capture_codex_turn_state(response.headers());
+        }
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
         let should_retry = extract_should_retry(response.headers());
@@ -1513,7 +1927,7 @@ impl SamplingClient {
 
         let response_obj = (|| {
             let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
-            normalize_response_reasoning_effort(&mut value);
+            normalize_response_compat(&mut value, "completed");
             serde_json::from_value::<rs::Response>(value)
         })()
         .map_err(|e| {
@@ -1615,6 +2029,7 @@ impl SamplingClient {
             &request.named_custom_tool_outputs,
             &request.original_detail_custom_output_images,
         );
+        patch_raw_input_replacements(&mut request_body, &request.raw_input_replacements)?;
         patch_codex_request_compat(
             &mut request_body,
             self.defaults.provider,
@@ -1705,6 +2120,8 @@ impl SamplingClient {
                 should_retry,
             });
         }
+
+        self.capture_codex_turn_state(response.headers());
 
         let model_metadata = extract_model_metadata(response.headers());
 
@@ -2194,6 +2611,8 @@ impl SamplingClient {
         // They are injected as raw JSON after serialization.
         let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
+        let raw_input_replacements =
+            request.raw_responses_input_replacements(self.defaults.provider);
         let mut original_detail_custom_output_images =
             request.original_detail_custom_output_images();
         original_detail_custom_output_images
@@ -2211,6 +2630,7 @@ impl SamplingClient {
         wrapper.extra_raw_tools = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
         wrapper.original_detail_custom_output_images = original_detail_custom_output_images;
+        wrapper.raw_input_replacements = raw_input_replacements;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2241,6 +2661,8 @@ impl SamplingClient {
         let x_grok_agent_id = request.x_grok_agent_id.clone();
         let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
+        let raw_input_replacements =
+            request.raw_responses_input_replacements(self.defaults.provider);
         let mut original_detail_custom_output_images =
             request.original_detail_custom_output_images();
         original_detail_custom_output_images
@@ -2258,6 +2680,7 @@ impl SamplingClient {
         wrapper.extra_raw_tools = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
         wrapper.original_detail_custom_output_images = original_detail_custom_output_images;
+        wrapper.raw_input_replacements = raw_input_replacements;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2420,6 +2843,64 @@ mod tests {
             doom_loop_recovery: None,
             header_injector: None,
         }
+    }
+
+    #[test]
+    fn codex_compact_body_keeps_only_endpoint_contract_fields() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"type": "message", "role": "user", "content": "hello"}],
+            "instructions": "system",
+            "tools": null,
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high", "summary": "concise"},
+            "service_tier": null,
+            "prompt_cache_key": null,
+            "text": null,
+            "store": false,
+            "stream": false,
+            "include": ["reasoning.encrypted_content"],
+            "temperature": 0.7,
+            "max_output_tokens": 1234
+        });
+        retain_codex_compact_request_fields(&mut body).unwrap();
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert!(body.get("reasoning").is_some());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("service_tier").is_none());
+        for forbidden in [
+            "store",
+            "stream",
+            "include",
+            "temperature",
+            "max_output_tokens",
+        ] {
+            assert!(body.get(forbidden).is_none(), "unexpected {forbidden}");
+        }
+    }
+
+    #[test]
+    fn codex_raw_input_patch_restores_exact_compaction_item() {
+        let raw = serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        });
+        let mut body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "before"},
+                {"type": "message", "role": "assistant", "content": "placeholder"}
+            ]
+        });
+        patch_raw_input_replacements(
+            &mut body,
+            &[xai_grok_sampling_types::RawInputItemReplacement {
+                input_item_index: 1,
+                value: raw.clone(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(body["input"][1], raw);
     }
 
     /// Verify the serialized shape of StreamingChatRequest matches the
@@ -2600,6 +3081,45 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("codex_cli_rs")
         );
+    }
+
+    #[test]
+    fn codex_turn_state_is_reserved_and_emitted_once_from_internal_state() {
+        let mut cfg = minimal_config();
+        cfg.provider = xai_grok_sampling_types::ModelProvider::Codex;
+        cfg.api_backend = ApiBackend::Responses;
+        cfg.extra_headers.insert(
+            X_CODEX_TURN_STATE_HEADER.to_owned(),
+            "operator-stale-state".to_owned(),
+        );
+        let turn_state = Arc::new(OnceLock::new());
+        let client = SamplingClient::new_with_codex_turn_state(cfg, Arc::clone(&turn_state))
+            .expect("Codex client should construct");
+
+        let first = client
+            .post("http://localhost/first")
+            .build()
+            .expect("first request should build");
+        assert!(
+            first.headers().get(X_CODEX_TURN_STATE_HEADER).is_none(),
+            "configured stale turn state must not seed a new logical turn",
+        );
+
+        turn_state
+            .set("captured-turn-state".to_owned())
+            .expect("empty turn state should accept its first value");
+        let second = client
+            .post("http://localhost/second")
+            .build()
+            .expect("second request should build");
+        let values = second
+            .headers()
+            .get_all(X_CODEX_TURN_STATE_HEADER)
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 1, "turn state must never be duplicated");
+        assert_eq!(values[0].to_str().ok(), Some("captured-turn-state"));
+        assert!(values[0].is_sensitive());
     }
 
     #[derive(Debug)]
@@ -3229,12 +3749,7 @@ mod tests {
                 "input": [{ "type": "message", "role": "user", "content": "hello" }],
                 "reasoning": { "effort": "xhigh" },
             });
-            patch_codex_request_compat(
-                &mut body,
-                ModelProvider::Codex,
-                false,
-                Some(effort),
-            );
+            patch_codex_request_compat(&mut body, ModelProvider::Codex, false, Some(effort));
             assert_eq!(
                 body.pointer("/reasoning/effort")
                     .and_then(serde_json::Value::as_str),
@@ -3312,10 +3827,9 @@ mod tests {
 
     #[test]
     fn multi_agent_policy_is_gated_to_codex_v2_models() {
-        for (provider, multi_agent_v2) in [
-            (ModelProvider::Xai, true),
-            (ModelProvider::Codex, false),
-        ] {
+        for (provider, multi_agent_v2) in
+            [(ModelProvider::Xai, true), (ModelProvider::Codex, false)]
+        {
             let mut body = serde_json::json!({
                 "input": [{ "type": "message", "role": "user", "content": "hello" }],
                 "reasoning": { "effort": "xhigh" },
@@ -3442,6 +3956,137 @@ mod tests {
         assert_eq!(call.id, "call_custom_1");
         assert_eq!(call.name, "code");
         assert_eq!(call.input, "");
+    }
+
+    #[test]
+    fn deserialize_response_event_normalizes_current_x_search_call_shape() {
+        let sse = r#"{
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "x_search_call",
+                "id": "xs_123",
+                "name": "",
+                "arguments": "{\"query\":\"current xAI news\"}",
+                "call_id": "",
+                "status": "completed"
+            }
+        }"#;
+
+        let event = deserialize_response_event(sse).expect("x_search_call frame should parse");
+        let rs::ResponseStreamEvent::ResponseOutputItemAdded(event) = event else {
+            panic!("expected ResponseOutputItemAdded");
+        };
+        assert_eq!(event.sequence_number, 0);
+        let rs::OutputItem::CustomToolCall(call) = event.item else {
+            panic!("expected normalized backend CustomToolCall");
+        };
+        assert_eq!(call.id, "xs_123");
+        assert_eq!(call.call_id, "xs_123");
+        assert_eq!(call.name, "x_search");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call.input).unwrap(),
+            serde_json::json!({"query": "current xAI news"}),
+        );
+    }
+
+    #[test]
+    fn deserialize_response_event_keeps_x_search_progress_as_noop_progress() {
+        for event_type in [
+            "response.x_search_call.in_progress",
+            "response.x_search_call.searching",
+            "response.x_search_call.completed",
+        ] {
+            let sse = serde_json::json!({
+                "type": event_type,
+                "output_index": 2,
+                "item_id": "xs_progress"
+            })
+            .to_string();
+            let event = deserialize_response_event(&sse)
+                .unwrap_or_else(|error| panic!("{event_type} should parse: {error}"));
+            let rs::ResponseStreamEvent::ResponseWebSearchCallSearching(event) = event else {
+                panic!("expected recognized no-op progress for {event_type}");
+            };
+            assert_eq!(event.sequence_number, 0);
+            assert_eq!(event.output_index, 2);
+            assert_eq!(event.item_id, "xs_progress");
+        }
+    }
+
+    #[test]
+    fn deserialize_response_done_normalizes_x_search_and_minimal_usage() {
+        let sse = serde_json::json!({
+            "type": "response.done",
+            "response": {
+                "id": "resp_x_search",
+                "object": "response",
+                "model": "grok-4.5",
+                "status": "completed",
+                "output": [{
+                    "type": "x_search_call",
+                    "id": "xs_action",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "OpenAI Codex"}
+                }],
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        })
+        .to_string();
+
+        let event = deserialize_response_event(&sse).expect("response.done should parse");
+        let rs::ResponseStreamEvent::ResponseCompleted(event) = event else {
+            panic!("expected normalized ResponseCompleted");
+        };
+        assert_eq!(event.sequence_number, 0);
+        assert_eq!(event.response.created_at, 0);
+        let usage = event
+            .response
+            .usage
+            .expect("minimal usage should normalize");
+        assert_eq!(usage.total_tokens, 15);
+        assert_eq!(usage.input_tokens_details.cached_tokens, 0);
+        assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
+        let rs::OutputItem::CustomToolCall(call) = &event.response.output[0] else {
+            panic!("expected normalized x_search backend item");
+        };
+        assert_eq!(call.id, "xs_action");
+        assert_eq!(call.call_id, "xs_action");
+        assert_eq!(call.name, "x_search");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call.input).unwrap(),
+            serde_json::json!({"type": "search", "query": "OpenAI Codex"}),
+        );
+    }
+
+    #[test]
+    fn synchronous_response_normalizes_x_search_and_echoed_provider_tool() {
+        let mut response = serde_json::json!({
+            "id": "resp_sync_x_search",
+            "object": "response",
+            "model": "grok-4.5",
+            "status": "completed",
+            "output": [{
+                "type": "x_search_call",
+                "id": "xs_sync",
+                "status": "completed",
+                "action": {"query": "Open Grok"}
+            }],
+            "tools": [{"type": "x_search"}],
+            "usage": {"input_tokens": 3, "output_tokens": 2}
+        });
+
+        normalize_response_compat(&mut response, "completed");
+        let response = serde_json::from_value::<rs::Response>(response)
+            .expect("synchronous xAI response should fit the typed boundary");
+        assert_eq!(response.created_at, 0);
+        assert_eq!(response.tools, Some(Vec::new()));
+        assert!(matches!(
+            &response.output[0],
+            rs::OutputItem::CustomToolCall(call)
+                if call.id == "xs_sync" && call.name == "x_search"
+        ));
+        assert_eq!(response.usage.unwrap().total_tokens, 5);
     }
 
     #[test]
