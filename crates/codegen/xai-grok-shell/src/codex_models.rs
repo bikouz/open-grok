@@ -209,8 +209,8 @@ struct CodexWireModel {
     /// Older catalogs omitted this field and Codex defaults it to supported.
     #[serde(default = "default_true")]
     supports_reasoning_summary_parameter: bool,
-    /// Model-selected summary detail. Missing values default to `auto`, matching
-    /// codex-rs's forward-compatible model contract.
+    /// Model-selected summary detail. Missing values default to `detailed` so
+    /// supported Codex models expose useful reasoning summaries by default.
     #[serde(default)]
     default_reasoning_summary: ReasoningSummary,
     #[serde(default)]
@@ -1515,7 +1515,10 @@ mod tests {
 
         let defaults = convert(None, None);
         assert!(defaults.supports_reasoning_summary_parameter);
-        assert_eq!(defaults.default_reasoning_summary, ReasoningSummary::Auto);
+        assert_eq!(
+            defaults.default_reasoning_summary,
+            ReasoningSummary::Detailed
+        );
 
         for summary in [
             ReasoningSummary::Auto,

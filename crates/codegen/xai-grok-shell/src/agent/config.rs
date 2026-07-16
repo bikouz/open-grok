@@ -3584,10 +3584,14 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 supports_reasoning_effort: m.supports_reasoning_effort,
                 reasoning_efforts: m.reasoning_efforts,
                 supports_reasoning_summary_parameter: m.provider == ModelProvider::Codex,
-                // The embedded catalog is only an offline fallback. Current
-                // ChatGPT Codex catalogs select `none`; live models.json data
-                // remains authoritative and overwrites this value.
-                default_reasoning_summary: ReasoningSummary::None,
+                // The embedded catalog is only an offline fallback. Supported
+                // Codex models default to detailed summaries; live models.json
+                // data remains authoritative and overwrites this value.
+                default_reasoning_summary: if m.provider == ModelProvider::Codex {
+                    ReasoningSummary::Detailed
+                } else {
+                    ReasoningSummary::None
+                },
                 supports_backend_search: m.supports_backend_search,
                 compactions_remaining: m.compactions_remaining,
                 compaction_at_tokens: m.compaction_at_tokens,
@@ -6786,7 +6790,7 @@ reasoning_effort = "low"
         );
         assert_eq!(
             model_reasoning_summary(model.info()),
-            Some(ReasoningSummary::Auto)
+            Some(ReasoningSummary::Detailed)
         );
         let sampling = sampling_config_for_model(
             model,
@@ -11759,8 +11763,14 @@ default = "grok-4.5"
             assert_eq!(entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
             assert_eq!(entry.info.api_backend, ApiBackend::Responses);
             assert!(entry.info.supports_reasoning_summary_parameter);
-            assert_eq!(entry.info.default_reasoning_summary, ReasoningSummary::None);
-            assert_eq!(model_reasoning_summary(entry.info()), None);
+            assert_eq!(
+                entry.info.default_reasoning_summary,
+                ReasoningSummary::Detailed
+            );
+            assert_eq!(
+                model_reasoning_summary(entry.info()),
+                Some(ReasoningSummary::Detailed)
+            );
             assert!(
                 !entry.info.supported_in_api,
                 "embedded Codex fallbacks require a Codex OAuth session"
@@ -11806,6 +11816,17 @@ default = "grok-4.5"
         assert!(!supports_codex_multi_agent_v2(
             defaults["gpt-5.6-luna"].info()
         ));
+    }
+
+    #[test]
+    fn embedded_xai_models_do_not_inherit_codex_reasoning_summary_defaults() {
+        let defaults = default_model_entries(&EndpointsConfig::default());
+        let xai = defaults.get("grok-build").expect("embedded xAI model");
+
+        assert_eq!(xai.info.provider, ModelProvider::Xai);
+        assert!(!xai.info.supports_reasoning_summary_parameter);
+        assert_eq!(xai.info.default_reasoning_summary, ReasoningSummary::None);
+        assert_eq!(model_reasoning_summary(xai.info()), None);
     }
     #[test]
     fn authoritative_codex_catalog_replaces_only_codex_partition() {

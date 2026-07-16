@@ -782,9 +782,9 @@ pub enum ReasoningEffort {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningSummary {
-    #[default]
     Auto,
     Concise,
+    #[default]
     Detailed,
     None,
 }
@@ -1641,7 +1641,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_serde_default_and_wire_omission_are_stable() {
-        assert_eq!(ReasoningSummary::default(), ReasoningSummary::Auto);
+        assert_eq!(ReasoningSummary::default(), ReasoningSummary::Detailed);
         for (summary, wire, value) in [
             (ReasoningSummary::Auto, r#""auto""#, Some("auto")),
             (ReasoningSummary::Concise, r#""concise""#, Some("concise")),
