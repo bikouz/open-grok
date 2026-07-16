@@ -392,6 +392,8 @@ fn patch_codex_request_compat(
         return;
     }
 
+    patch_codex_instruction_roles(request_body);
+
     if matches!(
         local_effort,
         Some(ReasoningEffort::Max | ReasoningEffort::Ultra)
@@ -435,6 +437,82 @@ fn patch_codex_request_compat(
         .filter(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"))
         .map_or(input.len(), |_| input.len() - 1);
     input.insert(insert_at, mode_item);
+}
+
+/// Match codex-rs's Responses request boundary for harness instructions.
+///
+/// Open Grok keeps its base prompt as the leading `System` item so the same
+/// persisted conversation can be used by xAI. ChatGPT Codex does not accept
+/// `system` roles in `/backend-api/codex/responses`: codex-rs sends the base
+/// prompt through top-level `instructions`, while later contextual instruction
+/// messages use the `developer` role. Apply that provider-only wire projection
+/// without mutating the shared conversation history.
+fn patch_codex_instruction_roles(request_body: &mut serde_json::Value) {
+    let Some(input) = request_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    let mut leading_instructions = Vec::new();
+    let mut in_leading_prefix = true;
+    let mut projected = Vec::with_capacity(input.len());
+
+    for mut item in std::mem::take(input) {
+        let is_system = item.get("role").and_then(serde_json::Value::as_str) == Some("system");
+        if !is_system {
+            in_leading_prefix = false;
+            projected.push(item);
+            continue;
+        }
+
+        if in_leading_prefix
+            && let Some(text) = responses_message_text(&item).filter(|text| !text.trim().is_empty())
+        {
+            leading_instructions.push(text);
+            continue;
+        }
+
+        // A system-shaped item after conversation history has started is not
+        // the base prompt. Keep it exactly where it was, but use the role that
+        // the Codex Responses contract accepts for contextual instructions.
+        item["role"] = serde_json::Value::String("developer".to_owned());
+        projected.push(item);
+    }
+    *input = projected;
+
+    if leading_instructions.is_empty() {
+        return;
+    }
+    let leading = leading_instructions.join("\n\n");
+    let existing = request_body
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty());
+    let instructions = match existing {
+        // The compact endpoint supplies its own authoritative instruction
+        // string (base prompt plus optional compaction context). Never append
+        // a duplicate prompt merely because legacy input also carried it.
+        Some(existing) => existing.to_owned(),
+        None => leading,
+    };
+    request_body["instructions"] = serde_json::Value::String(instructions);
+}
+
+fn responses_message_text(item: &serde_json::Value) -> Option<String> {
+    match item.get("content")? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
 }
 
 fn is_multi_agent_mode_item(item: &serde_json::Value) -> bool {
@@ -3761,6 +3839,65 @@ mod tests {
                 Some("ultra"),
             );
         }
+    }
+
+    #[test]
+    fn codex_projects_base_system_prompt_to_instructions_and_later_system_to_developer() {
+        let mut body = serde_json::json!({
+            "input": [
+                { "type": "message", "role": "system", "content": "base one" },
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{ "type": "input_text", "text": "base two" }]
+                },
+                { "type": "message", "role": "user", "content": "hello" },
+                { "type": "message", "role": "system", "content": "late context" }
+            ],
+            "instructions": null
+        });
+
+        patch_codex_request_compat(&mut body, ModelProvider::Codex, false, None);
+
+        assert_eq!(body["instructions"], "base one\n\nbase two");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "developer");
+        assert!(input.iter().all(|item| item["role"] != "system"));
+    }
+
+    #[test]
+    fn xai_keeps_system_roles_in_responses_input() {
+        let mut body = serde_json::json!({
+            "input": [
+                { "type": "message", "role": "system", "content": "base" },
+                { "type": "message", "role": "user", "content": "hello" }
+            ],
+            "instructions": null
+        });
+
+        patch_codex_request_compat(&mut body, ModelProvider::Xai, false, None);
+
+        assert_eq!(body["input"][0]["role"], "system");
+        assert!(body["instructions"].is_null());
+    }
+
+    #[test]
+    fn codex_keeps_explicit_compaction_instructions_while_removing_system_input() {
+        let mut body = serde_json::json!({
+            "input": [
+                { "type": "message", "role": "system", "content": "duplicate base" },
+                { "type": "message", "role": "user", "content": "hello" }
+            ],
+            "instructions": "authoritative compact instructions"
+        });
+
+        patch_codex_request_compat(&mut body, ModelProvider::Codex, false, None);
+
+        assert_eq!(body["instructions"], "authoritative compact instructions");
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["role"], "user");
     }
 
     #[test]

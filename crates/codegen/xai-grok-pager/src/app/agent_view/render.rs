@@ -1165,11 +1165,11 @@ impl AgentView {
         }
         let ctx_used = self.context_state.as_ref().map(|c| c.used);
         let model_window = self.session.models.get_context_window();
-        let ctx_total = self
+        let snapshot_total = self
             .context_state
             .as_ref()
-            .and_then(|c| (c.total > 0).then_some(c.total))
-            .or(model_window);
+            .and_then(|c| (c.total > 0).then_some(c.total));
+        let ctx_total = context_bar::resolve_context_total(model_window, snapshot_total);
         if let Some(ctx_line) = context_bar::context_bar_line_for_session(
             ctx_used,
             ctx_total,

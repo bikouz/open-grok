@@ -53,6 +53,20 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// Resolve the context-window denominator shown in the live status bar.
+///
+/// The selected model catalog is authoritative when it has a window. A stored
+/// usage snapshot may belong to the model that was active immediately before
+/// a `/model` switch, so it is only a fallback until the next token update.
+pub fn resolve_context_total(
+    selected_model_window: Option<u64>,
+    snapshot_total: Option<u64>,
+) -> Option<u64> {
+    selected_model_window
+        .filter(|total| *total > 0)
+        .or_else(|| snapshot_total.filter(|total| *total > 0))
+}
+
 // ---------------------------------------------------------------------------
 // Color blending
 // ---------------------------------------------------------------------------
@@ -311,6 +325,16 @@ mod tests {
             let s = fmt_tokens(n);
             assert!(s.len() <= 4, "fmt_tokens({n}) = {s:?} should be ≤4 chars");
         }
+    }
+
+    #[test]
+    fn selected_model_window_overrides_stale_usage_snapshot() {
+        assert_eq!(
+            resolve_context_total(Some(353_000), Some(500_000)),
+            Some(353_000)
+        );
+        assert_eq!(resolve_context_total(None, Some(500_000)), Some(500_000));
+        assert_eq!(resolve_context_total(Some(0), Some(500_000)), Some(500_000));
     }
 
     #[test]

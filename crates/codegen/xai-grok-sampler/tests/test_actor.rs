@@ -842,7 +842,10 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
         .insert("originator".into(), "codex_cli_rs".into());
 
     let codex_request = || {
-        let mut request = user_request("search the web");
+        let mut request = ConversationRequest::from_items(vec![
+            ConversationItem::system("Open Grok Codex base instructions"),
+            ConversationItem::user("search the web"),
+        ]);
         request.hosted_tools = vec![HostedTool::web_search(None), HostedTool::XSearch];
         request.x_grok_conv_id = Some("must-not-leak".into());
         request.x_grok_req_id = Some("must-not-leak".into());
@@ -899,6 +902,18 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
         assert_eq!(
             body["tools"],
             json!([{"type": "web_search", "external_web_access": true}])
+        );
+        assert_eq!(
+            body["instructions"], "Open Grok Codex base instructions",
+            "Codex base prompt must use top-level instructions: {body}"
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .is_some_and(|input| input.iter().all(|item| {
+                    item.get("role").and_then(serde_json::Value::as_str) != Some("system")
+                })),
+            "Codex Responses input must not contain system-role messages: {body}"
         );
         assert!(
             body["include"].as_array().is_some_and(|includes| includes
