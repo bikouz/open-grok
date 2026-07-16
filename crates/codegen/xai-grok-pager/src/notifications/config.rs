@@ -95,6 +95,7 @@ pub enum TitleItem {
     Cwd,
     Model,
     TurnTimer,
+    #[serde(rename = "open-grok", alias = "grok")]
     Grok,
     ActionRequired,
 }
@@ -177,11 +178,11 @@ session_recap_threshold_secs = 30
 # Set the terminal/tab title to reflect agent state.
 enabled = true
 # Items shown in the title. Options: action-required, spinner, activity,
-# session-name, cwd, model, turn-timer, grok
-items = [\"action-required\", \"spinner\", \"activity\", \"session-name\", \"grok\"]
+# session-name, cwd, model, turn-timer, open-grok (legacy alias: grok)
+items = [\"action-required\", \"spinner\", \"activity\", \"session-name\", \"open-grok\"]
 
 # [[ui.notifications.hooks]]
-# command = \"terminal-notifier -title 'Grok' -message '$GROK_MESSAGE'\"
+# command = \"terminal-notifier -title 'Open Grok' -message '$GROK_MESSAGE'\"
 # events = [\"turn_complete\", \"approval_required\"]
 # only_unfocused = true
 # timeout_secs = 10

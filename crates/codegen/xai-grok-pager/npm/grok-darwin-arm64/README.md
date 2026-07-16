@@ -1,11 +1,7 @@
-# @xai-official/grok-darwin-arm64
+# @mweinbach/open-grok-darwin-arm64
 
-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on darwin-arm64.
+Source package for the `darwin-arm64` binary used by
+`@mweinbach/open-grok`.
 
-Do not install this package directly. Install the main package instead:
-
-```sh
-npm install -g @xai-official/grok
-```
-
-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+The `v0.1.220-open-grok.2` GitHub release does not publish npm packages. Use the
+[GitHub release installer](https://github.com/mweinbach/open-grok#install).

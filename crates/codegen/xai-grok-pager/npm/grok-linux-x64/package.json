@@ -1,7 +1,7 @@
 {
-    "name": "@xai-official/grok-linux-x64",
-    "version": "0.2.0-dev",
-    "description": "linux-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
+    "name": "@mweinbach/open-grok-linux-x64",
+    "version": "0.1.220-open-grok.2",
+    "description": "linux-x64 binary package for @mweinbach/open-grok.",
     "license": "Apache-2.0",
     "files": [
         "bin/",

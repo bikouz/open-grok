@@ -1,13 +1,15 @@
 #!/bin/bash
 #
-# Grok CLI installer (enterprise channel) — https://x.ai/cli/enterprise-install.sh
+# Open Grok installer (xAI enterprise channel)
 #
 # Standalone installer for the enterprise channel. This is intentionally a full
 # copy of the install logic (not a wrapper around install.sh) so that changes to
 # the stable installer cannot accidentally break enterprise deployments.
 #
-# Auth: GROK_DEPLOYMENT_KEY (takes precedence) or ~/.opengrok/auth.json from `open-grok login`.
-# Env: GROK_BIN_DIR, GROK_PROXY_URL
+# Auth: GROK_DEPLOYMENT_KEY (takes precedence) or
+#       $OPENGROK_HOME/auth.json from `open-grok login`.
+# Env: OPENGROK_HOME, OPEN_GROK_BIN_DIR, OPEN_GROK_ENTERPRISE_BASE_URL,
+#      OPEN_GROK_ENTERPRISE_FALLBACK_URL, GROK_PROXY_URL
 #
 # Usage:
 #   curl -fsSL https://x.ai/cli/enterprise-install.sh | bash            # latest enterprise
@@ -19,9 +21,10 @@
 
 set -e
 
-TARGET="$1"
+OPEN_GROK_HOME="${OPENGROK_HOME:-${HOME:?HOME or OPENGROK_HOME must be set}/.opengrok}"
+TARGET="${1:-}"
 
-if [[ -n "$TARGET" ]] && [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?$ ]]; then
+if [[ -n "$TARGET" ]] && [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
     echo "Invalid version format: $TARGET (expected X.Y.Z or X.Y.Z-suffix)" >&2
     exit 1
 fi
@@ -111,10 +114,10 @@ json_get() {
         | sed -e 's/\\"/"/g' -e 's/\\n/\'$'\n''/g' -e 's/\\t/\'$'\t''/g' -e 's/\\\\/\\/g'
 }
 
-# Read a token from ~/.opengrok/auth.json for the given scope key.
+# Read an xAI token from $OPENGROK_HOME/auth.json for the given scope key.
 # Format: {"scope_url": {"key": "token"}, ...}
-read_grok_token() {
-    local auth_file="$HOME/.opengrok/auth.json"
+read_xai_token() {
+    local auth_file="$OPEN_GROK_HOME/auth.json"
     local scope="$1"
     [ -f "$auth_file" ] || return 1
     # Flatten to one line then extract: find the scope, then the "key" value after it
@@ -130,14 +133,14 @@ if [ -n "$GROK_DEPLOYMENT_KEY" ]; then
     AUTH_SOURCE="deployment key"
     echo "Auth: using deployment key." >&2
 else
-    OIDC_TOKEN=$(read_grok_token "$OIDC_SCOPE" 2>/dev/null) || true
-    LEGACY_TOKEN=$(read_grok_token "$LEGACY_SCOPE" 2>/dev/null) || true
+    OIDC_TOKEN=$(read_xai_token "$OIDC_SCOPE" 2>/dev/null) || true
+    LEGACY_TOKEN=$(read_xai_token "$LEGACY_SCOPE" 2>/dev/null) || true
     if [ -n "$OIDC_TOKEN" ]; then
         AUTH_SOURCE="auth.json (oidc)"
-        echo "Auth: using OIDC token from ~/.opengrok/auth.json." >&2
+        echo "Auth: using OIDC token from $OPEN_GROK_HOME/auth.json." >&2
     elif [ -n "$LEGACY_TOKEN" ]; then
         AUTH_SOURCE="auth.json (legacy)"
-        echo "Auth: using legacy token from ~/.opengrok/auth.json." >&2
+        echo "Auth: using legacy token from $OPEN_GROK_HOME/auth.json." >&2
     fi
 fi
 
@@ -155,10 +158,10 @@ case "$(uname -m)" in
     *)                    echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-BASE_URL_PRIMARY="https://x.ai/cli"
-BASE_URL_FALLBACK="https://storage.googleapis.com/grok-build-public-artifacts/cli"
-DOWNLOAD_DIR="$HOME/.opengrok/downloads"
-BIN_DIR="${GROK_BIN_DIR:-$HOME/.opengrok/bin}"
+BASE_URL_PRIMARY="${OPEN_GROK_ENTERPRISE_BASE_URL:-https://x.ai/cli}"
+BASE_URL_FALLBACK="${OPEN_GROK_ENTERPRISE_FALLBACK_URL:-https://storage.googleapis.com/grok-build-public-artifacts/cli}"
+DOWNLOAD_DIR="$OPEN_GROK_HOME/downloads"
+BIN_DIR="${OPEN_GROK_BIN_DIR:-$OPEN_GROK_HOME/bin}"
 mkdir -p "$DOWNLOAD_DIR" "$BIN_DIR"
 
 platform="${os}-${arch}"
@@ -188,31 +191,33 @@ else
     fi
 fi
 
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?$ ]]; then
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
     echo "Invalid version format: $version (expected X.Y.Z or X.Y.Z-suffix)" >&2
     exit 1
 fi
 
 if [ -n "$AUTH_SOURCE" ]; then
-    echo "Installing Grok $version ($platform, $AUTH_SOURCE)..." >&2
+    echo "Installing Open Grok $version ($platform, $AUTH_SOURCE)..." >&2
 else
-    echo "Installing Grok $version ($platform)..." >&2
+    echo "Installing Open Grok $version ($platform)..." >&2
 fi
 
-binary_path="$DOWNLOAD_DIR/grok-$platform"
+# The xAI enterprise artifact endpoint retains its upstream wire name. The
+# downloaded file and every installed output use the fork-specific name.
+binary_path="$DOWNLOAD_DIR/open-grok-$platform"
 artifact_base="${BASE_URL}/grok-${version}-${platform}"
 
 if [ "$os" = "windows" ]; then
     binary_path="${binary_path}.exe"
 fi
 
-echo "  Downloading grok ${version}..." >&2
+echo "  Downloading Open Grok ${version}..." >&2
 if [ "$os" = "windows" ]; then
     if ! download_file_parallel "${artifact_base}.exe" "$binary_path"; then
         if ! download_file_parallel "$artifact_base" "$binary_path"; then
             rm -f "$binary_path"
             if is_not_found "${artifact_base}.exe"; then
-                echo "Error: Grok is not yet available for your system ($platform)." >&2
+                echo "Error: Open Grok is not yet available for your system ($platform)." >&2
             else
                 echo "Error: binary download failed (${artifact_base}.exe and ${artifact_base})" >&2
             fi
@@ -222,7 +227,7 @@ if [ "$os" = "windows" ]; then
 elif ! download_file_parallel "$artifact_base" "$binary_path"; then
     rm -f "$binary_path"
     if is_not_found "$artifact_base"; then
-        echo "Error: Grok is not yet available for your system ($platform)." >&2
+        echo "Error: Open Grok is not yet available for your system ($platform)." >&2
     else
         echo "Error: binary download failed from ${artifact_base}" >&2
     fi
@@ -232,7 +237,7 @@ fi
 if [ "$os" = "windows" ]; then
     # Symlinks require Developer Mode on Windows; copy instead.
     # If the exe is locked by a running process, rename it aside then retry.
-    for bin_name in grok.exe agent.exe; do
+    for bin_name in open-grok.exe; do
         rm -f "$BIN_DIR/$bin_name.old" 2>/dev/null || true  # stale backup from prior update
         if ! cp -f "$binary_path" "$BIN_DIR/$bin_name" 2>/dev/null; then
             mv -f "$BIN_DIR/$bin_name" "$BIN_DIR/$bin_name.old" 2>/dev/null || true
@@ -244,25 +249,24 @@ if [ "$os" = "windows" ]; then
             fi
         fi
     done
-    echo "  Binary installed to $BIN_DIR/grok.exe and $BIN_DIR/agent.exe." >&2
+    echo "  Binary installed to $BIN_DIR/open-grok.exe." >&2
 else
     chmod +x "$binary_path"
-    ln -sf "$binary_path" "$BIN_DIR/grok"
-    ln -sf "$binary_path" "$BIN_DIR/agent"
-    echo "  Binary linked to $BIN_DIR/grok and $BIN_DIR/agent." >&2
+    ln -sf "$binary_path" "$BIN_DIR/open-grok"
+    echo "  Binary linked to $BIN_DIR/open-grok." >&2
 fi
 
 # Generate shell completions (best-effort)
-mkdir -p "$HOME/.opengrok/completions/bash" "$HOME/.opengrok/completions/zsh"
-"$BIN_DIR/grok" completions bash > "$HOME/.opengrok/completions/bash/grok.bash" 2>/dev/null || true
-"$BIN_DIR/grok" completions zsh  > "$HOME/.opengrok/completions/zsh/_grok"     2>/dev/null || true
+mkdir -p "$OPEN_GROK_HOME/completions/bash" "$OPEN_GROK_HOME/completions/zsh"
+"$BIN_DIR/open-grok" completions bash > "$OPEN_GROK_HOME/completions/bash/open-grok.bash" 2>/dev/null || true
+"$BIN_DIR/open-grok" completions zsh  > "$OPEN_GROK_HOME/completions/zsh/_open-grok"     2>/dev/null || true
 # Fish: write to the auto-loaded completions dir so it works immediately
 if mkdir -p "$HOME/.config/fish/completions" 2>/dev/null; then
-    "$BIN_DIR/grok" completions fish > "$HOME/.config/fish/completions/grok.fish" 2>/dev/null || true
+    "$BIN_DIR/open-grok" completions fish > "$HOME/.config/fish/completions/open-grok.fish" 2>/dev/null || true
 fi
 
 # Persist installer source and channel to config
-CONFIG_FILE="$HOME/.opengrok/config.toml"
+CONFIG_FILE="$OPEN_GROK_HOME/config.toml"
 CLI_BLOCK="installer = \"internal\"\nchannel = \"enterprise\""
 if [ ! -f "$CONFIG_FILE" ]; then
     printf '[cli]\n%b\n' "$CLI_BLOCK" > "$CONFIG_FILE"
@@ -300,49 +304,47 @@ if [ -n "$GROK_DEPLOYMENT_KEY" ]; then
         MANAGED_CONFIG=$(json_get "$DEPLOY_RESPONSE" "managed_config")
         REQUIREMENTS=$(json_get "$DEPLOY_RESPONSE" "requirements")
         if [ -n "$MANAGED_CONFIG" ] && [ "$MANAGED_CONFIG" != "null" ]; then
-            printf '%s\n' "$MANAGED_CONFIG" > "$HOME/.opengrok/managed_config.toml"
+            printf '%s\n' "$MANAGED_CONFIG" > "$OPEN_GROK_HOME/managed_config.toml"
             echo "  Managed config applied." >&2
         else
-            rm -f "$HOME/.opengrok/managed_config.toml"
+            rm -f "$OPEN_GROK_HOME/managed_config.toml"
         fi
         if [ -n "$REQUIREMENTS" ] && [ "$REQUIREMENTS" != "null" ]; then
-            printf '%s\n' "$REQUIREMENTS" > "$HOME/.opengrok/requirements.toml"
+            printf '%s\n' "$REQUIREMENTS" > "$OPEN_GROK_HOME/requirements.toml"
             echo "  Requirements applied." >&2
         else
-            rm -f "$HOME/.opengrok/requirements.toml"
+            rm -f "$OPEN_GROK_HOME/requirements.toml"
         fi
     fi
 fi
 
 if [ "$os" = "windows" ]; then
-    echo "Grok $version installed to $BIN_DIR/grok.exe" >&2
+    echo "Open Grok $version installed to $BIN_DIR/open-grok.exe" >&2
 else
-    echo "Grok $version installed to $BIN_DIR/grok" >&2
+    echo "Open Grok $version installed to $BIN_DIR/open-grok" >&2
 fi
 
-# --- Ensure grok is on PATH ---
+# --- Ensure open-grok is on PATH ---
 
 path_has_dir() {
     case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac
 }
 
-# Try to symlink into a directory already on PATH so grok works immediately
+# Try to symlink into a directory already on PATH so open-grok works immediately
 # without restarting the shell. Candidate dirs in preference order.
 SYMLINK_CREATED=""
 if [ "$os" != "windows" ] && ! path_has_dir "$BIN_DIR"; then
     for candidate in "$HOME/.local/bin" "/usr/local/bin"; do
         if path_has_dir "$candidate" && [ -d "$candidate" ] && [ -w "$candidate" ]; then
-            ln -sf "$BIN_DIR/grok" "$candidate/grok"
-            ln -sf "$BIN_DIR/agent" "$candidate/agent"
+            ln -sf "$BIN_DIR/open-grok" "$candidate/open-grok"
             SYMLINK_CREATED="$candidate"
-            echo "  Symlinked $candidate/grok -> $BIN_DIR/grok" >&2
-            echo "  Symlinked $candidate/agent -> $BIN_DIR/agent" >&2
+            echo "  Symlinked $candidate/open-grok -> $BIN_DIR/open-grok" >&2
             break
         fi
     done
 fi
 
-# Also update shell config so ~/.opengrok/bin is on PATH for future sessions
+# Also update shell config so the Open Grok bin directory is on PATH for future sessions.
 user_shell="$(basename "${SHELL:-}")"
 config_file=""
 
@@ -376,28 +378,28 @@ if [ -n "$config_file" ]; then
 
     # Build the new installer block
     if [ "$user_shell" = "fish" ]; then
-        new_block='# >>> grok installer >>>
-fish_add_path $HOME/.opengrok/bin
-# <<< grok installer <<<'
+        new_block="# >>> open-grok installer >>>
+fish_add_path \"$BIN_DIR\"
+# <<< open-grok installer <<<"
     elif [ "$user_shell" = "zsh" ]; then
-        new_block='# >>> grok installer >>>
-export PATH="$HOME/.opengrok/bin:$PATH"
-fpath=(~/.opengrok/completions/zsh $fpath)
+        new_block="# >>> open-grok installer >>>
+export PATH=\"$BIN_DIR:\$PATH\"
+fpath=(\"$OPEN_GROK_HOME/completions/zsh\" \$fpath)
 autoload -Uz compinit && compinit -C
-# <<< grok installer <<<'
+# <<< open-grok installer <<<"
     else
-        new_block='# >>> grok installer >>>
-export PATH="$HOME/.opengrok/bin:$PATH"
-[[ -r "$HOME/.opengrok/completions/bash/grok.bash" ]] && source "$HOME/.opengrok/completions/bash/grok.bash"
-# <<< grok installer <<<'
+        new_block="# >>> open-grok installer >>>
+export PATH=\"$BIN_DIR:\$PATH\"
+[[ -r \"$OPEN_GROK_HOME/completions/bash/open-grok.bash\" ]] && source \"$OPEN_GROK_HOME/completions/bash/open-grok.bash\"
+# <<< open-grok installer <<<"
     fi
 
-    if grep -qs "grok installer" "$config_file" 2>/dev/null; then
+    if grep -qs "open-grok installer" "$config_file" 2>/dev/null; then
         # Replace existing block in-place (strip old >>> to <<< lines, insert new)
         tmp="$config_file.tmp.$$"
         awk '
-            /# >>> grok installer >>>/ { skip=1; next }
-            /# <<< grok installer <<</ { skip=0; next }
+            /# >>> open-grok installer >>>/ { skip=1; next }
+            /# <<< open-grok installer <<</ { skip=0; next }
             !skip { print }
         ' "$config_file" > "$tmp" && mv "$tmp" "$config_file"
     else
@@ -417,14 +419,14 @@ fi
 
 echo "" >&2
 if path_has_dir "$BIN_DIR" || [ -n "$SYMLINK_CREATED" ]; then
-    echo "Run 'grok' or 'agent' to get started!" >&2
+    echo "Run 'open-grok' to get started!" >&2
 elif [ -n "$config_file" ]; then
-    echo "Restart your terminal, then run 'grok' or 'agent' to get started!" >&2
+    echo "Restart your terminal, then run 'open-grok' to get started!" >&2
 else
-    echo "Add $BIN_DIR to your PATH, then run 'grok' or 'agent' to get started:" >&2
-    echo '  export PATH="$HOME/.opengrok/bin:$PATH"' >&2
+    echo "Add $BIN_DIR to your PATH, then run 'open-grok' to get started:" >&2
+    echo "  export PATH=\"$BIN_DIR:\$PATH\"" >&2
 fi
 
 if [ "$os" = "windows" ]; then
-    echo "To use grok from cmd.exe or PowerShell, add %USERPROFILE%\\.opengrok\\bin to your PATH." >&2
+    echo "To use open-grok from cmd.exe or PowerShell, add %USERPROFILE%\\.opengrok\\bin (or %OPENGROK_HOME%\\bin) to your PATH." >&2
 fi

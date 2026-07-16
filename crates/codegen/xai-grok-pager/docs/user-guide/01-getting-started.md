@@ -1,6 +1,9 @@
 # Getting Started
 
-Grok Build is a terminal-based AI coding assistant from SpaceXAI. It runs as a TUI (Terminal User Interface) that understands your codebase, executes shell commands, edits files, searches the web, and manages tasks.
+Open Grok is Grok Build with ChatGPT Codex optimizations. It runs as a TUI
+(Terminal User Interface) that understands your codebase, executes shell
+commands, edits files, searches the web, and manages tasks across xAI and
+OpenAI Codex models.
 
 You can use it interactively as a full-screen TUI, run it headlessly for scripting and CI/CD, or integrate it into editors via the Agent Client Protocol (ACP).
 
@@ -8,31 +11,21 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 
 ## Installation
 
-Install the latest stable release (macOS, Linux, or Windows via Git Bash):
+Install the latest Apple Silicon macOS release:
 
 ```bash
-curl -fsSL https://x.ai/cli/install.sh | bash
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
 ```
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://x.ai/cli/install.sh | bash -s 0.1.42
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash -s 0.1.220-open-grok.2
 ```
 
-On **Windows (PowerShell)**, use the native PowerShell installer:
-
-```powershell
-irm https://x.ai/cli/install.ps1 | iex
-```
-
-Install a specific version:
-
-```powershell
-$env:GROK_VERSION="0.1.42"; irm https://x.ai/cli/install.ps1 | iex
-```
-
-The PowerShell installer automatically adds `%USERPROFILE%\.opengrok\bin` to your User PATH. Alternatively, install via [Git for Windows](https://gitforwindows.org/) (Git Bash) or MSYS2 using the bash script above. WSL users get the Linux binary automatically.
+The installer writes only `open-grok` under
+`${OPENGROK_HOME:-$HOME/.opengrok}/bin`; it does not create or replace `grok`
+or `agent` commands. Build from source on other platforms.
 
 Verify the installation:
 
@@ -40,23 +33,27 @@ Verify the installation:
 open-grok --version
 ```
 
-Update to the latest version at any time:
+Update to the latest version by running the installer again:
 
 ```bash
-open-grok update
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
 ```
 
 ---
 
 ## First Launch
 
-Start Grok by running:
+Start Open Grok by running:
 
 ```bash
 open-grok
 ```
 
-On first launch, Grok opens your browser to authenticate with grok.com. After you sign in, Grok stores your credentials in `~/.opengrok/auth.json`, where they persist across sessions. Grok refreshes your credentials automatically and prompts you to sign in again when they can no longer be renewed.
+On first launch, Open Grok asks whether you want to connect xAI or OpenAI
+Codex, then starts the selected sign-in flow. xAI credentials are stored in
+`~/.opengrok/auth.json`; Codex credentials are stored separately in
+`~/.opengrok/codex-auth.json`. Both paths follow `OPENGROK_HOME`, and neither
+touches an upstream `~/.grok` installation.
 
 If you prefer API key authentication (e.g., for CI/CD or environments without a browser), set the `XAI_API_KEY` environment variable instead:
 

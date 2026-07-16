@@ -471,6 +471,6 @@ $EDITOR ~/.opengrok/memory/MEMORY.md
 ### Debug Logging
 
 ```bash
-RUST_LOG=debug GROK_LOG_FILE=/tmp/grok.log grok
-grep "memory" /tmp/grok.log
+RUST_LOG=debug GROK_LOG_FILE=/tmp/open-grok.log open-grok
+grep "memory" /tmp/open-grok.log
 ```

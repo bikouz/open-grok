@@ -6,11 +6,12 @@
 //   2. Stamps the sub-package's version to match the meta package
 //
 // Each per-platform package is its own npm publish target. The meta package
-// (`@xai-official/grok`) lists all six as `optionalDependencies` pinned to
-// the same version; npm installs only the one matching the host's
+// (`@mweinbach/open-grok`) lists all six donor packages as
+// `optionalDependencies` pinned to the same version; npm installs only the one
+// matching the host's
 // `os` + `cpu` filters.
 //
-// Why brotli? npm's tarball ceiling is ~200 MB and the raw grok binary is
+// Why brotli? npm's tarball ceiling is ~200 MB and the raw Open Grok binary is
 // 100–150 MB per platform. Brotli at max quality cuts that to 30–40 MB,
 // leaves plenty of headroom for binary growth, and is decoded by Node's
 // built-in zlib.brotliDecompressSync (no native deps required).
@@ -24,7 +25,8 @@ const zlib = require('zlib');
 
 const brotliCompress = promisify(zlib.brotliCompress);
 
-const xaiRoot = process.env.XAI_ROOT || path.resolve(__dirname, '..', '..', '..', '..', '..');
+const openGrokRoot = process.env.OPEN_GROK_ROOT
+    || path.resolve(__dirname, '..', '..', '..', '..', '..', '..');
 const npmRoot = path.resolve(__dirname, '..', '..');
 
 const NOTICES_SOURCE = path.resolve(
@@ -34,6 +36,16 @@ const NOTICES_NAME = 'THIRD_PARTY_NOTICES.md';
 const META_PKG_JSON = path.resolve(__dirname, '..', 'package.json');
 const meta = JSON.parse(fs.readFileSync(META_PKG_JSON, 'utf8'));
 const VERSION = meta.version;
+
+// Keep the meta-package dependency pins synchronized with its version. This
+// avoids publishing a new wrapper that still resolves an older donor binary.
+for (const packageName of Object.keys(meta.optionalDependencies || {})) {
+    if (!packageName.startsWith('@mweinbach/open-grok-')) {
+        throw new Error(`Unexpected optional dependency in Open Grok package: ${packageName}`);
+    }
+    meta.optionalDependencies[packageName] = VERSION;
+}
+fs.writeFileSync(META_PKG_JSON, JSON.stringify(meta, null, 4) + '\n');
 
 function ensureDir(p) { fs.mkdirSync(path.dirname(p), { recursive: true }); }
 
@@ -73,7 +85,7 @@ async function packPlatform({ platform, arch, envVar, defaultSource, binName }) 
     });
     fs.writeFileSync(outBr, compressed);
     console.log(
-        `[assemble] grok-${platform}-${arch}@${VERSION}: ` +
+        `[assemble] open-grok-${platform}-${arch}@${VERSION}: ` +
         `${(raw.length / 1048576).toFixed(1)} MB -> ${(compressed.length / 1048576).toFixed(1)} MB ` +
         `(${path.relative(npmRoot, outBr)})`
     );
@@ -83,38 +95,38 @@ async function packPlatform({ platform, arch, envVar, defaultSource, binName }) 
 async function main() {
     const targets = [
         {
-            platform: 'darwin', arch: 'arm64', binName: 'grok',
-            envVar: 'GROK_DARWIN_ARM64',
-            defaultSource: path.join(xaiRoot, 'target', 'release', 'xai-grok-pager'),
+            platform: 'darwin', arch: 'arm64', binName: 'open-grok',
+            envVar: 'OPEN_GROK_DARWIN_ARM64',
+            defaultSource: path.join(openGrokRoot, 'target', 'release', 'open-grok'),
         },
         {
-            platform: 'darwin', arch: 'x64', binName: 'grok',
-            envVar: 'GROK_DARWIN_X64',
-            defaultSource: path.join(xaiRoot, 'target', 'x86_64-apple-darwin', 'release', 'xai-grok-pager'),
+            platform: 'darwin', arch: 'x64', binName: 'open-grok',
+            envVar: 'OPEN_GROK_DARWIN_X64',
+            defaultSource: path.join(openGrokRoot, 'target', 'x86_64-apple-darwin', 'release', 'open-grok'),
         },
         {
-            platform: 'linux', arch: 'x64', binName: 'grok',
-            envVar: 'GROK_LINUX_X64',
-            defaultSource: path.join(xaiRoot, 'target',
+            platform: 'linux', arch: 'x64', binName: 'open-grok',
+            envVar: 'OPEN_GROK_LINUX_X64',
+            defaultSource: path.join(openGrokRoot, 'target',
                 'explorer_cross_x86_64-unknown-linux-gnu',
-                'x86_64-unknown-linux-gnu', 'release', 'xai-grok-pager'),
+                'x86_64-unknown-linux-gnu', 'release', 'open-grok'),
         },
         {
-            platform: 'linux', arch: 'arm64', binName: 'grok',
-            envVar: 'GROK_LINUX_ARM64',
-            defaultSource: path.join(xaiRoot, 'target',
+            platform: 'linux', arch: 'arm64', binName: 'open-grok',
+            envVar: 'OPEN_GROK_LINUX_ARM64',
+            defaultSource: path.join(openGrokRoot, 'target',
                 'explorer_cross_aarch64-unknown-linux-gnu',
-                'aarch64-unknown-linux-gnu', 'release', 'xai-grok-pager'),
+                'aarch64-unknown-linux-gnu', 'release', 'open-grok'),
         },
         {
-            platform: 'win32', arch: 'x64', binName: 'grok.exe',
-            envVar: 'GROK_WIN32_X64',
-            defaultSource: path.join(xaiRoot, 'target', 'x86_64-pc-windows-msvc', 'release', 'xai-grok-pager.exe'),
+            platform: 'win32', arch: 'x64', binName: 'open-grok.exe',
+            envVar: 'OPEN_GROK_WIN32_X64',
+            defaultSource: path.join(openGrokRoot, 'target', 'x86_64-pc-windows-msvc', 'release', 'open-grok.exe'),
         },
         {
-            platform: 'win32', arch: 'arm64', binName: 'grok.exe',
-            envVar: 'GROK_WIN32_ARM64',
-            defaultSource: path.join(xaiRoot, 'target', 'aarch64-pc-windows-msvc', 'release', 'xai-grok-pager.exe'),
+            platform: 'win32', arch: 'arm64', binName: 'open-grok.exe',
+            envVar: 'OPEN_GROK_WIN32_ARM64',
+            defaultSource: path.join(openGrokRoot, 'target', 'aarch64-pc-windows-msvc', 'release', 'open-grok.exe'),
         },
     ];
 

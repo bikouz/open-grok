@@ -1,7 +1,7 @@
 {
-    "name": "@xai-official/grok-darwin-x64",
-    "version": "0.2.0-dev",
-    "description": "darwin-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
+    "name": "@mweinbach/open-grok-darwin-x64",
+    "version": "0.1.220-open-grok.2",
+    "description": "darwin-x64 binary package for @mweinbach/open-grok.",
     "license": "Apache-2.0",
     "files": [
         "bin/",

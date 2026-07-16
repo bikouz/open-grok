@@ -1,10 +1,10 @@
 {
-    "name": "@xai-official/grok",
-    "version": "0.1.220-alpha.4",
-    "description": "Bring Grok into your terminal",
+    "name": "@mweinbach/open-grok",
+    "version": "0.1.220-open-grok.2",
+    "description": "Open Grok: Grok Build with ChatGPT Codex optimizations",
     "license": "Apache-2.0",
     "bin": {
-        "grok": "bin/grok"
+        "open-grok": "bin/open-grok"
     },
     "files": [
         "bin/"
@@ -27,15 +27,12 @@
     "engines": {
         "node": ">=20"
     },
-    "dependencies": {
-        "@iarna/toml": "^3.0.0"
-    },
     "optionalDependencies": {
-        "@xai-official/grok-darwin-arm64": "0.1.220-alpha.4",
-        "@xai-official/grok-darwin-x64": "0.1.220-alpha.4",
-        "@xai-official/grok-linux-arm64": "0.1.220-alpha.4",
-        "@xai-official/grok-linux-x64": "0.1.220-alpha.4",
-        "@xai-official/grok-win32-arm64": "0.1.220-alpha.4",
-        "@xai-official/grok-win32-x64": "0.1.220-alpha.4"
+        "@mweinbach/open-grok-darwin-arm64": "0.1.220-open-grok.2",
+        "@mweinbach/open-grok-darwin-x64": "0.1.220-open-grok.2",
+        "@mweinbach/open-grok-linux-arm64": "0.1.220-open-grok.2",
+        "@mweinbach/open-grok-linux-x64": "0.1.220-open-grok.2",
+        "@mweinbach/open-grok-win32-arm64": "0.1.220-open-grok.2",
+        "@mweinbach/open-grok-win32-x64": "0.1.220-open-grok.2"
     }
 }

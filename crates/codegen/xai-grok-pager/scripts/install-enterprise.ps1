@@ -1,16 +1,19 @@
 #
-# Grok CLI installer (enterprise channel) for PowerShell — https://x.ai/cli/enterprise-install.ps1
+# Open Grok installer (xAI enterprise channel) for PowerShell
 #
 # Standalone installer for the enterprise channel. Intentionally a full copy of
 # the install logic so changes to the stable installer cannot break enterprise.
 #
-# Auth: GROK_DEPLOYMENT_KEY env var (takes precedence) or ~/.opengrok/auth.json from `open-grok login`.
-# Env: GROK_BIN_DIR, GROK_PROXY_URL
+# Auth: GROK_DEPLOYMENT_KEY env var (takes precedence) or
+#       $OPENGROK_HOME/auth.json from `open-grok login`.
+# Env: OPENGROK_HOME, OPEN_GROK_BIN_DIR, OPEN_GROK_VERSION,
+#      OPEN_GROK_ENTERPRISE_BASE_URL, OPEN_GROK_ENTERPRISE_FALLBACK_URL,
+#      GROK_PROXY_URL
 #
 # Usage:
 #   irm https://x.ai/cli/enterprise-install.ps1 | iex                                       # latest enterprise
 #   & ([scriptblock]::Create((irm https://x.ai/cli/enterprise-install.ps1))) -Version 0.1.42 # specific version
-#   $env:GROK_VERSION="0.1.42"; irm https://x.ai/cli/enterprise-install.ps1 | iex           # specific version (alt)
+#   $env:OPEN_GROK_VERSION="0.1.42"; irm https://x.ai/cli/enterprise-install.ps1 | iex      # specific version (alt)
 #   $env:GROK_DEPLOYMENT_KEY="<key>"; irm https://x.ai/cli/enterprise-install.ps1 | iex
 #
 
@@ -28,8 +31,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Accept version from environment variable (useful with irm | iex).
-if (-not $Version -and $env:GROK_VERSION) {
-    $Version = $env:GROK_VERSION
+if (-not $Version -and $env:OPEN_GROK_VERSION) {
+    $Version = $env:OPEN_GROK_VERSION
 }
 
 # This script is Windows-only. PS 5.1 has no Platform property and only runs on Windows.
@@ -38,7 +41,11 @@ if ($PSVersionTable.Platform -and $PSVersionTable.Platform -ne 'Win32NT') {
     exit 1
 }
 
-$GrokDir = Join-Path $env:USERPROFILE '.opengrok'
+$OpenGrokDir = if ($env:OPENGROK_HOME) {
+    $env:OPENGROK_HOME
+} else {
+    Join-Path $env:USERPROFILE '.opengrok'
+}
 
 # --- Helpers ---
 
@@ -93,8 +100,8 @@ function Download-File([string]$Url, [string]$OutFile) {
     }
 }
 
-function Read-GrokToken([string]$Scope) {
-    $authFile = Join-Path $GrokDir 'auth.json'
+function Read-XaiToken([string]$Scope) {
+    $authFile = Join-Path $OpenGrokDir 'auth.json'
     if (-not (Test-Path $authFile)) { return $null }
     try {
         $auth = Get-Content -Raw $authFile | ConvertFrom-Json
@@ -106,7 +113,7 @@ function Read-GrokToken([string]$Scope) {
 
 # --- Validate version ---
 
-if ($Version -and $Version -notmatch '^\d+\.\d+\.\d+(-\S+)?$') {
+if ($Version -and $Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$') {
     Write-Error "Invalid version format: $Version (expected X.Y.Z or X.Y.Z-suffix)"
     exit 1
 }
@@ -121,14 +128,14 @@ if ($env:GROK_DEPLOYMENT_KEY) {
     $AuthSource = 'deployment key'
     Write-Host 'Auth: using deployment key.' -ForegroundColor DarkGray
 } else {
-    $oidcToken = Read-GrokToken $OidcScope
-    $legacyToken = Read-GrokToken $LegacyScope
+    $oidcToken = Read-XaiToken $OidcScope
+    $legacyToken = Read-XaiToken $LegacyScope
     if ($oidcToken) {
         $AuthSource = 'auth.json (oidc)'
-        Write-Host 'Auth: using OIDC token from ~/.opengrok/auth.json.' -ForegroundColor DarkGray
+        Write-Host "Auth: using OIDC token from $OpenGrokDir\auth.json." -ForegroundColor DarkGray
     } elseif ($legacyToken) {
         $AuthSource = 'auth.json (legacy)'
-        Write-Host 'Auth: using legacy token from ~/.opengrok/auth.json.' -ForegroundColor DarkGray
+        Write-Host "Auth: using legacy token from $OpenGrokDir\auth.json." -ForegroundColor DarkGray
     }
 }
 
@@ -150,10 +157,22 @@ $platform = "windows-$arch"
 
 # --- Resolve version ---
 
-$BaseUrlPrimary = 'https://x.ai/cli'
-$BaseUrlFallback = 'https://storage.googleapis.com/grok-build-public-artifacts/cli'
-$DownloadDir = Join-Path $GrokDir 'downloads'
-$BinDir = if ($env:GROK_BIN_DIR) { $env:GROK_BIN_DIR } else { Join-Path $GrokDir 'bin' }
+$BaseUrlPrimary = if ($env:OPEN_GROK_ENTERPRISE_BASE_URL) {
+    $env:OPEN_GROK_ENTERPRISE_BASE_URL.TrimEnd('/')
+} else {
+    'https://x.ai/cli'
+}
+$BaseUrlFallback = if ($env:OPEN_GROK_ENTERPRISE_FALLBACK_URL) {
+    $env:OPEN_GROK_ENTERPRISE_FALLBACK_URL.TrimEnd('/')
+} else {
+    'https://storage.googleapis.com/grok-build-public-artifacts/cli'
+}
+$DownloadDir = Join-Path $OpenGrokDir 'downloads'
+$BinDir = if ($env:OPEN_GROK_BIN_DIR) {
+    $env:OPEN_GROK_BIN_DIR
+} else {
+    Join-Path $OpenGrokDir 'bin'
+}
 
 New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null
 New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
@@ -183,14 +202,16 @@ if ($Version) {
 }
 
 if ($AuthSource) {
-    Write-Host "Installing Grok $resolvedVersion ($platform, $AuthSource)..." -ForegroundColor Cyan
+    Write-Host "Installing Open Grok $resolvedVersion ($platform, $AuthSource)..." -ForegroundColor Cyan
 } else {
-    Write-Host "Installing Grok $resolvedVersion ($platform)..." -ForegroundColor Cyan
+    Write-Host "Installing Open Grok $resolvedVersion ($platform)..." -ForegroundColor Cyan
 }
 
 # --- Download binary ---
 
-$binaryPath = Join-Path $DownloadDir "grok-$platform.exe"
+# The xAI enterprise artifact endpoint retains its upstream wire name. The
+# downloaded file and every installed output use the fork-specific name.
+$binaryPath = Join-Path $DownloadDir "open-grok-$platform.exe"
 $artifactBase = "$BaseUrl/grok-$resolvedVersion-$platform"
 
 $downloaded = $false
@@ -212,7 +233,7 @@ if (-not $downloaded) {
 
 # --- Install binary (locked-file safe) ---
 
-foreach ($binName in @('grok.exe', 'agent.exe')) {
+foreach ($binName in @('open-grok.exe')) {
     $dest = Join-Path $BinDir $binName
     $old = "$dest.old"
 
@@ -232,20 +253,20 @@ foreach ($binName in @('grok.exe', 'agent.exe')) {
     }
 }
 
-Write-Host "  Installed to $BinDir\grok.exe and $BinDir\agent.exe." -ForegroundColor DarkGray
+Write-Host "  Installed to $BinDir\open-grok.exe." -ForegroundColor DarkGray
 
 # --- Generate completions (best-effort) ---
 
-$completionsDir = Join-Path (Join-Path $GrokDir 'completions') 'powershell'
+$completionsDir = Join-Path (Join-Path $OpenGrokDir 'completions') 'powershell'
 try {
     New-Item -ItemType Directory -Path $completionsDir -Force | Out-Null
-    & (Join-Path $BinDir 'grok.exe') completions powershell 2>$null |
-        Set-Content (Join-Path $completionsDir 'grok.ps1') -ErrorAction SilentlyContinue
+    & (Join-Path $BinDir 'open-grok.exe') completions powershell 2>$null |
+        Set-Content (Join-Path $completionsDir 'open-grok.ps1') -ErrorAction SilentlyContinue
 } catch {}
 
 # --- Persist installer config ---
 
-$ConfigFile = Join-Path $GrokDir 'config.toml'
+$ConfigFile = Join-Path $OpenGrokDir 'config.toml'
 $cliLines = @('installer = "internal"', 'channel = "enterprise"')
 
 if (-not (Test-Path $ConfigFile)) {
@@ -295,8 +316,8 @@ if ($env:GROK_DEPLOYMENT_KEY) {
         $managedConfig = $deployResponse.managed_config
         $requirements = $deployResponse.requirements
 
-        $managedConfigPath = Join-Path $GrokDir 'managed_config.toml'
-        $requirementsPath = Join-Path $GrokDir 'requirements.toml'
+        $managedConfigPath = Join-Path $OpenGrokDir 'managed_config.toml'
+        $requirementsPath = Join-Path $OpenGrokDir 'requirements.toml'
 
         if ($managedConfig -and $managedConfig -ne 'null') {
             [System.IO.File]::WriteAllText($managedConfigPath, $managedConfig, [System.Text.Encoding]::UTF8)
@@ -314,9 +335,9 @@ if ($env:GROK_DEPLOYMENT_KEY) {
     }
 }
 
-Write-Host "Grok $resolvedVersion installed to $BinDir\grok.exe" -ForegroundColor Green
+Write-Host "Open Grok $resolvedVersion installed to $BinDir\open-grok.exe" -ForegroundColor Green
 
-# --- Ensure grok is on PATH ---
+# --- Ensure open-grok is on PATH ---
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $pathEntries = if ($userPath) { $userPath -split ';' | Where-Object { $_ -ne '' } } else { @() }
@@ -324,11 +345,11 @@ if ($pathEntries -notcontains $BinDir) {
     $newPath = (@($BinDir) + $pathEntries) -join ';'
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     Write-Host "  Added $BinDir to your User PATH." -ForegroundColor DarkGray
-    # Update current session so grok works immediately.
+    # Update current session so open-grok works immediately.
     if ($env:Path -notlike "*$BinDir*") {
         $env:Path = "$BinDir;$env:Path"
     }
 }
 
 Write-Host ''
-Write-Host "Run 'grok' or 'agent' to get started!" -ForegroundColor Cyan
+Write-Host "Run 'open-grok' to get started!" -ForegroundColor Cyan

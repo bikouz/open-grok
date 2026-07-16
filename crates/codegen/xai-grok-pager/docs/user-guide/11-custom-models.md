@@ -375,8 +375,8 @@ curl -s https://api.example.com/v1/models \
 ### Debug Logging
 
 ```bash
-RUST_LOG=debug GROK_LOG_FILE=/tmp/grok.log grok
-tail -f /tmp/grok.log
+RUST_LOG=debug GROK_LOG_FILE=/tmp/open-grok.log open-grok
+tail -f /tmp/open-grok.log
 ```
 
 Look for log entries containing `model` or `sampling` to trace model selection and API calls.

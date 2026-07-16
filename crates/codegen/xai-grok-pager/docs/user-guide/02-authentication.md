@@ -287,8 +287,8 @@ Set `RUST_LOG` to control the verbosity of the file log and headless stderr outp
 In the TUI, set `GROK_LOG_FILE` to an absolute path to write logs to that file:
 
 ```bash
-GROK_LOG_FILE=/tmp/grok.log RUST_LOG=debug grok
-tail -f /tmp/grok.log
+GROK_LOG_FILE=/tmp/open-grok.log RUST_LOG=debug open-grok
+tail -f /tmp/open-grok.log
 ```
 
 `GROK_LOG_FILE` is treated as a literal file path. A relative value such as `1` writes a file named `1` in the current directory.
@@ -296,7 +296,7 @@ tail -f /tmp/grok.log
 In headless mode, logs go to stderr. Redirect them to a file:
 
 ```bash
-RUST_LOG=debug grok -p "hello" 2> /tmp/grok.log
+RUST_LOG=debug open-grok -p "hello" 2> /tmp/open-grok.log
 ```
 
 ### Common log messages

@@ -89,7 +89,7 @@ open-grok mcp list
 open-grok mcp list --json          # Machine-readable output
 
 # Add a stdio server. Everything after -- is the server command, so flags
-# like -y reach the server instead of being parsed by grok.
+# like -y reach the server instead of being parsed by open-grok.
 open-grok mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /path/to/dir
 
 # Add a stdio server with environment variables (-e is repeatable)
@@ -342,8 +342,8 @@ open-grok inspect --json   # Machine-readable
 ### Debug Logging
 
 ```bash
-RUST_LOG=debug GROK_LOG_FILE=/tmp/grok.log grok
-tail -f /tmp/grok.log
+RUST_LOG=debug GROK_LOG_FILE=/tmp/open-grok.log open-grok
+tail -f /tmp/open-grok.log
 ```
 
 Look for log entries containing `mcp` to trace server startup, tool discovery, and tool call execution.

@@ -1,61 +1,52 @@
-# Grok
+# Open Grok
 
-Bring Grok into your terminal. Fast, flicker-free CLI built for plans, subagents, and parallel work.
+Open Grok is Grok Build with ChatGPT Codex optimizations. It keeps its command,
+configuration, sessions, and credentials isolated from an upstream Grok install.
 
-**[Homepage](https://x.ai/cli)** | **[Documentation](https://docs.x.ai/build/overview)**
+**[Repository](https://github.com/mweinbach/open-grok)**
 
 ## Install
 
-```bash
-curl -fsSL https://x.ai/cli/install.sh | bash
-```
-
-Or install with npm:
+Install the signed macOS release:
 
 ```bash
-npm i -g @xai-official/grok
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
 ```
+
+The installer exposes only the `open-grok` command and places runtime state in
+`${OPENGROK_HOME:-$HOME/.opengrok}`. It does not create or replace `grok` or
+`agent` commands.
+
+## npm Packaging Status
+
+This directory contains the fork-owned `@mweinbach/open-grok` packaging for a
+future npm distribution. The `v0.1.220-open-grok.2` release does **not** publish
+npm packages; use the GitHub release installer above.
 
 ## Get Started
 
 ```bash
 # Launch the interactive TUI
-grok
+open-grok
 
 # Run a single task
-grok -p "Explain this codebase"
+open-grok -p "Explain this codebase"
 ```
 
-On first launch, Grok opens your browser to authenticate. For CI or headless environments, use an API key from [console.x.ai](https://console.x.ai):
-
-```bash
-export XAI_API_KEY="xai-..."
-```
+On first launch, choose xAI or OpenAI Codex sign-in. The provider credentials
+are stored separately under the Open Grok home. `XAI_API_KEY` remains available
+for xAI API-key authentication.
 
 ## Update
 
-```bash
-grok update
-```
-
-Or if installed via npm:
-
-```bash
-npm i -g @xai-official/grok@latest
-```
+Re-run the GitHub release installer to update.
 
 ## Supported Platforms
 
-| Platform | Architecture |
-|---|---|
-| macOS | Apple Silicon (arm64) |
-| Linux | x86_64, arm64 |
-| Windows | x86_64 |
-
-## Documentation
-
-For full documentation including configuration, MCP servers, custom models, headless mode, agent mode, and more, visit [docs.x.ai/build/overview](https://docs.x.ai/build/overview).
+The GitHub release currently provides an Apple Silicon macOS binary. The source
+npm package metadata supports macOS, Linux, and Windows for a future npm
+release.
 
 ## Feedback
 
-Run `/feedback` inside Grok to report issues or send feedback directly.
+Run `/feedback` inside Open Grok to report an issue.
