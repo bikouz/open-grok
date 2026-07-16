@@ -1,146 +1,224 @@
 <div align="center">
 
-<h1>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://media.x.ai/v1/website/spacexai-symbol-white-transparent-0c31957f.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png">
-    <img alt="SpaceXAI logo" src="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png" width="96">
-  </picture>
-  <br>
-  Grok Build (<code>grok</code>)
-</h1>
+# Open Grok (`open-grok`)
 
-**Grok Build** is SpaceXAI's terminal-based AI coding agent. It runs as a
-full-screen TUI that understands your codebase, edits files, executes shell
-commands, searches the web, and manages long-running tasks — interactively,
-headlessly for scripting/CI, or embedded in editors via the Agent Client
-Protocol (ACP).
+**Grok Build with ChatGPT Codex optimizations**
 
-[Installing the released binary](#installing-the-released-binary) ·
-[Building from source](#building-from-source) ·
-[Documentation](#documentation) ·
-[Repository layout](#repository-layout) ·
-[Development](#development) ·
-[Contributing](#contributing) ·
-[License](#license)
-
-![Grok Build TUI](https://media.x.ai/v1/website/universe-tui-screenshot-6f7a0837.png)
-
-**Learn more about Grok Build at [x.ai/cli](https://x.ai/cli)**
-
-This repository contains the Rust source for the `grok` CLI/TUI and its agent
-runtime. It is synced periodically from the SpaceXAI monorepo.
+[Install](#install) · [Sign in](#sign-in-and-use-both-providers) ·
+[Code Mode](#codex-code-mode) · [Build from source](#build-from-source) ·
+[Provenance](#upstream-provenance-and-license)
 
 </div>
 
----
+Open Grok is a community fork of [Grok Build](https://github.com/xai-org/grok-build),
+the terminal coding agent published by SpaceXAI. It retains the Grok Build TUI,
+headless agent, tools, and Agent Client Protocol support while adding an
+OpenAI Codex provider path and Codex-compatible execution behavior.
 
-## Installing the released binary
+The public command is `open-grok`. It can be installed beside the upstream
+`grok` command without replacing it.
 
-Prebuilt binaries are published for macOS, Linux, and Windows:
+## What this fork adds
+
+- **Codex Code Mode and Code Mode Only.** Open Grok includes the persistent
+  JavaScript `exec`/`wait` runtime used by Codex. Ordinary tools remain available
+  through the generated `tools.*` namespace; direct-only interaction and
+  multi-agent controls stay top-level.
+- **GPT-5.6 Sol compatibility.** The built-in `gpt-5.6-sol` entry uses the Codex
+  Responses API, a 353,000-token context window, backend-hosted web search, and
+  mandatory `code_mode_only` behavior.
+- **ChatGPT Codex OAuth.** `open-grok login --codex` uses the Codex OAuth flow and
+  stores those credentials separately in `~/.opengrok/codex-auth.json`. A model
+  API key may still be configured explicitly.
+- **xAI and Codex side by side.** xAI sign-in remains available, `/model` can
+  switch between provider-backed models, and `/usage` reports xAI billing and
+  Codex quota windows independently.
+- **Provider-aware hosted search.** xAI models receive xAI web/X search tools;
+  Codex models receive OpenAI `web_search`. Open Grok does not pass one
+  provider's credentials or provider-only tools to the other.
+
+The implementation and compatibility contract are documented in
+[`docs/code-mode-port.md`](docs/code-mode-port.md) and
+[`docs/codex-provider-port.md`](docs/codex-provider-port.md).
+
+## Install
+
+The initial binary release supports **Apple Silicon macOS only** (`arm64` /
+`aarch64`). Linux, Intel macOS, and Windows users should build from source for
+now.
 
 ```sh
-curl -fsSL https://x.ai/cli/install.sh | bash   # macOS / Linux / Git Bash
-irm https://x.ai/cli/install.ps1 | iex          # Windows PowerShell
-grok --version
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+open-grok --version
 ```
 
-See the [changelog](https://x.ai/build/changelog) for the latest fixes,
-features, and improvements in each release.
+The installer downloads the raw `open-grok-macos-aarch64` artifact and its
+`.sha256` file, verifies SHA-256 before replacing anything, and atomically
+installs only `open-grok`. It does not create `grok` or `agent` aliases.
 
-## Building from source
+By default, the destination is
+`${OPENGROK_HOME:-$HOME/.opengrok}/bin`. Override it with
+`OPEN_GROK_BIN_DIR`. When piping the installer, export the override first so it
+is available to `bash`:
+
+```sh
+export OPEN_GROK_BIN_DIR="$HOME/.local/bin"
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+```
+
+Install a specific version by passing it to the script (with or without a
+leading `v`):
+
+```sh
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh \
+  | bash -s -- v0.1.220-open-grok.1
+```
+
+For local installer testing, `OPEN_GROK_RELEASE_BASE_URL` may point directly to
+an asset base URL such as `http://127.0.0.1:8000` or `file:///tmp/release`
+containing `open-grok-macos-aarch64` and its `.sha256` file.
+
+Release binaries are stripped and ad-hoc signed, but they are not Apple
+Developer ID signed or notarized. macOS may show an unidentified-developer or
+Gatekeeper warning. If your security policy requires notarization, build from
+source and sign the result with your own identity.
+
+## Sign in and use both providers
+
+Sign in to either provider, or both:
+
+```sh
+open-grok login                         # xAI browser sign-in
+open-grok login --codex                 # ChatGPT Codex OAuth
+open-grok login --codex --device-auth   # headless/remote Codex flow
+```
+
+Then launch the TUI and select a model:
+
+```sh
+open-grok
+```
+
+Inside the TUI, use `/model gpt-5.6-sol` for GPT-5.6 Sol, `/model` (or the model
+picker) to switch providers, and `/usage` to view both providers' available
+usage. Bare `login`/`logout` continue to operate on xAI credentials; use
+`logout --codex` for Codex or `logout --all` for both.
+
+Codex credentials are isolated from the primary xAI credential store. A
+Codex-selected session can run without xAI authentication, and a provider
+failure in `/usage` does not hide the other provider's result.
+
+## Codex Code Mode
+
+There are two related behaviors:
+
+- **Code Mode** can be enabled in Settings for newly started sessions whose
+  Responses-backed model does not declare an explicit tool mode.
+- **Code Mode Only** is selected by model metadata and takes precedence over
+  the preference. GPT-5.6 Sol always uses this mode.
+
+In Code Mode Only, the model calls the native freeform `exec` tool with raw
+JavaScript. Local tools are invoked through `tools.*`, and `wait` resumes or
+terminates a yielded JavaScript cell. The runtime persists for the session and
+is disposed when the session ends. Changing the setting requires starting a
+new session.
+
+## Build from source
 
 Requirements:
 
-- **Rust** — the toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml);
-  `rustup` installs it automatically on first build.
-- **protoc** — proto codegen resolves [`bin/protoc`](bin/protoc) (a
-  [dotslash](https://dotslash-cli.com) launcher) or falls back to a `protoc` on
-  `PATH` / `$PROTOC`.
-- macOS and Linux are supported build hosts; Windows builds are best-effort
-  and not currently tested from this tree.
+- Rust, pinned by [`rust-toolchain.toml`](rust-toolchain.toml)
+- `protoc`, resolved through [`bin/protoc`](bin/protoc) and its
+  [Dotslash](https://dotslash-cli.com) launcher, or provided through `PATH` /
+  `PROTOC`
+- Xcode Command Line Tools when producing the signed macOS release artifacts
+
+Prepare a checkout and run it without touching an installed release:
 
 ```sh
-cargo run -p xai-grok-pager-bin              # build + launch the TUI
-cargo build -p xai-grok-pager-bin --release  # release binary: target/release/xai-grok-pager
-cargo check -p xai-grok-pager-bin            # fast validation
+./bin/setup-dev
+./bin/open-grok-dev --version
+./bin/open-grok-dev
 ```
 
-The binary artifact is named `xai-grok-pager`; official installs ship it as
-`grok`. On first launch it opens your browser to authenticate — see the
-[authentication guide](crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md).
+For a focused local build:
 
-## Documentation
+```sh
+cargo build --locked -p xai-grok-pager-bin --bin open-grok
+./target/debug/open-grok --version
+```
 
-Full online documentation is available at
-[docs.x.ai/build/overview](https://docs.x.ai/build/overview).
+On Apple Silicon macOS, build the complete release asset set with:
 
-The user guide ships with the pager crate:
-[`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
-— getting started, keyboard shortcuts, slash commands, configuration, theming,
-MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
+```sh
+./scripts/build-macos-release.sh
+```
+
+The script reads [`OPEN_GROK_VERSION`](OPEN_GROK_VERSION), injects it through
+`GROK_VERSION`, builds the hardened `release-dist` profile, strips and ad-hoc
+signs the binary, verifies its version and source commit, and writes these
+ignored local artifacts. Release builds require a clean worktree and embed a
+trusted local arm64 `rg` selected through `GROK_TOOLS_BUNDLE_RG_PATH` or `PATH`.
+The required version is ripgrep 15.0.0, matching the embedded-tool metadata.
+
+```text
+dist/open-grok-macos-aarch64
+dist/open-grok-macos-aarch64.sha256
+dist/install.sh
+dist/LICENSE
+dist/THIRD-PARTY-NOTICES
+```
+
+## Compatibility with Grok Build
+
+Open Grok uses `~/.opengrok` for user-level runtime state and project-local
+`.opengrok` directories for repository configuration. Set `OPENGROK_HOME` to
+move all user-level Open Grok state, or `OPEN_GROK_BIN_DIR` to change only the
+installed command location. Codex OAuth is stored at
+`~/.opengrok/codex-auth.json` by default.
+
+The fork does not fall back to upstream Grok Build state. Credentials, settings,
+sessions, caches, skills, plugins, and project configuration are isolated from
+an upstream installation.
 
 ## Repository layout
 
 | Path | Contents |
-|------|----------|
-| `crates/codegen/xai-grok-pager-bin` | Composition-root package; builds the `xai-grok-pager` binary |
-| `crates/codegen/xai-grok-pager` | The TUI: scrollback, prompt, modals, rendering |
-| `crates/codegen/xai-grok-shell` | Agent runtime + leader/stdio/headless entry points |
-| `crates/codegen/xai-grok-tools` | Tool implementations (terminal, file edit, search, ...) |
-| `crates/codegen/xai-grok-workspace` | Host filesystem, VCS, execution, checkpoints |
-| `crates/codegen/...` | The rest of the CLI crate closure (config, MCP, markdown, sandbox, ...) |
-| `crates/common/`, `crates/build/`, `prod/mc/` | Small shared leaf crates pulled in by the closure |
-| `third_party/` | Vendored upstream source (Mermaid diagram stack) — see below |
+| --- | --- |
+| `crates/codegen/xai-grok-pager-bin` | Composition-root package for `open-grok` |
+| `crates/codegen/xai-grok-pager` | TUI, commands, settings, and rendering |
+| `crates/codegen/xai-grok-shell` | Agent runtime, sessions, provider routing, and headless modes |
+| `crates/codegen/xai-grok-code-mode*` | Codex-compatible Code Mode protocol and runtime |
+| `crates/codegen/xai-grok-tools` | Terminal, file, search, and other tool implementations |
+| `docs/` | Fork compatibility and implementation notes |
+| `scripts/` | Release packaging helpers |
 
 > [!IMPORTANT]
-> The root `Cargo.toml` (workspace members, dependency versions, lints,
-> profiles) is **generated** — treat it as read-only. Prefer editing per-crate
-> `Cargo.toml` files.
+> The root `Cargo.toml` is generated. Treat it as read-only and make dependency
+> changes in the per-crate manifests.
 
-## Development
+## Upstream provenance and license
 
-For a first-time local checkout, validate the required tools, fetch the locked
-dependencies, and compile the main package:
+Open Grok is maintained at
+[`mweinbach/open-grok`](https://github.com/mweinbach/open-grok). It is derived
+from the Grok Build local source snapshot
+`c1b5909ec707c069f1d21a93917af044e71da0d7` dated 2026-07-15. That exact
+snapshot is the fork baseline because the upstream repository currently has
+replacement, unrelated history. Codex behavior is ported from a pinned revision of
+[`openai/codex`](https://github.com/openai/codex). The pinned commit and
+deliberate compatibility differences are recorded in the documents linked above.
 
-```sh
-./bin/setup-dev
-```
+This community fork is not affiliated with, sponsored by, or endorsed by xAI,
+SpaceXAI, or OpenAI. Grok, ChatGPT, Codex, and related marks belong to their
+respective owners.
 
-Use the repo-local runner while changing the source. It builds and launches
-this checkout without replacing an installed `grok` release:
+First-party source is licensed under the **Apache License, Version 2.0**; see
+[`LICENSE`](LICENSE). Ported and vendored code retains its original license and
+attribution. See [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES),
+[`crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md`](crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md),
+and [`third_party/NOTICE`](third_party/NOTICE).
 
-```sh
-./bin/grok-dev --version
-./bin/grok-dev inspect
-./bin/grok-dev "explain this repository"
-```
-
-The usual focused Cargo commands remain available for development:
-
-```sh
-cargo check -p <crate>        # always target specific crates; full-workspace builds are slow
-cargo test -p xai-grok-config # per-crate tests
-cargo clippy -p <crate>       # lint config: clippy.toml at the repo root
-cargo fmt --all               # rustfmt.toml at the repo root
-```
-
-## Contributing
-
-> [!NOTE]
-> External contributions are not accepted. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## License
-
-First-party code in this repository is licensed under the **Apache License,
-Version 2.0** — see [`LICENSE`](LICENSE).
-
-Third-party and vendored code remains under its original licenses. See:
-
-- [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES) — crates.io / git dependencies,
-  bundled UI themes, and **in-tree source ports** (including openai/codex and
-  sst/opencode tool implementations)
-- [`crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md`](crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md)
-  — crate-local notice for the codex and opencode ports (license texts +
-  Apache §4(b) change notice)
-- [`third_party/NOTICE`](third_party/NOTICE) — vendored Mermaid-stack index
+Every binary GitHub Release must upload `LICENSE` and `THIRD-PARTY-NOTICES`
+beside the core binary, checksum, and installer assets. Publish the release as a
+full GitHub Release, not a GitHub prerelease, so the documented
+`/releases/latest/download` installer URL resolves.
