@@ -46,9 +46,10 @@
     fn ext_session_update_replay_restores_then_removes_scheduled_task() {
         let mut app = make_app_with_agent("sess-1");
         let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().session.loading_replay = true;
         assert!(app.agents[&id].session.scheduled_tasks.is_empty());
 
-        handle(
+        let created_redraw = handle(
             make_ext_session_notification_with_method(
                 "sess-1",
                 "x.ai/session/update",
@@ -62,6 +63,10 @@
             &mut app,
         );
         assert!(
+            !created_redraw,
+            "replayed ScheduledTaskCreated must not reveal partial resume state"
+        );
+        assert!(
             app.agents[&id]
                 .session
                 .scheduled_tasks
@@ -69,7 +74,7 @@
             "replayed ScheduledTaskCreated must restore scheduled_tasks on resume"
         );
 
-        handle(
+        let deleted_redraw = handle(
             make_ext_session_notification_with_method(
                 "sess-1",
                 "x.ai/session/update",
@@ -78,6 +83,10 @@
                 },
             ),
             &mut app,
+        );
+        assert!(
+            !deleted_redraw,
+            "replayed ScheduledTaskDeleted must not reveal partial resume state"
         );
         assert!(
             app.agents[&id].session.scheduled_tasks.is_empty(),

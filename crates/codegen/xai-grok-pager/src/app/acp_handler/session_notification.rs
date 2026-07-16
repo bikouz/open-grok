@@ -121,10 +121,12 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             return handle_task_completed(notif, app) && !loading_replay;
         }
         XaiSessionUpdate::ScheduledTaskCreated { .. } => {
-            return handle_scheduled_task_created(notif, app);
+            let loading_replay = notification_target_loading(app, &session_notif.session_id);
+            return handle_scheduled_task_created(notif, app) && !loading_replay;
         }
         XaiSessionUpdate::ScheduledTaskDeleted { .. } => {
-            return handle_scheduled_task_deleted(notif, app);
+            let loading_replay = notification_target_loading(app, &session_notif.session_id);
+            return handle_scheduled_task_deleted(notif, app) && !loading_replay;
         }
         _ => {}
     }
