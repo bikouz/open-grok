@@ -222,8 +222,12 @@ pub trait BearerResolver: Send + Sync + std::fmt::Debug {
 
     /// When true, an unavailable or identity-mismatched live snapshot removes
     /// the static auth fallback instead of sending a stale credential.
+    ///
+    /// New resolvers fail closed by default so a provider cannot silently
+    /// inherit the legacy xAI stale-token fallback. The active xAI resolver
+    /// opts into that compatibility behavior explicitly.
     fn fail_closed_on_missing(&self) -> bool {
-        false
+        true
     }
 }
 

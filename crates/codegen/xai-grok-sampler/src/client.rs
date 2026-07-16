@@ -25,73 +25,32 @@ use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ModelProvider, NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
-    ReasoningEffort, ResponseModelMetadata, Result, SamplingError, build_messages_request,
-    is_check_event, messages, rs,
+    NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
+    ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
+    rs,
 };
+#[cfg(test)]
+use xai_grok_sampling_types::{ModelProvider, ReasoningEffort};
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
+#[cfg(test)]
+use crate::provider::{
+    EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT, MULTI_AGENT_MODE_CLOSE_TAG,
+    MULTI_AGENT_MODE_OPEN_TAG, PROACTIVE_MULTI_AGENT_MODE_TEXT,
+};
+use crate::provider::{
+    ProviderAdapter, ProviderRequestHeaders as GrokRequestHeaders, ResponsesRequestPolicy,
+    X_CODEX_TURN_STATE_HEADER, provider_adapter,
+};
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
 pub use xai_grok_sampling_types::ApiBackend;
 
-/// Process-level fallback for the `x-grok-client-identifier` header.
-const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
-
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
-const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const X_CODEX_BETA_FEATURES_HEADER: &str = "x-codex-beta-features";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
-const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
-const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
-const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
-const PROACTIVE_MULTI_AGENT_MODE_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
-
-/// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
-struct GrokRequestHeaders<'a> {
-    conv_id: &'a str,
-    req_id: &'a str,
-    model_id: &'a str,
-    session_id: &'a str,
-    turn_idx: Option<&'a str>,
-    agent_id: &'a str,
-    deployment_id: Option<&'a str>,
-    user_id: Option<&'a str>,
-}
-
-impl GrokRequestHeaders<'_> {
-    fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut b = builder
-            .header("x-grok-conv-id", self.conv_id)
-            .header("x-grok-req-id", self.req_id)
-            .header("x-grok-model-override", self.model_id)
-            .header("x-grok-session-id", self.session_id)
-            .header("x-grok-agent-id", self.agent_id);
-        if let Some(idx) = self.turn_idx {
-            b = b.header("x-grok-turn-idx", idx);
-        }
-        if let Some(id) = self.deployment_id.filter(|s| !s.is_empty()) {
-            b = b.header("x-grok-deployment-id", id);
-        }
-        if let Some(id) = self.user_id.filter(|s| !s.is_empty()) {
-            b = b.header("x-grok-user-id", id);
-        }
-        b
-    }
-
-    fn apply_for_provider(
-        &self,
-        builder: reqwest::RequestBuilder,
-        provider: xai_grok_sampling_types::ModelProvider,
-    ) -> reqwest::RequestBuilder {
-        match provider {
-            xai_grok_sampling_types::ModelProvider::Xai => self.apply(builder),
-            xai_grok_sampling_types::ModelProvider::Codex => builder,
-        }
-    }
-}
 
 /// Parse the `Retry-After` response header as delta-seconds.
 /// Our inference backends only emit integer seconds (never HTTP-date),
@@ -117,12 +76,22 @@ impl GrokRequestHeaders<'_> {
 /// `ResponseUsage` unchanged so billing telemetry stays correct. When
 /// the API doesn't emit `context_details` (older deployments) `total_tokens`
 /// passes through unchanged.
+#[cfg(test)]
 fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
+    deserialize_response_event_for_adapter(data, provider_adapter(ModelProvider::Xai))
+}
+
+fn deserialize_response_event_for_adapter(
+    data: &str,
+    adapter: &dyn ProviderAdapter,
+) -> Result<rs::ResponseStreamEvent> {
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
         Err(first_err) => {
             // Try sanitizing provider extensions at the typed SDK boundary.
-            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
+            if adapter.normalizes_response_events()
+                && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data)
+            {
                 normalize_response_event_compat(&mut value);
                 if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
                     apply_terminal_event_overrides(&mut event, data);
@@ -154,81 +123,14 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
 /// it as `previous_response_id` exclusively for incremental WebSocket
 /// requests; the HTTP Responses transport sends the complete input on every
 /// request and uses `prompt_cache_key` for cache affinity.
-fn absorb_response_metadata_event(
-    event_name: &str,
-    data: &str,
-    codex_turn_state: Option<&Arc<OnceLock<String>>>,
-) -> bool {
-    let parsed = serde_json::from_str::<serde_json::Value>(data).ok();
-    let is_metadata = event_name == "response.metadata"
-        || parsed
-            .as_ref()
-            .and_then(|value| value.get("type"))
-            .and_then(serde_json::Value::as_str)
-            == Some("response.metadata");
-    if !is_metadata {
-        return false;
-    }
-
-    if let Some(response_id) = parsed
-        .as_ref()
-        .and_then(|value| value.get("response_id"))
-        .and_then(serde_json::Value::as_str)
-    {
-        tracing::trace!(%response_id, "received Codex response metadata");
-    }
-
-    let turn_state = parsed
-        .as_ref()
-        .and_then(|value| value.get("headers"))
-        .and_then(serde_json::Value::as_object)
-        .and_then(|headers| {
-            headers.iter().find_map(|(name, value)| {
-                name.eq_ignore_ascii_case(X_CODEX_TURN_STATE_HEADER)
-                    .then(|| response_metadata_header_value(value))
-                    .flatten()
-            })
-        });
-    if let (Some(state), Some(value)) = (codex_turn_state, turn_state) {
-        // Codex's routing state is immutable within one logical turn. The
-        // first successful Responses/compact value always wins.
-        let _ = state.set(value);
-    }
-
-    true
-}
-
-fn response_metadata_header_value(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(value) => Some(value.clone()),
-        serde_json::Value::Array(values) => values.first().and_then(response_metadata_header_value),
-        _ => None,
-    }
-}
-
 /// Return true only when serde rejected the top-level Responses event kind,
 /// not when a known event was malformed internally. codex-rs intentionally
 /// uses an open string discriminator and ignores future event kinds; this
 /// predicate lets the Codex HTTP stream preserve that forward compatibility
 /// without hiding schema errors in events we already understand.
+#[cfg(test)]
 fn is_unknown_top_level_response_event(error: &SamplingError, data: &str) -> bool {
-    let SamplingError::Serialization(error) = error else {
-        return false;
-    };
-    let Some(event_type) = serde_json::from_str::<serde_json::Value>(data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-    else {
-        return false;
-    };
-    error
-        .to_string()
-        .contains(&format!("unknown variant `{event_type}`"))
+    provider_adapter(ModelProvider::Codex).ignores_unknown_response_event(error, data)
 }
 
 /// Normalize valid custom-tool stream shapes that async-openai 0.33.1 models
@@ -490,6 +392,7 @@ fn normalize_response_reasoning_effort(value: &mut serde_json::Value) {
 /// Max and Ultra are distinct local choices, but Codex accepts `max` for both.
 /// On live Codex v2 models, Ultra opts into proactive multi-agent delegation.
 /// The policy item exists only in this request body and is never persisted to chat.
+#[cfg(test)]
 fn patch_codex_request_compat(
     request_body: &mut serde_json::Value,
     provider: ModelProvider,
@@ -497,156 +400,17 @@ fn patch_codex_request_compat(
     local_effort: Option<ReasoningEffort>,
     reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
 ) {
-    if provider != ModelProvider::Codex {
-        return;
-    }
-
-    patch_codex_instruction_roles(request_body);
-
-    // The typed conversation conversion defaults to `concise` for xAI. For
-    // Codex, models.json is authoritative: project its effective value or
-    // remove the field when the model does not support it / selects `none`.
-    match reasoning_summary.and_then(|summary| summary.wire_value()) {
-        Some(summary) => {
-            if !request_body
-                .get("reasoning")
-                .is_some_and(serde_json::Value::is_object)
-            {
-                request_body["reasoning"] = serde_json::json!({});
-            }
-            request_body["reasoning"]["summary"] = serde_json::Value::String(summary.to_owned());
-        }
-        None => {
-            if let Some(reasoning) = request_body
-                .get_mut("reasoning")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                reasoning.remove("summary");
-            }
-        }
-    }
-
-    if matches!(
-        local_effort,
-        Some(ReasoningEffort::Max | ReasoningEffort::Ultra)
-    ) {
-        if !request_body
-            .get("reasoning")
-            .is_some_and(serde_json::Value::is_object)
-        {
-            request_body["reasoning"] = serde_json::json!({});
-        }
-        request_body["reasoning"]["effort"] = serde_json::Value::String("max".to_owned());
-    }
-
-    if !multi_agent_v2 {
-        return;
-    }
-
-    let mode_text = if local_effort == Some(ReasoningEffort::Ultra) {
-        PROACTIVE_MULTI_AGENT_MODE_TEXT
-    } else {
-        EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT
-    };
-    let rendered = format!("{MULTI_AGENT_MODE_OPEN_TAG}{mode_text}{MULTI_AGENT_MODE_CLOSE_TAG}");
-    let Some(input) = request_body
-        .get_mut("input")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return;
-    };
-
-    // Be idempotent if a future session layer starts supplying this same
-    // contextual item. Removal is request-local and does not mutate history.
-    input.retain(|item| !is_multi_agent_mode_item(item));
-    let mode_item = serde_json::json!({
-        "type": "message",
-        "role": "developer",
-        "content": [{ "type": "input_text", "text": rendered }],
-    });
-    let insert_at = input
-        .last()
-        .filter(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-        .map_or(input.len(), |_| input.len() - 1);
-    input.insert(insert_at, mode_item);
+    provider_adapter(provider).patch_responses_request(
+        request_body,
+        ResponsesRequestPolicy {
+            multi_agent_v2,
+            local_effort,
+            reasoning_summary,
+        },
+    );
 }
 
-/// Match codex-rs's Responses request boundary for harness instructions.
-///
-/// Open Grok keeps its base prompt as the leading `System` item so the same
-/// persisted conversation can be used by xAI. ChatGPT Codex does not accept
-/// `system` roles in `/backend-api/codex/responses`: codex-rs sends the base
-/// prompt through top-level `instructions`, while later contextual instruction
-/// messages use the `developer` role. Apply that provider-only wire projection
-/// without mutating the shared conversation history.
-fn patch_codex_instruction_roles(request_body: &mut serde_json::Value) {
-    let Some(input) = request_body
-        .get_mut("input")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return;
-    };
-
-    let mut leading_instructions = Vec::new();
-    let mut in_leading_prefix = true;
-    let mut projected = Vec::with_capacity(input.len());
-
-    for mut item in std::mem::take(input) {
-        let is_system = item.get("role").and_then(serde_json::Value::as_str) == Some("system");
-        if !is_system {
-            in_leading_prefix = false;
-            projected.push(item);
-            continue;
-        }
-
-        if in_leading_prefix
-            && let Some(text) = responses_message_text(&item).filter(|text| !text.trim().is_empty())
-        {
-            leading_instructions.push(text);
-            continue;
-        }
-
-        // A system-shaped item after conversation history has started is not
-        // the base prompt. Keep it exactly where it was, but use the role that
-        // the Codex Responses contract accepts for contextual instructions.
-        item["role"] = serde_json::Value::String("developer".to_owned());
-        projected.push(item);
-    }
-    *input = projected;
-
-    if leading_instructions.is_empty() {
-        return;
-    }
-    let leading = leading_instructions.join("\n\n");
-    let existing = request_body
-        .get("instructions")
-        .and_then(serde_json::Value::as_str)
-        .filter(|text| !text.trim().is_empty());
-    let instructions = match existing {
-        // The compact endpoint supplies its own authoritative instruction
-        // string (base prompt plus optional compaction context). Never append
-        // a duplicate prompt merely because legacy input also carried it.
-        Some(existing) => existing.to_owned(),
-        None => leading,
-    };
-    request_body["instructions"] = serde_json::Value::String(instructions);
-}
-
-fn responses_message_text(item: &serde_json::Value) -> Option<String> {
-    match item.get("content")? {
-        serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Array(parts) => {
-            let text = parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
-    }
-}
-
+#[cfg(test)]
 fn is_multi_agent_mode_item(item: &serde_json::Value) -> bool {
     if item.get("role").and_then(serde_json::Value::as_str) != Some("developer") {
         return false;
@@ -999,13 +763,29 @@ struct CodexRemoteCompactionV2Collector {
 }
 
 impl CodexRemoteCompactionV2Collector {
+    #[cfg(test)]
     fn absorb(
         &mut self,
         event_name: &str,
         data: &str,
         codex_turn_state: Option<&Arc<OnceLock<String>>>,
     ) -> Result<()> {
-        if absorb_response_metadata_event(event_name, data, codex_turn_state) {
+        self.absorb_with_adapter(
+            provider_adapter(ModelProvider::Codex),
+            event_name,
+            data,
+            codex_turn_state,
+        )
+    }
+
+    fn absorb_with_adapter(
+        &mut self,
+        adapter: &dyn ProviderAdapter,
+        event_name: &str,
+        data: &str,
+        codex_turn_state: Option<&Arc<OnceLock<String>>>,
+    ) -> Result<()> {
+        if adapter.absorb_response_metadata(event_name, data, codex_turn_state) {
             return Ok(());
         }
         if let Some(error) = try_parse_stream_error(data) {
@@ -1156,6 +936,7 @@ pub struct SamplingClient {
     default_headers: HeaderMap,
     base_url: String,
     defaults: ClientDefaults,
+    provider_adapter: &'static dyn ProviderAdapter,
     /// Optional 401-attribution hook. The shell wires this to emit a
     /// structured event at every UNAUTHORIZED arm so 401s can be
     /// bucketed by stale-snapshot vs. live-token-rejected. `None` for
@@ -1175,6 +956,7 @@ impl std::fmt::Debug for SamplingClient {
         f.debug_struct("SamplingClient")
             .field("base_url", &self.base_url)
             .field("defaults", &self.defaults)
+            .field("provider_adapter", &self.provider_adapter.provider())
             .field(
                 "has_attribution_callback",
                 &self.attribution_callback.is_some(),
@@ -1300,8 +1082,10 @@ impl SamplingClient {
         config: SamplerConfig,
         codex_turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<Self> {
-        let codex_turn_state = (config.provider == ModelProvider::Codex
-            && config.api_backend == ApiBackend::Responses)
+        let provider_adapter = provider_adapter(config.provider);
+        provider_adapter.validate_backend(&config.api_backend)?;
+        let codex_turn_state = provider_adapter
+            .supports_turn_state(&config.api_backend)
             .then(|| codex_turn_state)
             .flatten();
         let mut headers = HeaderMap::new();
@@ -1354,45 +1138,9 @@ impl SamplingClient {
             }
         }
 
-        // x-grok-* headers are private xAI proxy metadata and must never be
-        // synthesized for the Codex Responses endpoint. Explicit provider
-        // headers (for example `originator`) still flow through extra_headers.
-        if config.provider != xai_grok_sampling_types::ModelProvider::Codex {
-            if let Some(client_version) = config.client_version.as_ref()
-                && let Ok(header_value) = HeaderValue::from_str(client_version)
-            {
-                headers.insert(
-                    HeaderName::from_static("x-grok-client-version"),
-                    header_value,
-                );
-            }
-
-            if let Some(deployment_id) = config.deployment_id.as_ref()
-                && let Ok(header_value) = HeaderValue::from_str(deployment_id)
-            {
-                headers.insert(
-                    HeaderName::from_static("x-grok-deployment-id"),
-                    header_value,
-                );
-            }
-
-            if let Some(user_id) = config.user_id.as_ref()
-                && let Ok(header_value) = HeaderValue::from_str(user_id)
-            {
-                headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
-            }
-
-            let client_id = config
-                .client_identifier
-                .clone()
-                .unwrap_or_else(|| DEFAULT_CLIENT_IDENTIFIER.to_string());
-            if let Ok(header_value) = HeaderValue::from_str(&client_id) {
-                headers.insert(
-                    HeaderName::from_static("x-grok-client-identifier"),
-                    header_value,
-                );
-            }
-        }
+        // Provider-private identity headers are transport policy, independent
+        // of the auth headers resolved above.
+        provider_adapter.apply_default_headers(&mut headers, &config);
 
         // Always set User-Agent: per-session origin if available, else fallback.
         {
@@ -1452,6 +1200,7 @@ impl SamplingClient {
             default_headers: headers,
             base_url: config.base_url,
             defaults,
+            provider_adapter,
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
@@ -1470,18 +1219,8 @@ impl SamplingClient {
     }
 
     fn capture_codex_turn_state(&self, headers: &HeaderMap) {
-        let Some(state) = self.codex_turn_state.as_ref() else {
-            return;
-        };
-        let Some(value) = headers
-            .get(X_CODEX_TURN_STATE_HEADER)
-            .and_then(|value| value.to_str().ok())
-        else {
-            return;
-        };
-        // Codex's contract is immutable within a turn. Compact and later
-        // Responses calls may echo other values, but the first one wins.
-        let _ = state.set(value.to_owned());
+        self.provider_adapter
+            .capture_turn_state(headers, self.codex_turn_state.as_ref());
     }
 
     /// Replace a live bearer resolver without rebuilding the client's model,
@@ -1567,20 +1306,10 @@ impl SamplingClient {
             injector.inject(&mut headers);
         }
 
-        // This header is an internal Codex routing token, never operator
-        // configuration. Remove any value supplied through extra headers,
-        // live auth metadata, or tracing injection, then install at most the
-        // exact first value captured for this logical turn.
-        headers.remove(X_CODEX_TURN_STATE_HEADER);
-        if let Some(mut value) = self
-            .codex_turn_state
-            .as_ref()
-            .and_then(|state| state.get())
-            .and_then(|state| HeaderValue::from_str(state).ok())
-        {
-            value.set_sensitive(true);
-            headers.insert(X_CODEX_TURN_STATE_HEADER, value);
-        }
+        self.provider_adapter.sanitize_headers(&mut headers);
+
+        self.provider_adapter
+            .apply_turn_state_header(&mut headers, self.codex_turn_state.as_ref());
         self.http.post(url).headers(headers)
     }
 
@@ -1697,9 +1426,16 @@ impl SamplingClient {
             })
             .collect();
 
-        req_headers.push(Self::format_header("x-grok-conv-id", x_grok_conv_id));
-        req_headers.push(Self::format_header("x-grok-req-id", x_grok_req_id));
-        req_headers.push(Self::format_header("x-grok-model-override", model_id));
+        if self
+            .provider_adapter
+            .profile()
+            .request_metadata
+            .sends_x_grok_headers()
+        {
+            req_headers.push(Self::format_header("x-grok-conv-id", x_grok_conv_id));
+            req_headers.push(Self::format_header("x-grok-req-id", x_grok_req_id));
+            req_headers.push(Self::format_header("x-grok-model-override", model_id));
+        }
         if include_accept {
             req_headers.push(Self::format_header("accept", "text/event-stream"));
         }
@@ -1854,11 +1590,9 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply_for_provider(
-                self.post(self.endpoint("chat/completions")),
-                self.defaults.provider,
-            )
+        let http_request = self
+            .provider_adapter
+            .apply_request_headers(self.post(self.endpoint("chat/completions")), grok_headers)
             .json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1915,11 +1649,9 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply_for_provider(
-                self.post(self.endpoint("chat/completions")),
-                self.defaults.provider,
-            )
+        let http_request = self
+            .provider_adapter
+            .apply_request_headers(self.post(self.endpoint("chat/completions")), grok_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&streaming_request);
 
@@ -2083,10 +1815,9 @@ impl SamplingClient {
         inner.instructions = (!instructions.is_empty()).then(|| instructions.to_owned());
         inner.parallel_tool_calls = Some(true);
         if inner.prompt_cache_key.is_none() {
-            inner.prompt_cache_key = request
-                .x_grok_session_id
-                .clone()
-                .filter(|session_id| !session_id.is_empty());
+            inner.prompt_cache_key = self
+                .provider_adapter
+                .prompt_cache_key(request.x_grok_session_id.as_deref());
         }
         if remote_v2 {
             inner.store = Some(false);
@@ -2117,12 +1848,13 @@ impl SamplingClient {
             &original_detail_custom_output_images,
         );
         patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
-        patch_codex_request_compat(
+        self.provider_adapter.patch_responses_request(
             &mut request_body,
-            self.defaults.provider,
-            self.defaults.codex_multi_agent_v2,
-            local_reasoning_effort,
-            self.defaults.reasoning_summary,
+            ResponsesRequestPolicy {
+                multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                local_effort: local_reasoning_effort,
+                reasoning_summary: self.defaults.reasoning_summary,
+            },
         );
         if remote_v2 {
             if request_body
@@ -2183,7 +1915,8 @@ impl SamplingClient {
         mut request: ConversationRequest,
         instructions: &str,
     ) -> Result<Vec<xai_grok_sampling_types::ConversationItem>> {
-        if self.defaults.provider != ModelProvider::Codex
+        if self.provider_adapter.profile().responses_dialect()
+            != Some(xai_grok_sampling_types::ResponsesDialect::Codex)
             || self.defaults.api_backend != ApiBackend::Responses
         {
             return Err(SamplingError::InvalidConfiguration(
@@ -2272,7 +2005,8 @@ impl SamplingClient {
         mut request: ConversationRequest,
         instructions: &str,
     ) -> Result<CodexRemoteCompactionV2Result> {
-        if self.defaults.provider != ModelProvider::Codex
+        if self.provider_adapter.profile().responses_dialect()
+            != Some(xai_grok_sampling_types::ResponsesDialect::Codex)
             || self.defaults.api_backend != ApiBackend::Responses
         {
             return Err(SamplingError::InvalidConfiguration(
@@ -2365,7 +2099,12 @@ impl SamplingClient {
             if event.data == "[DONE]" {
                 break;
             }
-            collector.absorb(&event.event, &event.data, self.codex_turn_state.as_ref())?;
+            collector.absorb_with_adapter(
+                self.provider_adapter,
+                &event.event,
+                &event.data,
+                self.codex_turn_state.as_ref(),
+            )?;
             if collector.saw_completed {
                 break;
             }
@@ -2409,13 +2148,10 @@ impl SamplingClient {
         // codex-rs keys HTTP prompt caching by the stable session ID. Keep
         // this provider-scoped so xAI's request body remains unchanged, and
         // preserve an explicit cache key if a caller supplied one.
-        if self.defaults.provider == ModelProvider::Codex
-            && request.inner.prompt_cache_key.is_none()
-        {
-            request.inner.prompt_cache_key = request
-                .x_grok_session_id
-                .clone()
-                .filter(|session_id| !session_id.is_empty());
+        if request.inner.prompt_cache_key.is_none() {
+            request.inner.prompt_cache_key = self
+                .provider_adapter
+                .prompt_cache_key(request.x_grok_session_id.as_deref());
         }
 
         Ok(())
@@ -2476,18 +2212,17 @@ impl SamplingClient {
             &request.original_detail_custom_output_images,
         );
         patch_raw_input_replacements(&mut request_body, &request.raw_input_replacements)?;
-        patch_codex_request_compat(
+        self.provider_adapter.patch_responses_request(
             &mut request_body,
-            self.defaults.provider,
-            self.defaults.codex_multi_agent_v2,
-            request.local_reasoning_effort,
-            self.defaults.reasoning_summary,
+            ResponsesRequestPolicy {
+                multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                local_effort: request.local_reasoning_effort,
+                reasoning_summary: self.defaults.reasoning_summary,
+            },
         );
-        let http_request = grok_headers
-            .apply_for_provider(
-                self.post(self.endpoint("responses")),
-                self.defaults.provider,
-            )
+        let http_request = self
+            .provider_adapter
+            .apply_request_headers(self.post(self.endpoint("responses")), grok_headers)
             .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
@@ -2542,7 +2277,9 @@ impl SamplingClient {
 
         let response_obj = (|| {
             let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
-            normalize_response_compat(&mut value, "completed");
+            if self.provider_adapter.normalizes_response_events() {
+                normalize_response_compat(&mut value, "completed");
+            }
             serde_json::from_value::<rs::Response>(value)
         })()
         .map_err(|e| {
@@ -2645,12 +2382,13 @@ impl SamplingClient {
             &request.original_detail_custom_output_images,
         );
         patch_raw_input_replacements(&mut request_body, &request.raw_input_replacements)?;
-        patch_codex_request_compat(
+        self.provider_adapter.patch_responses_request(
             &mut request_body,
-            self.defaults.provider,
-            self.defaults.codex_multi_agent_v2,
-            request.local_reasoning_effort,
-            self.defaults.reasoning_summary,
+            ResponsesRequestPolicy {
+                multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                local_effort: request.local_reasoning_effort,
+                reasoning_summary: self.defaults.reasoning_summary,
+            },
         );
         // Fresh per attempt so signals never leak across retries; `None`
         // disables collection. The opt-in wire header is xAI-only below.
@@ -2658,15 +2396,11 @@ impl SamplingClient {
             .defaults
             .doom_loop_recovery
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
-        let mut http_request = grok_headers
-            .apply_for_provider(
-                self.post(self.endpoint("responses")),
-                self.defaults.provider,
-            )
+        let mut http_request = self
+            .provider_adapter
+            .apply_request_headers(self.post(self.endpoint("responses")), grok_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        if doom_loop.is_some()
-            && self.defaults.provider != xai_grok_sampling_types::ModelProvider::Codex
-        {
+        if doom_loop.is_some() && self.provider_adapter.sends_doom_loop_opt_in() {
             // Presence opts in; the server ignores the value.
             http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
         }
@@ -2761,7 +2495,7 @@ impl SamplingClient {
 
         let doom_loop_for_stream = doom_loop.clone();
         let codex_turn_state_for_stream = self.codex_turn_state.clone();
-        let is_codex_stream = self.defaults.provider == ModelProvider::Codex;
+        let provider_adapter_for_stream = self.provider_adapter;
 
         // The scan item is an `Option`: `Some(None)` skips an absorbed
         // doom-loop event without terminating the stream (`filter_map`
@@ -2791,11 +2525,12 @@ impl SamplingClient {
                         // the check disabled, the shared name-or-payload-type
                         // predicate guards against a server emitting it
                         // despite no opt-in (rollout skew), named or not.
-                        let swallow_metadata = absorb_response_metadata_event(
-                            &event.event,
-                            data,
-                            codex_turn_state_for_stream.as_ref(),
-                        );
+                        let swallow_metadata = provider_adapter_for_stream
+                            .absorb_response_metadata(
+                                &event.event,
+                                data,
+                                codex_turn_state_for_stream.as_ref(),
+                            );
                         let swallow = swallow_metadata
                             || match &doom_loop_for_stream {
                                 Some(collector) => collector.absorb(&event.event, data),
@@ -2806,12 +2541,14 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            let decoded = deserialize_response_event(data);
-                            if is_codex_stream
-                                && decoded.as_ref().is_err_and(|error| {
-                                    is_unknown_top_level_response_event(error, data)
-                                })
-                            {
+                            let decoded = deserialize_response_event_for_adapter(
+                                data,
+                                provider_adapter_for_stream,
+                            );
+                            if decoded.as_ref().is_err_and(|error| {
+                                provider_adapter_for_stream
+                                    .ignores_unknown_response_event(error, data)
+                            }) {
                                 tracing::debug!(
                                     event_type = ?serde_json::from_str::<serde_json::Value>(data)
                                         .ok()
@@ -2895,8 +2632,9 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply_for_provider(self.post(self.endpoint("messages")), self.defaults.provider)
+        let http_request = self
+            .provider_adapter
+            .apply_request_headers(self.post(self.endpoint("messages")), grok_headers)
             .json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
@@ -3011,8 +2749,9 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply_for_provider(self.post(self.endpoint("messages")), self.defaults.provider)
+        let http_request = self
+            .provider_adapter
+            .apply_request_headers(self.post(self.endpoint("messages")), grok_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&request.inner);
 
@@ -3884,6 +3623,31 @@ mod tests {
     }
 
     #[test]
+    fn provider_backend_matrix_rejects_unsupported_codex_protocols() {
+        for backend in [ApiBackend::ChatCompletions, ApiBackend::Messages] {
+            let config = SamplerConfig {
+                provider: ModelProvider::Codex,
+                api_backend: backend,
+                ..minimal_config()
+            };
+            assert!(
+                matches!(
+                    SamplingClient::new(config),
+                    Err(SamplingError::InvalidConfiguration(_))
+                ),
+                "Codex must reject unsupported backend"
+            );
+        }
+
+        let config = SamplerConfig {
+            provider: ModelProvider::Codex,
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        };
+        assert!(SamplingClient::new(config).is_ok());
+    }
+
+    #[test]
     fn new_applies_extra_headers() {
         let mut cfg = minimal_config();
         cfg.extra_headers
@@ -3897,12 +3661,15 @@ mod tests {
     fn codex_omits_synthesized_x_grok_headers_but_keeps_provider_headers() {
         let mut cfg = minimal_config();
         cfg.provider = xai_grok_sampling_types::ModelProvider::Codex;
+        cfg.api_backend = ApiBackend::Responses;
         cfg.client_identifier = Some("must-not-leak".to_string());
         cfg.client_version = Some("must-not-leak".to_string());
         cfg.deployment_id = Some("must-not-leak".to_string());
         cfg.user_id = Some("must-not-leak".to_string());
         cfg.extra_headers
             .insert("originator".to_string(), "codex_cli_rs".to_string());
+        cfg.extra_headers
+            .insert("X-Grok-Conv-ID".to_string(), "must-not-leak".to_string());
 
         let client = SamplingClient::new(cfg).expect("Codex client should construct");
         assert!(
@@ -3989,6 +3756,7 @@ mod tests {
         provider_headers.insert("X-OpenAI-Fedramp".to_string(), "true".to_string());
         let mut cfg = minimal_config();
         cfg.provider = ModelProvider::Codex;
+        cfg.api_backend = ApiBackend::Responses;
         cfg.api_key = Some("stale-token-a".to_string());
         cfg.extra_headers.insert(
             "cHaTgPt-aCcOuNt-Id".to_string(),
@@ -4036,6 +3804,7 @@ mod tests {
     fn scoped_auth_snapshot_fails_closed_when_identity_is_unavailable() {
         let mut cfg = minimal_config();
         cfg.provider = ModelProvider::Codex;
+        cfg.api_backend = ApiBackend::Responses;
         cfg.api_key = Some("must-not-be-sent".to_string());
         cfg.extra_headers.insert(
             "ChatGPT-Account-ID".to_string(),
@@ -4223,6 +3992,10 @@ mod tests {
         fn current_bearer(&self) -> Option<String> {
             Some(self.0.to_string())
         }
+
+        fn fail_closed_on_missing(&self) -> bool {
+            false
+        }
     }
 
     #[derive(Debug)]
@@ -4259,6 +4032,7 @@ mod tests {
         let cfg = SamplerConfig {
             api_key: Some("stale-static-token".to_owned()),
             provider: xai_grok_sampling_types::ModelProvider::Codex,
+            api_backend: ApiBackend::Responses,
             extra_headers: indexmap::indexmap! {
                 "CHATGPT-ACCOUNT-ID".to_owned() => "spoofed-account".to_owned(),
             },
@@ -4305,6 +4079,7 @@ mod tests {
         let cfg = SamplerConfig {
             api_key: Some("codex-byok".to_owned()),
             provider: xai_grok_sampling_types::ModelProvider::Codex,
+            api_backend: ApiBackend::Responses,
             bearer_resolver: None,
             ..minimal_config()
         };
@@ -4531,6 +4306,10 @@ mod tests {
         impl crate::config::BearerResolver for StaticResolver {
             fn current_bearer(&self) -> Option<String> {
                 Some(self.0.clone())
+            }
+
+            fn fail_closed_on_missing(&self) -> bool {
+                false
             }
         }
 

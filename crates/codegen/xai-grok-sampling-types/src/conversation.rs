@@ -1060,6 +1060,7 @@ impl crate::HostedToolDialect {
         hosted_tools
             .iter()
             .filter_map(|tool| match (self, tool) {
+                (Self::Xai, tool) => Some(tool.clone()),
                 (Self::OpenAi, HostedTool::XSearch) => None,
                 (
                     Self::OpenAi,
@@ -1075,7 +1076,7 @@ impl crate::HostedToolDialect {
                     }
                     Some(tool)
                 }
-                _ => Some(tool.clone()),
+                (Self::OpenAi, HostedTool::ClientCustom(_)) => Some(tool.clone()),
             })
             .collect()
     }
@@ -1084,7 +1085,9 @@ impl crate::HostedToolDialect {
 impl crate::ProviderProfile {
     /// Normalize hosted tools using this profile's provider-neutral dialect.
     pub fn hosted_tools(self, hosted_tools: &[HostedTool]) -> Vec<HostedTool> {
-        self.hosted_tool_dialect.hosted_tools(hosted_tools)
+        self.hosted_tool_dialect
+            .map(|dialect| dialect.hosted_tools(hosted_tools))
+            .unwrap_or_default()
     }
 }
 
@@ -1240,16 +1243,16 @@ impl ConversationRequest {
         &self,
         provider: crate::ModelProvider,
     ) -> Vec<RawInputItemReplacement> {
-        let dialect = provider.profile().responses_dialect;
+        let dialect = provider.profile().responses_dialect();
         let mut replacements = Vec::new();
         let mut input_item_index = 0usize;
         for item in &self.items {
             if let ConversationItem::BackendToolCall(backend) = item {
                 let value = match (dialect, &backend.kind) {
-                    (crate::ResponsesDialect::Codex, BackendToolKind::CodexRawInput(raw)) => {
+                    (Some(crate::ResponsesDialect::Codex), BackendToolKind::CodexRawInput(raw)) => {
                         Some(raw.raw.clone())
                     }
-                    (crate::ResponsesDialect::Xai, BackendToolKind::XSearch(call)) => {
+                    (Some(crate::ResponsesDialect::Xai), BackendToolKind::XSearch(call)) => {
                         Some(x_search_call_wire_value(call))
                     }
                     _ => None,

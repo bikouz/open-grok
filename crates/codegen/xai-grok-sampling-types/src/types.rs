@@ -1099,6 +1099,27 @@ impl ResponsesDialect {
     }
 }
 
+/// Wire protocols accepted by one provider.
+///
+/// Responses carries its dialect inline so a Messages-only or Chat-only
+/// provider does not have to claim an unrelated Responses contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProviderBackends {
+    pub chat_completions: bool,
+    pub responses: Option<ResponsesDialect>,
+    pub messages: bool,
+}
+
+impl ProviderBackends {
+    pub const fn supports(self, backend: &ApiBackend) -> bool {
+        match backend {
+            ApiBackend::ChatCompletions => self.chat_completions,
+            ApiBackend::Responses => self.responses.is_some(),
+            ApiBackend::Messages => self.messages,
+        }
+    }
+}
+
 /// Hosted-tool schema accepted by the selected provider.
 ///
 /// `OpenAi` is intentionally broader than the built-in Codex provider: a
@@ -1159,6 +1180,9 @@ impl RequestMetadataPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuiltInSessionAuthKind {
+    /// This provider has no application-managed login. Models must supply
+    /// their own `api_key` / `env_key` credentials.
+    ApiKeyOnly,
     XaiSession,
     CodexOAuth,
 }
@@ -1166,9 +1190,14 @@ pub enum BuiltInSessionAuthKind {
 impl BuiltInSessionAuthKind {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ApiKeyOnly => "api_key_only",
             Self::XaiSession => "xai_session",
             Self::CodexOAuth => "codex_oauth",
         }
+    }
+
+    pub const fn is_api_key_only(self) -> bool {
+        matches!(self, Self::ApiKeyOnly)
     }
 
     pub const fn is_xai(self) -> bool {
@@ -1213,8 +1242,9 @@ pub struct ProviderProfile {
     /// Stable provider identifier. Use [`ModelProvider::as_str`] for its wire
     /// value and [`ModelProvider::name`] for its display name.
     pub provider: ModelProvider,
-    pub responses_dialect: ResponsesDialect,
-    pub hosted_tool_dialect: HostedToolDialect,
+    pub backends: ProviderBackends,
+    /// `None` means the provider accepts no hosted tools.
+    pub hosted_tool_dialect: Option<HostedToolDialect>,
     pub request_metadata: RequestMetadataPolicy,
     pub session_auth: BuiltInSessionAuthKind,
     pub xai_services: XaiServicePolicy,
@@ -1223,8 +1253,12 @@ pub struct ProviderProfile {
 impl ProviderProfile {
     pub const XAI: Self = Self {
         provider: ModelProvider::Xai,
-        responses_dialect: ResponsesDialect::Xai,
-        hosted_tool_dialect: HostedToolDialect::Xai,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: Some(ResponsesDialect::Xai),
+            messages: true,
+        },
+        hosted_tool_dialect: Some(HostedToolDialect::Xai),
         request_metadata: RequestMetadataPolicy::XGrokHeaders,
         session_auth: BuiltInSessionAuthKind::XaiSession,
         xai_services: XaiServicePolicy::Allowed,
@@ -1232,8 +1266,12 @@ impl ProviderProfile {
 
     pub const CODEX: Self = Self {
         provider: ModelProvider::Codex,
-        responses_dialect: ResponsesDialect::Codex,
-        hosted_tool_dialect: HostedToolDialect::OpenAi,
+        backends: ProviderBackends {
+            chat_completions: false,
+            responses: Some(ResponsesDialect::Codex),
+            messages: false,
+        },
+        hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
         request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
         session_auth: BuiltInSessionAuthKind::CodexOAuth,
         xai_services: XaiServicePolicy::Denied,
@@ -1257,6 +1295,14 @@ impl ProviderProfile {
 
     pub const fn allows_xai_services(self) -> bool {
         self.xai_services.allows()
+    }
+
+    pub const fn supports_backend(self, backend: &ApiBackend) -> bool {
+        self.backends.supports(backend)
+    }
+
+    pub const fn responses_dialect(self) -> Option<ResponsesDialect> {
+        self.backends.responses
     }
 }
 
@@ -1520,8 +1566,8 @@ mod tests {
             provider: ModelProvider,
             id: &'static str,
             name: &'static str,
-            responses: ResponsesDialect,
-            hosted_tools: HostedToolDialect,
+            backends: ProviderBackends,
+            hosted_tools: Option<HostedToolDialect>,
             request_metadata: RequestMetadataPolicy,
             session_auth: BuiltInSessionAuthKind,
             xai_services: XaiServicePolicy,
@@ -1532,8 +1578,12 @@ mod tests {
                 provider: ModelProvider::Xai,
                 id: "xai",
                 name: "xAI",
-                responses: ResponsesDialect::Xai,
-                hosted_tools: HostedToolDialect::Xai,
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: Some(ResponsesDialect::Xai),
+                    messages: true,
+                },
+                hosted_tools: Some(HostedToolDialect::Xai),
                 request_metadata: RequestMetadataPolicy::XGrokHeaders,
                 session_auth: BuiltInSessionAuthKind::XaiSession,
                 xai_services: XaiServicePolicy::Allowed,
@@ -1542,8 +1592,12 @@ mod tests {
                 provider: ModelProvider::Codex,
                 id: "codex",
                 name: "OpenAI Codex",
-                responses: ResponsesDialect::Codex,
-                hosted_tools: HostedToolDialect::OpenAi,
+                backends: ProviderBackends {
+                    chat_completions: false,
+                    responses: Some(ResponsesDialect::Codex),
+                    messages: false,
+                },
+                hosted_tools: Some(HostedToolDialect::OpenAi),
                 request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
                 session_auth: BuiltInSessionAuthKind::CodexOAuth,
                 xai_services: XaiServicePolicy::Denied,
@@ -1555,7 +1609,8 @@ mod tests {
             assert_eq!(profile.provider, case.provider);
             assert_eq!(profile.id(), case.id);
             assert_eq!(profile.name(), case.name);
-            assert_eq!(profile.responses_dialect, case.responses);
+            assert_eq!(profile.backends, case.backends);
+            assert_eq!(profile.responses_dialect(), case.backends.responses);
             assert_eq!(profile.hosted_tool_dialect, case.hosted_tools);
             assert_eq!(profile.request_metadata, case.request_metadata);
             assert_eq!(profile.session_auth, case.session_auth);
@@ -1563,11 +1618,32 @@ mod tests {
             assert_eq!(profile.is_xai(), case.provider.is_xai());
             assert_eq!(profile.is_codex(), case.provider.is_codex());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
+            for backend in [
+                ApiBackend::ChatCompletions,
+                ApiBackend::Responses,
+                ApiBackend::Messages,
+            ] {
+                assert_eq!(
+                    profile.supports_backend(&backend),
+                    case.backends.supports(&backend),
+                    "{profile:?} backend {backend:?}"
+                );
+            }
 
             let serialized = serde_json::to_value(profile).unwrap();
             let round_trip: ProviderProfile = serde_json::from_value(serialized).unwrap();
             assert_eq!(round_trip, profile);
         }
+    }
+
+    #[test]
+    fn api_key_only_auth_kind_has_no_built_in_session_identity() {
+        let kind = BuiltInSessionAuthKind::ApiKeyOnly;
+        assert!(kind.is_api_key_only());
+        assert!(!kind.is_xai());
+        assert!(!kind.is_codex());
+        assert_eq!(kind.as_str(), "api_key_only");
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!("api_key_only"));
     }
 
     #[test]
