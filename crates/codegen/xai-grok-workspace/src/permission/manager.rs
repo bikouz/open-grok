@@ -662,6 +662,20 @@ fn clamp_yolo(requested: bool, yolo_pin: Option<&'static str>) -> bool {
     requested && yolo_pin.is_none()
 }
 
+/// Bound explicit prompted decisions so classifier context cannot grow for the
+/// lifetime of a long-running session.
+const MAX_RECORDED_PERMISSION_DECISIONS: usize = 12;
+
+/// Return the user's explicit prompted decision when it is safe to retain.
+/// Transport errors, cancellation, and follow-up messages are not decisions.
+fn prompted_decision_approved(decision: &Decision, outcome_str: &str) -> Option<bool> {
+    match decision {
+        Decision::Allow => Some(true),
+        Decision::Reject(_) if outcome_str != "error" => Some(false),
+        _ => None,
+    }
+}
+
 /// Whether an auto-forced prompt must neutralize a pre-decided `Allow`. True for
 /// every non-bash access. Session grants short-circuit before classify, so this
 /// is defense-in-depth for leftover non-grant Allows. Bash is carved out — its
@@ -975,6 +989,10 @@ fn spawn_permission_manager_with_pin(
             Some(crate::permission::auto_mode::default_auto_mode_classifier());
         // Recent turns + project AGENTS.md for classifier context (set by session).
         let mut classifier_turns: Vec<crate::permission::auto_mode::ClassifierTurn> = Vec::new();
+        // Explicit user answers to permission prompts. Kept separately so a
+        // transcript refresh cannot erase permission context.
+        let mut recorded_permission_decisions: Vec<crate::permission::auto_mode::ClassifierTurn> =
+            Vec::new();
         let mut project_instructions: Option<String> = None;
         // Log a refused yolo-enable once per session, not per SetYoloMode.
         let mut pin_refusal_logged = false;
@@ -1253,12 +1271,14 @@ fn spawn_permission_manager_with_pin(
                             AutoFastPath::Classify => {
                                 let verdict = if let Some(ref clf) = auto_classifier {
                                     use crate::permission::auto_mode::ClassifierContext;
+                                    let mut turns = classifier_turns.clone();
+                                    turns.extend(recorded_permission_decisions.iter().cloned());
                                     let classify = clf.classify(
                                         &tool_name,
                                         &access,
                                         access_detail.as_deref(),
                                         ClassifierContext {
-                                            turns: classifier_turns.clone(),
+                                            turns,
                                             project_instructions: project_instructions.clone(),
                                         },
                                     );
@@ -1725,6 +1745,25 @@ fn spawn_permission_manager_with_pin(
                             (decision, outcome_str, true)
                         }
                     };
+                    if user_prompted
+                        && let Some(approved) = prompted_decision_approved(&decision, outcome_str)
+                    {
+                        recorded_permission_decisions.push(
+                            crate::permission::auto_mode::ClassifierTurn::PermissionDecision {
+                                tool: tool_name.clone(),
+                                args: crate::permission::auto_mode::permission_decision_args(
+                                    &access,
+                                    access_detail.as_deref(),
+                                ),
+                                approved,
+                            },
+                        );
+                        let len = recorded_permission_decisions.len();
+                        if len > MAX_RECORDED_PERMISSION_DECISIONS {
+                            recorded_permission_decisions
+                                .drain(..len - MAX_RECORDED_PERMISSION_DECISIONS);
+                        }
+                    }
                     let trigger = if matches!(decision, Decision::Cancelled)
                         && respond_to.is_closed()
                     {
@@ -2601,13 +2640,13 @@ mod tests {
         manager_with_recording_client_remember(cwd, config, client, client_type, true)
     }
 
-    /// Like [`manager_with_recording_client`] but lets a test pin the
-    /// `remember_tool_approvals` gate (which decides whether an explicit grant
-    /// can satisfy an `ask` policy floor).
+    /// Like [`manager_with_recording_client`] but accepts any test client and
+    /// lets the test pin `remember_tool_approvals`, which decides whether an
+    /// explicit grant can satisfy an `ask` policy floor.
     fn manager_with_recording_client_remember(
         cwd: &AbsPathBuf,
         config: Option<crate::permission::types::PermissionConfig>,
-        client: RecordingClient,
+        client: impl acp::Client + 'static,
         client_type: ClientType,
         remember_tool_approvals: bool,
     ) -> (PermissionHandle, mpsc::UnboundedReceiver<PermissionEvent>) {
@@ -2634,6 +2673,488 @@ mod tests {
             acp::ToolCallId::new(Arc::from("tc")),
             acp::ToolCallUpdateFields::default(),
         )
+    }
+
+    struct ApprovingClient;
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for ApprovingClient {
+        async fn request_permission(
+            &self,
+            args: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            let option_id = args
+                .options
+                .iter()
+                .find(|o| o.option_id.0.as_ref() == "allow-once")
+                .map(|o| o.option_id.clone())
+                .expect("prompt must offer allow-once");
+            Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                    option_id,
+                )),
+            ))
+        }
+
+        async fn session_notification(&self, _: acp::SessionNotification) -> acp::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CancellingClient;
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for CancellingClient {
+        async fn request_permission(
+            &self,
+            _: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Cancelled,
+            ))
+        }
+
+        async fn session_notification(&self, _: acp::SessionNotification) -> acp::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ContextCapturingClassifier {
+        verdict: crate::permission::auto_mode::ClassifierVerdict,
+        seen: Arc<std::sync::Mutex<Vec<crate::permission::auto_mode::ClassifierContext>>>,
+    }
+
+    impl crate::permission::auto_mode::PermissionClassifier for ContextCapturingClassifier {
+        fn classify<'a>(
+            &'a self,
+            _tool_name: &'a str,
+            _access: &'a AccessKind,
+            _access_detail: Option<&'a str>,
+            context: crate::permission::auto_mode::ClassifierContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = crate::permission::auto_mode::ClassifierVerdict>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.seen.lock().unwrap().push(context);
+            let verdict = self.verdict;
+            Box::pin(async move { verdict })
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn capturing_classifier(
+        verdict: crate::permission::auto_mode::ClassifierVerdict,
+    ) -> (
+        crate::permission::auto_mode::SharedClassifier,
+        Arc<std::sync::Mutex<Vec<crate::permission::auto_mode::ClassifierContext>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Arc::new(ContextCapturingClassifier {
+                verdict,
+                seen: seen.clone(),
+            }),
+            seen,
+        )
+    }
+
+    #[test]
+    fn prompted_decision_approved_gates_allow_reject_only() {
+        assert_eq!(
+            prompted_decision_approved(&Decision::Allow, "allow_once"),
+            Some(true)
+        );
+        assert_eq!(
+            prompted_decision_approved(&Decision::Allow, "allow_always"),
+            Some(true)
+        );
+        assert_eq!(
+            prompted_decision_approved(&Decision::Reject("no".into()), "reject_once"),
+            Some(false)
+        );
+        assert_eq!(
+            prompted_decision_approved(&Decision::Reject("boom".into()), "error"),
+            None
+        );
+        assert_eq!(
+            prompted_decision_approved(&Decision::Cancelled, "cancelled"),
+            None
+        );
+        assert_eq!(
+            prompted_decision_approved(&Decision::FollowupMessage("do x".into()), "followup"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn prompted_allow_feeds_classifier_context() {
+        use crate::permission::auto_mode::{ClassifierTurn, ClassifierVerdict};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let (mgr, _events) = manager_with_recording_client_remember(
+                    &cwd,
+                    None,
+                    ApprovingClient,
+                    ClientType::Generic,
+                    true,
+                );
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("my-custom-build --release".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Allow, "prompted allow-once must allow");
+
+                mgr.set_auto_mode(true);
+                mgr.set_classifier_transcript(vec![ClassifierTurn::UserText("build it".into())]);
+                let (classifier, seen) = capturing_classifier(ClassifierVerdict::Allow);
+                mgr.set_classifier(Some(classifier));
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("another-custom-tool".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Allow);
+
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 1, "exactly one classify call expected");
+                assert_eq!(
+                    seen[0].turns,
+                    vec![
+                        ClassifierTurn::UserText("build it".into()),
+                        ClassifierTurn::PermissionDecision {
+                            tool: "run_terminal_command".into(),
+                            args: r#"{"command":"my-custom-build --release"}"#.into(),
+                            approved: true,
+                        },
+                    ],
+                    "approval must follow the shell-set turns"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn prompted_reject_feeds_classifier_context_as_declined() {
+        use crate::permission::auto_mode::{ClassifierTurn, ClassifierVerdict};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let client = RecordingClient::default();
+                let (mgr, _events) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("deploy-widget --prod".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(matches!(decision, Decision::Reject(_)), "got {decision:?}");
+
+                mgr.set_auto_mode(true);
+                let (classifier, seen) = capturing_classifier(ClassifierVerdict::Allow);
+                mgr.set_classifier(Some(classifier));
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("my-custom-build --release".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Allow);
+
+                let seen = seen.lock().unwrap();
+                assert_eq!(
+                    seen[0].turns,
+                    vec![ClassifierTurn::PermissionDecision {
+                        tool: "run_terminal_command".into(),
+                        args: r#"{"command":"deploy-widget --prod"}"#.into(),
+                        approved: false,
+                    }],
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn policy_deny_and_auto_allow_record_no_decisions() {
+        use crate::permission::auto_mode::ClassifierVerdict;
+        use crate::permission::types::{
+            PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let config = PermissionConfig::new(vec![PermissionRule {
+                    action: RuleAction::Deny,
+                    tool: ToolFilter::Bash,
+                    pattern: Some("evil-tool*".to_owned()),
+                    pattern_mode: PatternMode::Glob,
+                }]);
+                let (mgr, _events) = manager_with_recording_client_remember(
+                    &cwd,
+                    Some(config),
+                    ApprovingClient,
+                    ClientType::Generic,
+                    true,
+                );
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("evil-tool --now".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    matches!(decision, Decision::PolicyDeny(_)),
+                    "got {decision:?}"
+                );
+
+                mgr.set_auto_mode(true);
+                let (classifier, seen) = capturing_classifier(ClassifierVerdict::Allow);
+                mgr.set_classifier(Some(classifier));
+                for cmd in ["my-custom-build --release", "second-custom-tool"] {
+                    let decision = mgr
+                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
+                        .await;
+                    assert_eq!(decision, Decision::Allow);
+                }
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 2);
+                assert!(
+                    seen[1].turns.is_empty(),
+                    "policy deny + auto allow must record nothing, got {:?}",
+                    seen[1].turns
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_error_prompts_record_no_decisions() {
+        use crate::permission::auto_mode::ClassifierVerdict;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let (mgr, _events) = manager_with_recording_client_remember(
+                    &cwd,
+                    None,
+                    CancellingClient,
+                    ClientType::Generic,
+                    true,
+                );
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("my-custom-build --release".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Cancelled);
+                mgr.set_auto_mode(true);
+                let (classifier, seen) = capturing_classifier(ClassifierVerdict::Allow);
+                mgr.set_classifier(Some(classifier));
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("post-cancel-tool".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Allow);
+                assert!(
+                    seen.lock().unwrap()[0].turns.is_empty(),
+                    "cancelled prompt must record nothing"
+                );
+
+                let tmp2 = tempfile::tempdir().unwrap();
+                let cwd2 = AbsPathBuf::new(tmp2.path().to_path_buf()).unwrap();
+                let (mgr2, _events2) = test_manager(&cwd2, false, None);
+                let decision = mgr2
+                    .request(
+                        AccessKind::Bash("my-custom-build --release".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(matches!(decision, Decision::Reject(_)), "got {decision:?}");
+                mgr2.set_auto_mode(true);
+                let (classifier2, seen2) = capturing_classifier(ClassifierVerdict::Allow);
+                mgr2.set_classifier(Some(classifier2));
+                let decision = mgr2
+                    .request(
+                        AccessKind::Bash("post-error-tool".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Allow);
+                assert!(
+                    seen2.lock().unwrap()[0].turns.is_empty(),
+                    "prompt transport error must record nothing"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn decision_history_capped_at_most_recent() {
+        use crate::permission::auto_mode::{ClassifierTurn, ClassifierVerdict};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let (mgr, _events) = manager_with_recording_client_remember(
+                    &cwd,
+                    None,
+                    ApprovingClient,
+                    ClientType::Generic,
+                    true,
+                );
+                for i in 0..=MAX_RECORDED_PERMISSION_DECISIONS {
+                    let decision = mgr
+                        .request(
+                            AccessKind::Bash(format!("custom-tool-{i} --run")),
+                            tool_call(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    assert_eq!(decision, Decision::Allow);
+                }
+                mgr.set_auto_mode(true);
+                let (classifier, seen) = capturing_classifier(ClassifierVerdict::Allow);
+                mgr.set_classifier(Some(classifier));
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("capstone-tool".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Allow);
+
+                let seen = seen.lock().unwrap();
+                let turns = &seen[0].turns;
+                assert_eq!(turns.len(), MAX_RECORDED_PERMISSION_DECISIONS);
+                assert_eq!(
+                    turns[0],
+                    ClassifierTurn::PermissionDecision {
+                        tool: "run_terminal_command".into(),
+                        args: r#"{"command":"custom-tool-1 --run"}"#.into(),
+                        approved: true,
+                    }
+                );
+                assert_eq!(
+                    turns[turns.len() - 1],
+                    ClassifierTurn::PermissionDecision {
+                        tool: "run_terminal_command".into(),
+                        args: format!(
+                            r#"{{"command":"custom-tool-{MAX_RECORDED_PERMISSION_DECISIONS} --run"}}"#
+                        ),
+                        approved: true,
+                    }
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn transcript_refresh_preserves_decision_history() {
+        use crate::permission::auto_mode::{ClassifierTurn, ClassifierVerdict};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let (mgr, _events) = manager_with_recording_client_remember(
+                    &cwd,
+                    None,
+                    ApprovingClient,
+                    ClientType::Generic,
+                    true,
+                );
+                mgr.set_classifier_transcript(vec![ClassifierTurn::UserText("first".into())]);
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("my-custom-build --release".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Allow);
+
+                mgr.set_classifier_transcript(vec![ClassifierTurn::UserText("second".into())]);
+                mgr.set_auto_mode(true);
+                let (classifier, seen) = capturing_classifier(ClassifierVerdict::Allow);
+                mgr.set_classifier(Some(classifier));
+                let decision = mgr
+                    .request(
+                        AccessKind::Bash("another-tool".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(decision, Decision::Allow);
+
+                let seen = seen.lock().unwrap();
+                assert_eq!(
+                    seen[0].turns,
+                    vec![
+                        ClassifierTurn::UserText("second".into()),
+                        ClassifierTurn::PermissionDecision {
+                            tool: "run_terminal_command".into(),
+                            args: r#"{"command":"my-custom-build --release"}"#.into(),
+                            approved: true,
+                        },
+                    ],
+                    "refresh must replace shell turns but keep decision history"
+                );
+            })
+            .await;
     }
 
     /// Regression: an `Ask Bash(ls*)` rule on `ls` — which bash-safety would

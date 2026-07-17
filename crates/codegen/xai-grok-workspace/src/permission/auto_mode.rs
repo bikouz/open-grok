@@ -64,14 +64,24 @@ pub struct ClassifierMessage {
     pub text: String,
 }
 
-/// One recent transcript turn the classifier sees. Includes user text +
-/// assistant tool_use only (assistant text and tool_result are excluded).
+/// One recent context turn the classifier sees. Conversation turns include
+/// user text and assistant tool use (assistant text and tool results are
+/// excluded); prompted permission decisions are tracked separately by the
+/// permission manager and appended chronologically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassifierTurn {
     /// A user text turn.
     UserText(String),
     /// An assistant tool_use block: tool name + compact JSON args (or raw detail).
     AssistantToolUse { tool: String, args: String },
+    /// A permission decision explicitly made by the user after seeing a prompt.
+    /// Approval records permission for the requested action; it does not claim
+    /// that the tool subsequently completed successfully (or ran at all).
+    PermissionDecision {
+        tool: String,
+        args: String,
+        approved: bool,
+    },
 }
 
 impl ClassifierTurn {
@@ -80,6 +90,19 @@ impl ClassifierTurn {
         match self {
             ClassifierTurn::UserText(text) => format!("User: {text}"),
             ClassifierTurn::AssistantToolUse { tool, args } => format!("{tool} {args}"),
+            ClassifierTurn::PermissionDecision {
+                tool,
+                args,
+                approved,
+            } => {
+                if *approved {
+                    format!(
+                        "The user was asked for permission to run {tool} {args} and approved that request."
+                    )
+                } else {
+                    format!("The user was asked about running {tool} {args} and declined it.")
+                }
+            }
         }
     }
 }
@@ -88,7 +111,8 @@ impl ClassifierTurn {
 /// populates `turns` (compacted) and `project_instructions` (AGENTS.md).
 #[derive(Debug, Clone, Default)]
 pub struct ClassifierContext {
-    /// Recent turns, chronological: user text + assistant tool_use only.
+    /// Recent conversation turns followed by bounded prompted permission
+    /// decisions retained by the permission manager.
     pub turns: Vec<ClassifierTurn>,
     /// Project AGENTS.md ("what the main agent sees"); None when absent.
     pub project_instructions: Option<String>,
@@ -957,6 +981,8 @@ Let it run if everything it does is ordinary development work on this machine: b
 Make it wait if any part reaches beyond the machine or cannot be undone: publishing anything (git push, PR or review edits and comments, posts, messages), opening shells on or changing other machines (SSH sessions, kubectl exec, cluster mutations, production services), rewriting or discarding saved work (rebase, hard reset, force-clean, force-deleting branches or worktrees), extracting credentials or secrets, looking up people's private data (even read-only), destroying files outside scratch space, downloading and running untrusted code, or probing systems for access.
 
 Judge by what the command actually does — not by scary names in paths or strings. If you cannot tell what it does, make it wait.
+
+Decisions the user has already made in this conversation are part of their intent. When they have seen an action and approved it, running it again without asking is fine as long as repeating it changes nothing new beyond this machine; the same goes for tamer steps in the same piece of work. An approval records the user's permission decision, not confirmation that the tool completed. They approved the run they saw, not a standing policy: anything that would set off another event outside this machine — publish again, send again, deploy again — deserves its own ask each time, even when the command is word-for-word what they approved, and nothing riskier than what they approved inherits their yes. When they have declined something, do not wave through that or anything close to it.
 "#;
 
 /// JSON Schema for the classifier's structured output (strict mode), matching the
@@ -1003,6 +1029,20 @@ pub fn mcp_access_detail(name: &str, input: &serde_json::Value) -> String {
     let compact = serde_json::to_string(input).unwrap_or_default();
     xai_grok_tools::util::truncate_line(&format!("{name} {compact}"), MCP_ACCESS_DETAIL_MAX_LEN)
         .into_owned()
+}
+
+/// Maximum rendered argument length retained for one prompted decision turn.
+pub const CLASSIFIER_TURN_MAX_LEN: usize = 400;
+
+/// Render bounded arguments for a prompted permission decision. Bash commands
+/// retain their tool-call JSON shape; other access kinds reuse the detail the
+/// user saw. This records the permission decision only, not tool completion.
+pub fn permission_decision_args(access: &AccessKind, access_detail: Option<&str>) -> String {
+    let raw = match access {
+        AccessKind::Bash(cmd) => serde_json::json!({ "command": cmd }).to_string(),
+        _ => access_detail.unwrap_or("(none)").to_owned(),
+    };
+    xai_grok_tools::util::truncate_str_with_marker(&raw, CLASSIFIER_TURN_MAX_LEN).into_owned()
 }
 
 /// Trailing JSON-shape instruction (omitted for `JustCommand`, where the
@@ -2030,6 +2070,106 @@ mod tests {
         );
         let kept = detail.split(" [... truncated").next().unwrap();
         assert_eq!(kept.chars().count(), MCP_ACCESS_DETAIL_MAX_LEN);
+    }
+
+    #[test]
+    fn permission_decision_render_golden() {
+        let approved = ClassifierTurn::PermissionDecision {
+            tool: "run_terminal_command".into(),
+            args: r#"{"command":"cargo test"}"#.into(),
+            approved: true,
+        };
+        assert_eq!(
+            approved.render(),
+            r#"The user was asked for permission to run run_terminal_command {"command":"cargo test"} and approved that request."#
+        );
+        let declined = ClassifierTurn::PermissionDecision {
+            tool: "run_terminal_command".into(),
+            args: r#"{"command":"git push"}"#.into(),
+            approved: false,
+        };
+        assert_eq!(
+            declined.render(),
+            r#"The user was asked about running run_terminal_command {"command":"git push"} and declined it."#
+        );
+    }
+
+    #[test]
+    fn system_prompt_contains_approval_history_addendum() {
+        assert!(AUTO_MODE_CLASSIFIER_SYSTEM_PROMPT.contains(
+            "Decisions the user has already made in this conversation are part of their intent."
+        ));
+        assert!(AUTO_MODE_CLASSIFIER_SYSTEM_PROMPT.contains(
+            "An approval records the user's permission decision, not confirmation that the tool completed."
+        ));
+        assert!(
+            AUTO_MODE_CLASSIFIER_SYSTEM_PROMPT
+                .contains("even when the command is word-for-word what they approved")
+        );
+        assert!(
+            AUTO_MODE_CLASSIFIER_SYSTEM_PROMPT
+                .contains("When they have declined something, do not wave through")
+        );
+    }
+
+    #[test]
+    fn permission_decision_args_forms_and_cap() {
+        let bash = AccessKind::Bash("ls -la".into());
+        assert_eq!(
+            permission_decision_args(&bash, Some("ls -la")),
+            r#"{"command":"ls -la"}"#
+        );
+        let multiline = AccessKind::Bash("echo a\necho b".into());
+        assert_eq!(
+            permission_decision_args(&multiline, Some("echo a\necho b")),
+            r#"{"command":"echo a\necho b"}"#
+        );
+        let input = serde_json::json!({"q": 1});
+        let detail = mcp_access_detail("linear__list", &input);
+        let mcp = AccessKind::MCPTool {
+            name: "linear__list".into(),
+            input,
+        };
+        assert_eq!(permission_decision_args(&mcp, Some(&detail)), detail);
+        let fetch = AccessKind::WebFetch("https://example.com/x".into());
+        assert_eq!(
+            permission_decision_args(&fetch, Some("https://example.com/x")),
+            "https://example.com/x"
+        );
+        assert_eq!(
+            permission_decision_args(&AccessKind::Read(None), None),
+            "(none)"
+        );
+        let long = "x".repeat(CLASSIFIER_TURN_MAX_LEN * 2);
+        let capped = permission_decision_args(&AccessKind::Bash(long.clone()), Some(&long));
+        assert!(capped.len() <= CLASSIFIER_TURN_MAX_LEN);
+        assert!(capped.ends_with('…'), "cap must be marker-visible");
+    }
+
+    #[test]
+    fn build_classifier_messages_includes_decision_turns() {
+        let ctx = ClassifierContext {
+            turns: vec![
+                ClassifierTurn::UserText("build and test".into()),
+                ClassifierTurn::PermissionDecision {
+                    tool: "run_terminal_command".into(),
+                    args: r#"{"command":"my-build --release"}"#.into(),
+                    approved: true,
+                },
+            ],
+            project_instructions: None,
+        };
+        let msgs = build_classifier_messages(
+            "run_terminal_command",
+            &AccessKind::Bash("my-build --release".into()),
+            Some("my-build --release"),
+            &ctx,
+            ClassifierPromptType::Full,
+        );
+        let last = &msgs.last().unwrap().text;
+        assert!(last.contains(
+            r#"The user was asked for permission to run run_terminal_command {"command":"my-build --release"} and approved that request."#
+        ));
     }
 
     #[test]
