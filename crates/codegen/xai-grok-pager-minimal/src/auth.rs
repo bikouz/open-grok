@@ -1,18 +1,18 @@
-//! Minimal-mode sign-in rendering for the live region.
+//! Minimal-mode sign-in / folder-trust rendering for the live region.
 //!
 //! Before any agent session exists (unauthenticated / folder-trust pending) the
 //! minimal live region shows the sign-in flow itself — device or external-command
-//! flow, a sign-in error, or a brief "starting" transient once authenticated —
-//! since minimal has no welcome screen. [`draw_live`](super::live::draw_live)
-//! computes a [`MinimalAuthHint`] from the app's [`AuthState`] and renders it via
-//! [`render_auth`].
+//! flow, a sign-in error, the folder-trust question, or a brief "starting"
+//! transient once both gates are open — since minimal has no welcome screen.
+
+use std::path::PathBuf;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use xai_grok_pager::app::app_view::{AuthState, PrimaryProvider};
+use xai_grok_pager::app::app_view::{AuthState, PrimaryProvider, TrustState};
 use xai_grok_pager::theme::Theme;
 
 /// What the minimal live region shows when there is no active agent yet: the
@@ -33,6 +33,8 @@ pub(super) enum MinimalAuthHint {
     },
     /// The last sign-in attempt failed; show the error.
     Failed(String),
+    /// Authenticated, but the cwd has untrusted repo-local config.
+    TrustFolder { workspace: PathBuf },
     /// Authenticated — the session is being created (brief transient).
     Starting,
 }
@@ -51,6 +53,18 @@ pub(super) fn minimal_auth_provider(
 pub(super) fn minimal_auth_hint(
     auth: &AuthState,
     primary_provider: PrimaryProvider,
+) -> MinimalAuthHint {
+    minimal_auth_hint_with_trust(auth, primary_provider, &TrustState::Done, true, false)
+}
+
+/// Map auth + trust gates to the minimal live-region surface while preserving
+/// the selected provider label used by the fork's multi-provider onboarding.
+pub(super) fn minimal_auth_hint_with_trust(
+    auth: &AuthState,
+    primary_provider: PrimaryProvider,
+    trust: &TrustState,
+    has_access: bool,
+    is_zdr_blocked: bool,
 ) -> MinimalAuthHint {
     match auth {
         AuthState::ProviderChoice { error } => MinimalAuthHint::ChooseProvider {
@@ -72,8 +86,44 @@ pub(super) fn minimal_auth_hint(
             url: None,
             code: None,
         },
+        AuthState::Done if has_access && !is_zdr_blocked => {
+            if let TrustState::Pending { workspace } = trust {
+                MinimalAuthHint::TrustFolder {
+                    workspace: workspace.clone(),
+                }
+            } else {
+                MinimalAuthHint::Starting
+            }
+        }
         AuthState::Done => MinimalAuthHint::Starting,
     }
+}
+
+/// Rows the no-agent live region needs for `hint` (before path wrap).
+pub(super) fn auth_hint_rows(hint: &MinimalAuthHint, width: u16) -> u16 {
+    match hint {
+        MinimalAuthHint::ChooseProvider { error } => 5 + u16::from(error.is_some()),
+        MinimalAuthHint::SigningIn { url: None, .. } => 3,
+        MinimalAuthHint::SigningIn {
+            url: Some(url),
+            code,
+            ..
+        } => {
+            let code_rows = if code.is_some() { 2 } else { 0 };
+            3 + wrapped_char_rows(url, width) + code_rows + 2
+        }
+        MinimalAuthHint::Failed(_) => 3,
+        MinimalAuthHint::TrustFolder { workspace } => {
+            1 + wrapped_char_rows(&workspace.display().to_string(), width) + 1 + 2 + 1 + 2 + 1 + 1
+        }
+        MinimalAuthHint::Starting => 1,
+    }
+}
+
+fn wrapped_char_rows(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let chars = text.chars().filter(|c| !c.is_control()).count();
+    chars.max(1).div_ceil(width) as u16
 }
 
 /// Parse the device-flow `user_code` from a verification URL (`None` if absent
@@ -300,6 +350,73 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
                 Line::from(Span::styled(err.clone(), gray)),
             );
         }
+        MinimalAuthHint::TrustFolder { workspace } => {
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled(
+                    "Do you trust the contents of this directory?",
+                    bold,
+                )),
+            );
+            y = render_url(
+                buf,
+                area,
+                y,
+                bottom,
+                &workspace.display().to_string(),
+                Style::default().fg(theme.accent_user).bg(Color::Reset),
+            );
+            y = put_line(buf, area, y, bottom, Line::default());
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled(
+                    "Open Grok may run or modify contents in this directory,",
+                    gray,
+                )),
+            );
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled("posing security risks.", gray)),
+            );
+            y = put_line(buf, area, y, bottom, Line::default());
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(vec![
+                    Span::styled("y", bold),
+                    Span::styled("  Yes, proceed", gray),
+                ]),
+            );
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(vec![
+                    Span::styled("n", bold),
+                    Span::styled("  No, quit", gray),
+                ]),
+            );
+            y = put_line(buf, area, y, bottom, Line::default());
+            let _ = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled("Enter or y to trust · n or Esc to quit", gray)),
+            );
+        }
         MinimalAuthHint::Starting => {
             let _ = put_line(
                 buf,
@@ -409,6 +526,72 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pending_folder_trust_is_shown_after_auth_without_losing_provider_routing() {
+        let trust = TrustState::Pending {
+            workspace: PathBuf::from("/tmp/untrusted-repo"),
+        };
+        assert!(matches!(
+            minimal_auth_hint_with_trust(
+                &AuthState::Done,
+                PrimaryProvider::Xai,
+                &trust,
+                true,
+                false,
+            ),
+            MinimalAuthHint::TrustFolder { workspace }
+                if workspace == PathBuf::from("/tmp/untrusted-repo")
+        ));
+        assert!(matches!(
+            minimal_auth_hint_with_trust(
+                &AuthState::Done,
+                PrimaryProvider::Xai,
+                &trust,
+                false,
+                false,
+            ),
+            MinimalAuthHint::Starting
+        ));
+        assert!(matches!(
+            minimal_auth_hint_with_trust(
+                &AuthState::Done,
+                PrimaryProvider::Xai,
+                &trust,
+                true,
+                true,
+            ),
+            MinimalAuthHint::Starting
+        ));
+    }
+
+    #[test]
+    fn render_auth_shows_folder_trust_question() {
+        let theme = Theme::current();
+        let area = Rect::new(0, 0, 80, 14);
+        let mut buf = Buffer::empty(area);
+        render_auth(
+            &mut buf,
+            area,
+            &theme,
+            &MinimalAuthHint::TrustFolder {
+                workspace: PathBuf::from("/home/agent/project"),
+            },
+        );
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+        }
+        assert!(text.contains("Do you trust the contents of this directory?"));
+        assert!(text.contains("/home/agent/project"));
+        assert!(text.contains("Open Grok may run or modify contents"));
+        assert!(text.contains("Yes, proceed"));
+        assert!(text.contains("No, quit"));
     }
 
     #[test]

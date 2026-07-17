@@ -107,6 +107,15 @@ static MINIMAL_AUTO_SET_FOR_MOUSE_LEAK: AtomicBool = AtomicBool::new(false);
 pub fn minimal_auto_set_for_mouse_leak() -> bool {
     MINIMAL_AUTO_SET_FOR_MOUSE_LEAK.load(Ordering::Acquire)
 }
+/// Set after a `/minimal` re-exec that actually stayed minimal (idle-status cue).
+static MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+pub fn minimal_show_switch_back_to_fullscreen() -> bool {
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.load(Ordering::Acquire)
+}
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_minimal_show_switch_back_to_fullscreen_for_test(on: bool) {
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.store(on, Ordering::Release);
+}
 /// Whether startup actually applied a forced cursor style. Teardown (and the
 /// panic hook, which can't thread parameters) resets the style only when
 /// true: under inherit, `0 q` would clobber a shell-chosen style.
@@ -159,6 +168,10 @@ pub(crate) static VOICE_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Read the cached voice-mode gate (see [`VOICE_MODE_ENABLED`]).
 pub(crate) fn voice_mode_enabled() -> bool {
     VOICE_MODE_ENABLED.load(Ordering::Acquire)
+}
+/// Test helper for the process-global voice gate.
+pub fn set_voice_mode_enabled_for_test(on: bool) {
+    VOICE_MODE_ENABLED.store(on, Ordering::Release);
 }
 /// Resolve whether voice mode is enabled from layered sources.
 ///
@@ -604,24 +617,9 @@ pub async fn run(
         screen_mode.is_minimal() && explicit_minimal.is_none() && screen_mode_override.is_none(),
         Ordering::Release,
     );
-    if args.minimal || args.fullscreen {
-        let want = if args.minimal {
-            "minimal"
-        } else {
-            "fullscreen"
-        };
-        if config_screen_mode != Some(want) {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    xai_grok_shell::util::config::set_screen_mode(want.to_string()).await
-                {
-                    tracing::warn!("failed to persist screen mode preference: {e}");
-                }
-            });
-        }
-    }
     let minimal = screen_mode.is_minimal();
     let relaunched_into_minimal = screen_mode_override == Some(ScreenMode::Minimal);
+    let relaunched_into_fullscreen = screen_mode_override == Some(ScreenMode::Fullscreen);
     tracing::info!(
         use_alt_screen = screen_mode.is_fullscreen(), minimal = screen_mode.is_minimal(),
         mouse_capture = ! screen_mode.is_minimal(), minimal_live_rows = config_watcher
@@ -643,6 +641,10 @@ pub async fn run(
         writer_sync,
         cursor_blink,
     )?;
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.store(
+        relaunched_into_minimal && screen_mode.is_minimal(),
+        Ordering::Release,
+    );
     apply_screen_mode_globals(screen_mode);
     finish_theme_after_probe(minimal, screen_mode);
     if let Some(ref t) = session_title {
@@ -660,6 +662,7 @@ pub async fn run(
         is_control_mode,
         screen_mode,
         relaunched_into_minimal,
+        relaunched_into_fullscreen,
         initial_theme: crate::theme::cache::current_kind(),
     };
     let result = event_loop::run(

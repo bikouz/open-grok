@@ -692,16 +692,14 @@ pub struct PagerArgs {
     /// Experimental: scrollback-native rendering. Finalized blocks are printed
     /// into the terminal's native scrollback (use the terminal's own scroll /
     /// selection); a small pinned region holds the prompt + running turn.
-    /// Sticky: records `[ui] screen_mode = "minimal"` in ~/.opengrok/config.toml
-    /// so future plain `open-grok` invocations open in minimal mode too.
+    /// Session-scoped only — does not write config. To default plain `open-grok`
+    /// to minimal, set `[ui] screen_mode = "minimal"` in ~/.opengrok/config.toml.
     #[arg(long = "minimal")]
     pub minimal: bool,
-    /// Open in the standard fullscreen TUI, overriding a sticky minimal
-    /// preference. Sticky counterpart of --minimal: records
-    /// `[ui] screen_mode = "fullscreen"` in ~/.opengrok/config.toml so future
-    /// plain `open-grok` invocations open fullscreen again. Fullscreen-vs-inline
-    /// still follows the alt-screen policy (--no-alt-screen, [terminal]
-    /// alt_screen, terminal auto-detection).
+    /// Open in the standard fullscreen TUI for this session, overriding a
+    /// config `[ui] screen_mode = "minimal"` preference. Session-scoped only —
+    /// does not write config. Fullscreen-vs-inline still follows the alt-screen
+    /// policy (--no-alt-screen, [terminal] alt_screen, terminal auto-detection).
     #[arg(long = "fullscreen", conflicts_with = "minimal")]
     pub fullscreen: bool,
     /// Write sampling events to ~/.opengrok/logs/sampling.jsonl.

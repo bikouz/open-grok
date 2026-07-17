@@ -954,6 +954,8 @@ pub struct AppView {
     pub yolo_policy_block: Option<&'static str>,
     /// One-shot notice that a launch `--yolo` was pinned off; shown on the first agent view.
     pub yolo_launch_block_notice: Option<&'static str>,
+    /// One-shot switch-back toast after a screen-mode re-exec.
+    pub screen_mode_switch_hint: Option<&'static str>,
     /// Require explicit plan approval via the plan viewer UI even in
     /// always-approve (YOLO) mode. Loaded from `[ui] require_plan_approval`
     /// in config.toml at startup.
@@ -1511,6 +1513,7 @@ impl AppView {
             auto_mode_gate: xai_grok_shell::util::config::auto_permission_mode_enabled_from_disk(),
             yolo_policy_block: None,
             yolo_launch_block_notice: None,
+            screen_mode_switch_hint: None,
             require_plan_approval: false,
             plan_mode: false,
             subagents: false,
@@ -5583,6 +5586,7 @@ pub(crate) mod tests {
             auto_mode_gate: true,
             yolo_policy_block: None,
             yolo_launch_block_notice: None,
+            screen_mode_switch_hint: None,
             require_plan_approval: false,
             plan_mode: false,
             subagents: false,
@@ -6226,7 +6230,8 @@ pub(crate) mod tests {
                 screen_row: 2,
                 col_start: 0,
                 col_end: 10,
-                url: Arc::from("https://example.com"),
+                target: crate::render::osc8::LinkTarget::Url(Arc::from("https://example.com")),
+                presentation: crate::render::osc8::LinkPresentation::Opaque,
                 id: Some(1),
             });
             agent.visible_link_map.rebuild(1, &overlay, vec![]);

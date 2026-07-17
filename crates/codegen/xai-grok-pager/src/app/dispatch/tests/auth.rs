@@ -1,6 +1,7 @@
 //! Tests for login, logout, account switching, and auth-code dispatchers.
 
 use super::*;
+use crate::app::actions::ProviderSessionTarget;
 
 fn add_provider_model(app: &mut AppView, model: &str, provider: &str) -> acp::ModelId {
     let model_id = acp::ModelId::new(model.to_string());
