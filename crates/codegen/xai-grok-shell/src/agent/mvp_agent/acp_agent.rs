@@ -3424,6 +3424,20 @@ impl acp::Agent for MvpAgent {
             )),
             "open-grok/kimi/endpoint/apply" => {
                 let params = crate::extensions::parse_params::<KimiEndpointApplyParams>(&args)?;
+                // Kimi credentials are captured in each child sampler at
+                // spawn. Stop resident Kimi children (and every initializing
+                // child whose provider is not resolved yet) before mutating
+                // the live service so no later child turn can use stale auth.
+                let cancelled_subagents = self
+                    .subagent_coordinator
+                    .borrow_mut()
+                    .cancel_for_kimi_runtime_change();
+                if cancelled_subagents > 0 {
+                    tracing::warn!(
+                        cancelled_subagents,
+                        "cancelled subagents before Kimi runtime credential change"
+                    );
+                }
                 let refreshed = self
                     .models_manager
                     .apply_kimi_endpoint(params.endpoint)

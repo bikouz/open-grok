@@ -1140,6 +1140,7 @@ fn dummy_tracker(
         child_cwd: String::new(),
         worktree_path: None,
         effective_model_id: String::new(),
+        effective_provider: xai_grok_sampling_types::ModelProvider::Xai,
         run_in_background: false,
         surface_completion: true,
         color: None,
@@ -1147,6 +1148,191 @@ fn dummy_tracker(
         explicitly_killed: false,
     }
 }
+
+#[tokio::test]
+async fn kimi_runtime_change_cancels_kimi_and_initializing_children_only() {
+    let mut coordinator = SubagentCoordinator::new();
+    let mut kimi = dummy_tracker("sub-kimi", "session-A", "explore", "kimi task");
+    kimi.effective_provider = xai_grok_sampling_types::ModelProvider::Kimi;
+    let kimi_cancel = kimi.cancel_token.clone();
+    let (kimi_cmd_tx, mut kimi_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    kimi.child_handle.cmd_tx = kimi_cmd_tx;
+    let xai = dummy_tracker("sub-xai", "session-A", "explore", "xai task");
+    let xai_cancel = xai.cancel_token.clone();
+    coordinator.insert(kimi);
+    coordinator.insert(xai);
+
+    let pending_cancel = tokio_util::sync::CancellationToken::new();
+    coordinator.insert_pending(PendingSubagent {
+        subagent_id: "sub-pending".to_owned(),
+        subagent_type: "explore".to_owned(),
+        description: "initializing task".to_owned(),
+        persona: None,
+        parent_prompt_id: None,
+        parent_session_id: "session-A".to_owned(),
+        started_at: std::time::Instant::now(),
+        run_in_background: false,
+        surface_completion: true,
+        color: None,
+        cancel_token: pending_cancel.clone(),
+    });
+
+    assert_eq!(coordinator.cancel_for_kimi_runtime_change(), 2);
+    assert!(kimi_cancel.is_cancelled());
+    assert!(pending_cancel.is_cancelled());
+    assert!(!xai_cancel.is_cancelled());
+    assert!(matches!(
+        kimi_cmd_rx.try_recv(),
+        Ok(SessionCommand::Cancel { .. })
+    ));
+    assert!(matches!(
+        kimi_cmd_rx.try_recv(),
+        Ok(SessionCommand::Shutdown)
+    ));
+}
+
+#[test]
+fn cancelled_pending_guard_records_cancelled_not_failed() {
+    let coordinator = std::cell::RefCell::new(SubagentCoordinator::new());
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    coordinator.borrow_mut().insert_pending(PendingSubagent {
+        subagent_id: "sub-cancelled-init".to_owned(),
+        subagent_type: "explore".to_owned(),
+        description: "initializing task".to_owned(),
+        persona: None,
+        parent_prompt_id: None,
+        parent_session_id: "session-A".to_owned(),
+        started_at: std::time::Instant::now(),
+        run_in_background: false,
+        surface_completion: true,
+        color: None,
+        cancel_token: cancel_token.clone(),
+    });
+
+    {
+        let _guard = PendingGuard {
+            coordinator: &coordinator,
+            id: "sub-cancelled-init".to_owned(),
+            defused: false,
+            error: Some("stale Kimi credential".to_owned()),
+            cancel_token: cancel_token.clone(),
+        };
+        cancel_token.cancel();
+    }
+
+    let lookup = coordinator.borrow().lookup("sub-cancelled-init");
+    assert!(matches!(
+        lookup,
+        Some(SnapshotLookup::Ready(ref snapshot))
+            if matches!(snapshot.status, SubagentSnapshotStatus::Cancelled { .. })
+    ));
+}
+
+fn kimi_test_entry(
+    model_id: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> crate::agent::config::ModelEntry {
+    let mut entry = crate::agent::config::ModelEntry::fallback(
+        model_id,
+        &crate::agent::config::EndpointsConfig::default(),
+    );
+    entry.info.model = model_id.to_owned();
+    entry.info.base_url = base_url.to_owned();
+    entry.info.provider = xai_grok_sampling_types::ModelProvider::Kimi;
+    entry.api_key = api_key.map(str::to_owned);
+    entry.env_key = None;
+    entry
+}
+
+fn ctx_with_live_models(
+    models: indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
+    current: &str,
+) -> SubagentSpawnContext {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models,
+        acp::ModelId::new(current),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    ctx
+}
+
+#[test]
+fn kimi_subagent_spawn_refresh_uses_live_replacement_key() {
+    let model_id = acp::ModelId::new("kimi-test");
+    let entry = kimi_test_entry(
+        model_id.0.as_ref(),
+        crate::kimi_models::KIMI_CODE_API_BASE_URL,
+        Some("new-key"),
+    );
+    let ctx = ctx_with_live_models(
+        indexmap::IndexMap::from([(model_id.0.to_string(), entry)]),
+        model_id.0.as_ref(),
+    );
+    let mut config = ctx.sampling_config.clone();
+    config.provider = xai_grok_sampling_types::ModelProvider::Kimi;
+    config.api_key = Some("old-key".to_owned());
+    config.base_url = crate::kimi_models::KIMI_CODE_API_BASE_URL.to_owned();
+    config.model = model_id.0.to_string();
+
+    refresh_kimi_sampling_config_for_spawn(&mut config, &model_id, &ctx).unwrap();
+
+    assert_eq!(config.api_key.as_deref(), Some("new-key"));
+    assert_eq!(config.base_url, crate::kimi_models::KIMI_CODE_API_BASE_URL);
+}
+
+#[test]
+fn kimi_subagent_spawn_refresh_fails_when_service_removed_old_model() {
+    let old_model = acp::ModelId::new("kimi-k3");
+    let code_model = acp::ModelId::new("kimi-for-coding");
+    let entry = kimi_test_entry(
+        code_model.0.as_ref(),
+        crate::kimi_models::KIMI_CODE_API_BASE_URL,
+        Some("code-key"),
+    );
+    let ctx = ctx_with_live_models(
+        indexmap::IndexMap::from([(code_model.0.to_string(), entry)]),
+        code_model.0.as_ref(),
+    );
+    let mut config = ctx.sampling_config.clone();
+    config.provider = xai_grok_sampling_types::ModelProvider::Kimi;
+    config.api_key = Some("old-platform-key".to_owned());
+    config.model = old_model.0.to_string();
+
+    let error = refresh_kimi_sampling_config_for_spawn(&mut config, &old_model, &ctx)
+        .expect_err("removed Platform model must not keep its old credential");
+
+    assert!(error.contains("no longer available"), "got: {error}");
+    assert_eq!(config.api_key.as_deref(), Some("old-platform-key"));
+}
+
+#[test]
+fn kimi_subagent_spawn_refresh_fails_without_a_live_key() {
+    let model_id = acp::ModelId::new("kimi-custom");
+    let entry = kimi_test_entry(
+        model_id.0.as_ref(),
+        "https://kimi.invalid/v1",
+        None,
+    );
+    let ctx = ctx_with_live_models(
+        indexmap::IndexMap::from([(model_id.0.to_string(), entry)]),
+        model_id.0.as_ref(),
+    );
+    let mut config = ctx.sampling_config.clone();
+    config.provider = xai_grok_sampling_types::ModelProvider::Kimi;
+    config.api_key = Some("revoked-key".to_owned());
+    config.model = model_id.0.to_string();
+
+    let error = refresh_kimi_sampling_config_for_spawn(&mut config, &model_id, &ctx)
+        .expect_err("cleared credential must fail closed");
+
+    assert!(error.contains("API key is required"), "got: {error}");
+    assert_eq!(config.api_key.as_deref(), Some("revoked-key"));
+}
+
 #[tokio::test]
 async fn active_summaries_for_filters_by_parent_session_id() {
     let mut coordinator = SubagentCoordinator::new();

@@ -80,6 +80,9 @@ pub(crate) struct SubagentTracker {
     pub worktree_path: Option<PathBuf>,
     /// Effective model ID used by the child session.
     pub effective_model_id: String,
+    /// Provider resolved for the child's live sampler. Kept separately from
+    /// the model ID so credential revocation never relies on slug heuristics.
+    pub effective_provider: xai_grok_sampling_types::ModelProvider,
     /// Whether the subagent was launched with `run_in_background: true`.
     pub run_in_background: bool,
     /// Mirrors `SubagentRequest::surface_completion`.
@@ -1110,6 +1113,65 @@ fn resolve_model_override_to_config(
     );
     Some((config, canonical_model_id))
 }
+/// Re-resolve a Kimi child's endpoint and credential immediately before its
+/// sampling client is built.
+///
+/// `SubagentSpawnContext.available_models` is intentionally a launch snapshot.
+/// The endpoint/key settings flow can mutate the resident model manager while
+/// earlier spawn setup awaits filesystem work, so using only that snapshot
+/// could resurrect a credential that was just replaced or cleared. Non-Kimi
+/// providers retain their existing snapshot semantics.
+fn refresh_kimi_sampling_config_for_spawn(
+    config: &mut xai_grok_sampler::SamplerConfig,
+    model_id: &acp::ModelId,
+    ctx: &SubagentSpawnContext,
+) -> Result<(), String> {
+    use crate::agent::config::{resolve_credentials, sampling_config_for_model};
+    use xai_grok_sampling_types::ModelProvider;
+
+    if config.provider != ModelProvider::Kimi {
+        return Ok(());
+    }
+
+    let live_models = ctx.models_manager.models();
+    let entry = crate::agent::config::find_model_by_id(&live_models, model_id.0.as_ref())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "Kimi service changed while subagent was starting; model '{}' is no longer available",
+                model_id.0
+            )
+        })?;
+    if entry.info().provider != ModelProvider::Kimi {
+        return Err("Kimi service changed while subagent was starting".to_owned());
+    }
+
+    let mut credentials = resolve_credentials(&entry, None);
+    credentials.auth_type = xai_chat_state::AuthType::ApiKey;
+    let mut refreshed = sampling_config_for_model(
+        &entry,
+        credentials,
+        ctx.alpha_test_key.clone(),
+        ctx.sampling_config.client_version.clone(),
+        ctx.sampling_config.deployment_id.clone(),
+        ctx.sampling_config.user_id.clone(),
+    );
+    if refreshed
+        .api_key
+        .as_deref()
+        .is_none_or(|key| key.trim().is_empty())
+    {
+        return Err(format!(
+            "{} API key is required before starting this Kimi subagent",
+            crate::kimi_models::effective_endpoint(ctx.models_manager.kimi_endpoint())
+        ));
+    }
+    if config.reasoning_effort.is_some() {
+        refreshed.reasoning_effort = config.reasoning_effort;
+    }
+    *config = refreshed;
+    Ok(())
+}
 /// Leading items to preserve across compaction on resume: the System head only, so the
 /// resumed body (the child's own work) stays compactable. Returns 0 when there's no
 /// leading System; the spawn path then inserts one and bumps the prefix to 1.
@@ -1509,8 +1571,9 @@ async fn bootstrap_initial_context(
         verbatim_fork: false,
     })
 }
-/// Drop guard that moves a pending coordinator entry to completed-as-failed
-/// on early return. Call `defuse()` after promoting to active.
+/// Drop guard that moves a pending coordinator entry to its terminal state on
+/// early return. Settings/runtime cancellation must remain distinguishable
+/// from initialization failure. Call `defuse()` after promoting to active.
 struct PendingGuard<'a> {
     coordinator: &'a std::cell::RefCell<SubagentCoordinator>,
     id: String,
@@ -1518,6 +1581,7 @@ struct PendingGuard<'a> {
     /// Specific error message set by fail_subagent before returning.
     /// Falls back to a generic message if unset.
     error: Option<String>,
+    cancel_token: CancellationToken,
 }
 impl PendingGuard<'_> {
     fn defuse(mut self) {
@@ -1534,9 +1598,12 @@ impl Drop for PendingGuard<'_> {
                 .error
                 .take()
                 .unwrap_or_else(|| "Subagent failed during initialization".to_string());
-            self.coordinator
-                .borrow_mut()
-                .move_pending_to_failed(&self.id, &error);
+            let mut coordinator = self.coordinator.borrow_mut();
+            if self.cancel_token.is_cancelled() {
+                coordinator.move_pending_to_cancelled(&self.id, "Subagent was cancelled");
+            } else {
+                coordinator.move_pending_to_failed(&self.id, &error);
+            }
         }
     }
 }

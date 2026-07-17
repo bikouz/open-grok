@@ -117,6 +117,7 @@ pub(crate) async fn handle_subagent_request(
         id: request.id.clone(),
         defused: false,
         error: None,
+        cancel_token: cancel_token.clone(),
     };
     resolve_subagent_toolset(
         &request.subagent_type,
@@ -556,6 +557,16 @@ pub(crate) async fn handle_subagent_request(
             return;
         }
     };
+    if let Err(error) = refresh_kimi_sampling_config_for_spawn(
+        &mut effective_sampling_config,
+        &effective_model_id,
+        &ctx,
+    ) {
+        pending_guard.set_error(error.clone());
+        send_failure(request, &error);
+        return;
+    }
+    let tracker_provider = effective_sampling_config.provider;
     let verbatim_mirror_fork = context_source == InitialContextSource::Forked
         && context_verbatim_fork;
     let task_prompt_text = prompt.clone();
@@ -1310,6 +1321,7 @@ pub(crate) async fn handle_subagent_request(
             child_cwd: tracker_child_cwd,
             worktree_path: worktree_path.clone(),
             effective_model_id: tracker_model_id,
+            effective_provider: tracker_provider,
             run_in_background,
             surface_completion: request.surface_completion,
             color: tracker_color,

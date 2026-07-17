@@ -469,6 +469,30 @@ impl SubagentCoordinator {
             }
         }
     }
+    /// Stop every child that could retain a stale Kimi endpoint or key.
+    ///
+    /// Active children carry an explicit provider identity. Initializing
+    /// children are all cancelled because their spawn context is a snapshot
+    /// captured before the runtime mutation and does not yet expose a safely
+    /// resolved provider. The promote checkpoint shuts a cancelled child down
+    /// before its first prompt reaches inference.
+    pub fn cancel_for_kimi_runtime_change(&mut self) -> usize {
+        let mut ids = self
+            .active
+            .values()
+            .filter(|tracker| {
+                tracker.effective_provider == xai_grok_sampling_types::ModelProvider::Kimi
+            })
+            .map(|tracker| tracker.subagent_id.clone())
+            .collect::<Vec<_>>();
+        ids.extend(self.pending.keys().cloned());
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            let _ = self.cancel_with_outcome(id);
+        }
+        ids.len()
+    }
     /// Attempt to cancel a subagent. Returns a typed outcome covering all cases:
     /// - Active → cancel it, return Cancelled
     /// - Pending (initializing) → fire its spawn token, return Cancelled
