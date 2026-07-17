@@ -4,7 +4,7 @@ Instructions for AI coding agents (and humans) working in this repository.
 
 **Product:** Open Grok (`open-grok`) — community fork of [Grok Build](https://github.com/xai-org/grok-build) with ChatGPT Codex, multi-provider support, and Code Mode.  
 **Version file:** [`OPEN_GROK_VERSION`](OPEN_GROK_VERSION)  
-**Deeper docs:** [`docs/agents/`](docs/agents/) · fork contracts: [`docs/`](docs/) · repo skills: [`.opengrok/skills/`](.opengrok/skills/) · end-user guide: [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
+**Deeper docs:** [`docs/agents/`](docs/agents/) · fork contracts: [`docs/`](docs/) · repo skills: [`.agents/skills/`](.agents/skills/) · end-user guide: [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
 
 ---
 
@@ -155,11 +155,11 @@ After any non-xAI profile that denies xAI services, the session export boundary 
 
 | Repeated task | Repo skill |
 | --- | --- |
-| Build or change this checkout | [`develop-open-grok`](.opengrok/skills/develop-open-grok/SKILL.md) |
-| Add/change provider, model, auth, or wire behavior | [`change-open-grok-provider`](.opengrok/skills/change-open-grok-provider/SKILL.md) |
-| Prove compaction, resume, or subagent persistence | [`verify-open-grok-session`](.opengrok/skills/verify-open-grok-session/SKILL.md) |
-| Build and publish a macOS release | [`release-open-grok`](.opengrok/skills/release-open-grok/SKILL.md) |
-| Compare or replay an upstream snapshot | [`sync-open-grok-upstream`](.opengrok/skills/sync-open-grok-upstream/SKILL.md) |
+| Build or change this checkout | [`develop-open-grok`](.agents/skills/develop-open-grok/SKILL.md) |
+| Add/change provider, model, auth, or wire behavior | [`change-open-grok-provider`](.agents/skills/change-open-grok-provider/SKILL.md) |
+| Prove compaction, resume, or subagent persistence | [`verify-open-grok-session`](.agents/skills/verify-open-grok-session/SKILL.md) |
+| Build and publish a macOS release | [`release-open-grok`](.agents/skills/release-open-grok/SKILL.md) |
+| Compare or replay an upstream snapshot | [`sync-open-grok-upstream`](.agents/skills/sync-open-grok-upstream/SKILL.md) |
 
 ### 5.2 While coding
 
@@ -224,7 +224,7 @@ cargo build --locked -p xai-grok-pager-bin --bin open-grok
 ./bin/open-grok-dev agent stdio
 ```
 
-Release (Apple Silicon, clean tree): `./scripts/build-macos-release.sh` reads `OPEN_GROK_VERSION`. The builder requires the pinned arm64 `ripgrep 15.0.0` through `GROK_TOOLS_BUNDLE_RG_PATH`; do not substitute a newer Homebrew binary. Use [`release-open-grok`](.opengrok/skills/release-open-grok/SKILL.md) for the publication and installer-verification sequence.
+Release (Apple Silicon, clean tree): `./scripts/build-macos-release.sh` reads `OPEN_GROK_VERSION`. The builder requires the pinned arm64 `ripgrep 15.0.0` through `GROK_TOOLS_BUNDLE_RG_PATH`; do not substitute a newer Homebrew binary. Use [`release-open-grok`](.agents/skills/release-open-grok/SKILL.md) for the publication and installer-verification sequence.
 
 ---
 
