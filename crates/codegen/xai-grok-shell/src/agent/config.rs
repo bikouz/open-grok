@@ -986,6 +986,9 @@ pub struct DiagnosticsConfig {
 pub struct ModelsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// Selected Kimi service. Platform is the migration-compatible default;
+    /// Code has an independent endpoint, credential, and embedded catalog.
+    pub kimi_endpoint: crate::kimi_models::KimiApiEndpoint,
     /// The pre-campaign `models.default` (merged user/managed/requirements)
     /// captured when a campaign is overriding the default, so model resolution can
     /// recover if the campaign points at a model missing from the catalog. `None`
@@ -3271,7 +3274,8 @@ pub fn resolve_model_list_with_provider_catalogs(
     kimi_authoritative: bool,
 ) -> IndexMap<String, ModelEntry> {
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
-    let defaults = default_model_entries(&cfg.endpoints);
+    let defaults =
+        default_model_entries_for_kimi_endpoint(&cfg.endpoints, cfg.models.kimi_endpoint);
     if cfg.endpoints.has_custom_endpoint() {
         tracing::info!(
             models_base_url = ? cfg.endpoints.models_base_url, models_list_url = ? cfg
@@ -3370,12 +3374,15 @@ pub fn resolve_model_list_with_provider_catalogs(
         ModelProvider::Codex,
         codex_authoritative,
     );
+    let kimi_live_discovery_enabled =
+        crate::kimi_models::effective_endpoint(cfg.models.kimi_endpoint)
+            == crate::kimi_models::KimiApiEndpoint::Platform;
     merge_remote_provider_partition(
         &mut resolved,
         &defaults,
-        kimi_remote,
+        kimi_live_discovery_enabled.then_some(kimi_remote).flatten(),
         ModelProvider::Kimi,
-        kimi_authoritative,
+        kimi_live_discovery_enabled && kimi_authoritative,
     );
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
@@ -3523,7 +3530,17 @@ fn apply_global_scalar_defaults(
 }
 /// Built-in default models. Prefer `resolve_model_list()`.
 pub fn default_model_entries(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntry> {
-    default_models(endpoints)
+    default_model_entries_for_kimi_endpoint(
+        endpoints,
+        crate::kimi_models::KimiApiEndpoint::Platform,
+    )
+}
+
+pub fn default_model_entries_for_kimi_endpoint(
+    endpoints: &EndpointsConfig,
+    kimi_endpoint: crate::kimi_models::KimiApiEndpoint,
+) -> IndexMap<String, ModelEntry> {
+    default_models(endpoints, kimi_endpoint)
         .into_iter()
         .map(|(key, entry)| (key, ModelEntry::from_config_entry(&entry)))
         .collect()
@@ -3599,7 +3616,10 @@ struct DefaultModelJson {
     #[serde(default)]
     show_model_fingerprint: bool,
 }
-fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryConfig> {
+fn default_models(
+    endpoints: &EndpointsConfig,
+    configured_kimi_endpoint: crate::kimi_models::KimiApiEndpoint,
+) -> IndexMap<String, ModelEntryConfig> {
     let root: serde_json::Value = serde_json::from_str(crate::models::DEFAULT_MODELS_JSON)
         .expect("default_models.json: invalid JSON");
     let entries: Vec<DefaultModelJson> = serde_json::from_value(
@@ -3612,14 +3632,27 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
         count = entries.len(),
         "loaded default models from embedded JSON"
     );
+    let kimi_endpoint = crate::kimi_models::effective_endpoint(configured_kimi_endpoint);
+    let kimi_base_url = crate::kimi_models::api_base_url(kimi_endpoint);
     entries
         .into_iter()
-        .map(|m| {
+        .filter_map(|mut m| {
             assert!(
                 !m.model.is_empty(),
                 "default_models.json: entry id={:?} has empty `model` field",
                 m.id
             );
+            if m.provider == ModelProvider::Kimi {
+                let embedded_endpoint = m
+                    .base_url
+                    .as_deref()
+                    .and_then(crate::kimi_models::endpoint_for_base_url);
+                if embedded_endpoint != Some(kimi_endpoint) {
+                    return None;
+                }
+                m.base_url = Some(kimi_base_url.clone());
+                m.env_key = Some(EnvKeys::single(kimi_endpoint.api_key_env()));
+            }
             let key = m.id.clone().unwrap_or_else(|| m.model.clone());
             let context_window = m
                 .context_window
@@ -3696,7 +3729,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 stream_tool_calls: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
-            (key, config)
+            Some((key, config))
         })
         .collect()
 }
@@ -4287,14 +4320,25 @@ impl ModelEntry {
     /// provider's trusted endpoint; explicit per-model BYOK remains valid for
     /// custom endpoints.
     pub fn has_usable_provider_credentials(&self) -> bool {
-        self.has_own_credentials()
-            || (trusted_built_in_session_endpoint(self.info.provider, &self.info.base_url)
-                && self.info.provider.profile().session_auth.is_api_key_only()
-                && crate::auth::read_provider_api_key(
-                    &crate::util::grok_home::grok_home(),
-                    self.info.provider,
-                )
-                .is_some())
+        if self.has_own_credentials() {
+            return true;
+        }
+        if !self.info.provider.profile().session_auth.is_api_key_only() {
+            return false;
+        }
+        if self.info.provider.is_kimi() {
+            return crate::kimi_models::endpoint_for_base_url(&self.info.base_url)
+                .and_then(|endpoint| {
+                    crate::auth::read_kimi_api_key(&crate::util::grok_home::grok_home(), endpoint)
+                })
+                .is_some();
+        }
+        trusted_built_in_session_endpoint(self.info.provider, &self.info.base_url)
+            && crate::auth::read_provider_api_key(
+                &crate::util::grok_home::grok_home(),
+                self.info.provider,
+            )
+            .is_some()
     }
 }
 impl std::ops::Deref for ModelEntry {
@@ -4715,14 +4759,23 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
     } else {
         match info.provider.profile().session_auth {
             xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
-                let stored = trusted_built_in_session_endpoint(info.provider, &info.base_url)
-                    .then(|| {
-                        crate::auth::read_provider_api_key(
+                let stored = if info.provider.is_kimi() {
+                    crate::kimi_models::endpoint_for_base_url(&info.base_url).and_then(|endpoint| {
+                        crate::auth::read_kimi_api_key(
                             &crate::util::grok_home::grok_home(),
-                            info.provider,
+                            endpoint,
                         )
                     })
-                    .flatten();
+                } else {
+                    trusted_built_in_session_endpoint(info.provider, &info.base_url)
+                        .then(|| {
+                            crate::auth::read_provider_api_key(
+                                &crate::util::grok_home::grok_home(),
+                                info.provider,
+                            )
+                        })
+                        .flatten()
+                };
                 if stored.is_none()
                     && let Some(ref env_keys) = model.env_key
                     && !env_keys.is_empty()
@@ -12082,7 +12135,9 @@ default = "grok-4.5"
 
     #[test]
     fn embedded_kimi_model_uses_chat_and_provider_owned_credentials() {
-        let defaults = default_model_entries(&EndpointsConfig::default());
+        let mut cfg = Config::default();
+        cfg.models.kimi_endpoint = crate::kimi_models::KimiApiEndpoint::Platform;
+        let defaults = resolve_model_list(&cfg, None);
         let entry = defaults.get("kimi-k3").expect("embedded Kimi K3");
 
         assert_eq!(entry.info.provider, ModelProvider::Kimi);
@@ -12094,6 +12149,46 @@ default = "grok-4.5"
         assert_eq!(
             entry.env_key.as_ref().and_then(EnvKeys::primary),
             Some(crate::kimi_models::KIMI_API_KEY_ENV)
+        );
+        assert!(!defaults.contains_key("kimi-for-coding"));
+        assert!(!defaults.contains_key("kimi-for-coding-highspeed"));
+    }
+
+    #[test]
+    fn embedded_kimi_code_catalog_is_selected_as_one_isolated_partition() {
+        let defaults = default_model_entries_for_kimi_endpoint(
+            &EndpointsConfig::default(),
+            crate::kimi_models::KimiApiEndpoint::Code,
+        );
+
+        assert!(!defaults.contains_key("kimi-k3"));
+        for slug in ["kimi-for-coding", "kimi-for-coding-highspeed"] {
+            let entry = defaults.get(slug).expect("embedded Kimi Code model");
+            assert_eq!(entry.info.provider, ModelProvider::Kimi);
+            assert_eq!(entry.info.api_backend, ApiBackend::ChatCompletions);
+            assert_eq!(
+                entry.info.base_url,
+                crate::kimi_models::KIMI_CODE_API_BASE_URL
+            );
+            assert_eq!(entry.info.context_window.get(), 262_144);
+            assert_eq!(entry.info.tool_mode, Some(ToolMode::Direct));
+            assert_eq!(
+                entry.env_key.as_ref().and_then(EnvKeys::primary),
+                Some(crate::kimi_models::KIMI_CODE_API_KEY_ENV)
+            );
+        }
+    }
+
+    #[test]
+    fn models_config_defaults_to_platform_and_parses_code_canonically() {
+        assert_eq!(
+            ModelsConfig::default().kimi_endpoint,
+            crate::kimi_models::KimiApiEndpoint::Platform
+        );
+        let code: ModelsConfig = toml::from_str("kimi_endpoint = \"code\"").unwrap();
+        assert_eq!(
+            code.kimi_endpoint,
+            crate::kimi_models::KimiApiEndpoint::Code
         );
     }
 

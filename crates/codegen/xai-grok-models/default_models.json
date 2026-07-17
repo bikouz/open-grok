@@ -30,6 +30,30 @@
       ]
     },
     {
+      "model": "kimi-for-coding",
+      "name": "Kimi for Coding",
+      "description": "Kimi Code's coding and agent model",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "context_window": 262144,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "KIMI_CODE_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "model": "kimi-for-coding-highspeed",
+      "name": "Kimi for Coding Highspeed",
+      "description": "Kimi Code's low-latency coding and agent model",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "context_window": 262144,
+      "api_backend": "chat_completions",
+      "provider": "kimi",
+      "env_key": "KIMI_CODE_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
       "model": "gpt-5.6-sol",
       "name": "GPT-5.6 Sol",
       "description": "Latest frontier agentic coding model",

@@ -33,6 +33,37 @@ pub(super) fn kimi_models_query_payload(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct KimiEndpointApplyParams {
+    endpoint: crate::kimi_models::KimiApiEndpoint,
+}
+
+pub(super) fn kimi_endpoint_apply_payload(
+    endpoint: crate::kimi_models::KimiApiEndpoint,
+    effective_endpoint: crate::kimi_models::KimiApiEndpoint,
+    refreshed: Result<bool, String>,
+    models: acp::SessionModelState,
+) -> serde_json::Value {
+    match refreshed {
+        Ok(refreshed) => serde_json::json!({
+            "endpoint": endpoint.as_canonical(),
+            "effective_endpoint": effective_endpoint.as_canonical(),
+            "refreshed": refreshed,
+            "models": models,
+        }),
+        Err(warning) => {
+            tracing::warn!(%warning, "Kimi endpoint applied but live model refresh failed");
+            serde_json::json!({
+                "endpoint": endpoint.as_canonical(),
+                "effective_endpoint": effective_endpoint.as_canonical(),
+                "refreshed": false,
+                "warning": warning,
+                "models": models,
+            })
+        }
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide
@@ -3391,6 +3422,25 @@ impl acp::Agent for MvpAgent {
                     "cleared": self.models_manager.clear_kimi_models(),
                 }),
             )),
+            "open-grok/kimi/endpoint/apply" => {
+                let params = crate::extensions::parse_params::<KimiEndpointApplyParams>(&args)?;
+                let refreshed = self
+                    .models_manager
+                    .apply_kimi_endpoint(params.endpoint)
+                    .await
+                    .map_err(|error| error.to_string());
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(kimi_endpoint_apply_payload(
+                    params.endpoint,
+                    self.models_manager.effective_kimi_endpoint(),
+                    refreshed,
+                    models,
+                )))
+            }
             "x.ai/getApiKey" | "x.ai/setApiKey" => {
                 crate::extensions::auth::handle(self, &args).await
             }

@@ -30,6 +30,54 @@ fn codex_refresh_failure_payload_keeps_auth_visible_fallback_models() {
     );
 }
 
+#[test]
+fn kimi_endpoint_payload_keeps_rebuilt_models_when_live_discovery_warns() {
+    let model_id = acp::ModelId::new("kimi-k3");
+    let models = acp::SessionModelState::new(
+        model_id.clone(),
+        vec![acp::ModelInfo::new(model_id.clone(), "Kimi K3".to_string())],
+    );
+
+    let payload = acp_agent::kimi_endpoint_apply_payload(
+        crate::kimi_models::KimiApiEndpoint::Platform,
+        crate::kimi_models::KimiApiEndpoint::Platform,
+        Err("models endpoint unavailable".to_string()),
+        models,
+    );
+    assert_eq!(
+        payload.get("endpoint").and_then(serde_json::Value::as_str),
+        Some("platform")
+    );
+    assert_eq!(
+        payload.get("warning").and_then(serde_json::Value::as_str),
+        Some("models endpoint unavailable")
+    );
+    let keys = payload
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "effective_endpoint",
+            "endpoint",
+            "models",
+            "refreshed",
+            "warning",
+        ])
+    );
+    let returned: acp::SessionModelState =
+        serde_json::from_value(payload.get("models").cloned().unwrap()).unwrap();
+    assert!(
+        returned
+            .available_models
+            .iter()
+            .any(|model| model.model_id == model_id)
+    );
+}
+
 /// Build an unsigned JWT with a `tier` claim (header.payload.sig base64url).
 fn jwt_with_tier(tier: u64) -> String {
     use base64::Engine;

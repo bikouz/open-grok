@@ -840,8 +840,12 @@ auto_update = true
         };
         let v = TomlValue::try_from(&m).expect("serialize ModelsConfig");
         if let TomlValue::Table(t) = v {
-            assert_eq!(t.len(), 1);
+            assert_eq!(t.len(), 2);
             assert!(t.contains_key("default"));
+            assert_eq!(
+                t.get("kimi_endpoint").and_then(TomlValue::as_str),
+                Some("platform")
+            );
             assert!(!t.contains_key("web_search"));
             assert!(!t.contains_key("session_summary"));
             assert!(!t.contains_key("image_description"));

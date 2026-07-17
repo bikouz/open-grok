@@ -114,6 +114,23 @@ pub async fn set_default_model(value: String) -> Result<()> {
     .await
 }
 
+/// Persist the selected Kimi service as `[models].kimi_endpoint`.
+/// Runtime clients apply the same selection through the ACP extension after
+/// this write succeeds, so they can own rollback if live application fails.
+pub async fn set_kimi_endpoint(endpoint: crate::kimi_models::KimiApiEndpoint) -> Result<()> {
+    update_config(|cfg| cfg.models.kimi_endpoint = endpoint).await
+}
+
+/// String boundary for Settings clients. Only canonical `platform` and `code`
+/// values are accepted; persistence remains typed after validation.
+pub async fn set_kimi_api_endpoint(value: String) -> Result<()> {
+    let endpoint =
+        crate::kimi_models::KimiApiEndpoint::from_canonical(&value).ok_or_else(|| {
+            anyhow::anyhow!("invalid Kimi API endpoint `{value}`; expected platform or code")
+        })?;
+    set_kimi_endpoint(endpoint).await
+}
+
 /// Persist an explicit `[models].recap` model id. Empty clears the pin and
 /// restores provider-aware Automatic selection.
 pub async fn set_recap_model(value: String) -> Result<()> {
@@ -335,5 +352,28 @@ mod tests {
         let err = optional_model_pin("recap", "x".repeat(MAX_DEFAULT_MODEL_LEN + 1))
             .expect_err("oversized model IDs must be rejected");
         assert!(err.to_string().contains("recap model id too long"));
+    }
+
+    #[test]
+    fn kimi_endpoint_serializes_with_canonical_values() {
+        let mut models = crate::agent::config::ModelsConfig::default();
+        assert_eq!(
+            models.kimi_endpoint,
+            crate::kimi_models::KimiApiEndpoint::Platform
+        );
+        models.kimi_endpoint = crate::kimi_models::KimiApiEndpoint::Code;
+        let value = toml::Value::try_from(&models).expect("serialize ModelsConfig");
+        assert_eq!(
+            value.get("kimi_endpoint").and_then(toml::Value::as_str),
+            Some("code")
+        );
+    }
+
+    #[test]
+    fn kimi_endpoint_string_boundary_rejects_noncanonical_values() {
+        assert_eq!(
+            crate::kimi_models::KimiApiEndpoint::from_canonical("coding"),
+            None
+        );
     }
 }

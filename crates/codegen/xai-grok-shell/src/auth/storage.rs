@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::model::{API_KEY_SCOPE, AuthMode, AuthStore, GrokAuth, lookup_auth};
+use crate::kimi_models::KimiApiEndpoint;
 use xai_grok_sampling_types::ModelProvider;
 
 /// RAII guard for an exclusive advisory lock on `auth.json.lock`.
@@ -361,6 +362,17 @@ fn provider_api_key_scope(provider: ModelProvider) -> String {
     format!("{}::api_key", provider.as_str())
 }
 
+const KIMI_CODE_API_KEY_SCOPE: &str = "kimi_code::api_key";
+
+fn kimi_api_key_scope(endpoint: KimiApiEndpoint) -> String {
+    match endpoint {
+        // Preserve the original provider scope so existing Kimi users migrate
+        // to the explicit Platform service without re-entering their key.
+        KimiApiEndpoint::Platform => provider_api_key_scope(ModelProvider::Kimi),
+        KimiApiEndpoint::Code => KIMI_CODE_API_KEY_SCOPE.to_owned(),
+    }
+}
+
 fn lock_api_key_store(path: &Path) -> std::io::Result<AuthFileLock> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -468,6 +480,45 @@ pub fn clear_provider_api_key(grok_home: &Path, provider: ModelProvider) -> std:
     clear_scoped_api_key(grok_home, &provider_api_key_scope(provider))
 }
 
+/// Read the credential for one Kimi service. Platform intentionally reuses
+/// the historical `kimi::api_key` scope; Code uses a distinct scope.
+pub fn read_kimi_api_key(grok_home: &Path, endpoint: KimiApiEndpoint) -> Option<String> {
+    let path = grok_home.join("auth.json");
+    let map = read_auth_json(&path).ok()?;
+    map.get(&kimi_api_key_scope(endpoint))
+        .map(|auth| auth.key.clone())
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Return whether a non-empty stored credential exists for one Kimi service.
+pub fn kimi_api_key_is_configured(grok_home: &Path, endpoint: KimiApiEndpoint) -> bool {
+    let path = grok_home.join("auth.json");
+    let Ok(map) = read_auth_json(&path) else {
+        return false;
+    };
+    map.get(&kimi_api_key_scope(endpoint))
+        .is_some_and(|auth| !auth.key.trim().is_empty())
+}
+
+/// Store a credential for exactly one Kimi service.
+pub fn store_kimi_api_key(
+    grok_home: &Path,
+    endpoint: KimiApiEndpoint,
+    api_key: &str,
+) -> std::io::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return clear_kimi_api_key(grok_home, endpoint);
+    }
+    store_scoped_api_key(grok_home, &kimi_api_key_scope(endpoint), api_key)
+}
+
+/// Clear one Kimi service credential while preserving the other service and
+/// all unrelated auth scopes.
+pub fn clear_kimi_api_key(grok_home: &Path, endpoint: KimiApiEndpoint) -> std::io::Result<()> {
+    clear_scoped_api_key(grok_home, &kimi_api_key_scope(endpoint))
+}
+
 #[cfg(test)]
 mod provider_api_key_tests {
     use super::*;
@@ -491,6 +542,59 @@ mod provider_api_key_tests {
         clear_provider_api_key(dir.path(), ModelProvider::Kimi).unwrap();
         assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
         assert!(read_provider_api_key(dir.path(), ModelProvider::Kimi).is_none());
+    }
+
+    #[test]
+    fn kimi_platform_migrates_existing_scope_and_code_is_fully_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        store_provider_api_key(dir.path(), ModelProvider::Kimi, "platform-secret").unwrap();
+        store_kimi_api_key(dir.path(), KimiApiEndpoint::Code, "code-secret").unwrap();
+
+        assert_eq!(
+            read_kimi_api_key(dir.path(), KimiApiEndpoint::Platform).as_deref(),
+            Some("platform-secret")
+        );
+        assert_eq!(
+            read_kimi_api_key(dir.path(), KimiApiEndpoint::Code).as_deref(),
+            Some("code-secret")
+        );
+        assert!(kimi_api_key_is_configured(
+            dir.path(),
+            KimiApiEndpoint::Platform
+        ));
+        assert!(kimi_api_key_is_configured(
+            dir.path(),
+            KimiApiEndpoint::Code
+        ));
+
+        clear_kimi_api_key(dir.path(), KimiApiEndpoint::Code).unwrap();
+        assert!(!kimi_api_key_is_configured(
+            dir.path(),
+            KimiApiEndpoint::Code
+        ));
+        assert_eq!(
+            read_provider_api_key(dir.path(), ModelProvider::Kimi).as_deref(),
+            Some("platform-secret"),
+            "clearing Code must preserve the migration-compatible Platform scope"
+        );
+
+        clear_kimi_api_key(dir.path(), KimiApiEndpoint::Platform).unwrap();
+        assert!(read_provider_api_key(dir.path(), ModelProvider::Kimi).is_none());
+    }
+
+    #[test]
+    fn empty_kimi_key_clears_only_the_selected_service() {
+        let dir = tempfile::tempdir().unwrap();
+        store_kimi_api_key(dir.path(), KimiApiEndpoint::Platform, "platform-secret").unwrap();
+        store_kimi_api_key(dir.path(), KimiApiEndpoint::Code, "code-secret").unwrap();
+
+        store_kimi_api_key(dir.path(), KimiApiEndpoint::Platform, "  ").unwrap();
+
+        assert!(read_kimi_api_key(dir.path(), KimiApiEndpoint::Platform).is_none());
+        assert_eq!(
+            read_kimi_api_key(dir.path(), KimiApiEndpoint::Code).as_deref(),
+            Some("code-secret")
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use indexmap::IndexMap;
 use crate::agent::config::{self, ModelEntry, resolve_credentials, sampling_config_for_model};
 use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
 use crate::codex_models::{CodexCompactionMetadata, CodexModelsCatalog, CodexModelsClient};
-use crate::kimi_models::{KimiModelsCatalog, KimiModelsClient};
+use crate::kimi_models::{KimiApiEndpoint, KimiModelsCatalog, KimiModelsClient};
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::sampling::SamplerConfig as SamplingConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -132,7 +132,7 @@ struct Inner {
     gateway: RwLock<Option<xai_acp_lib::AcpAgentGatewaySender>>,
     cache: ModelsCacheManager,
     codex_client: CodexModelsClient,
-    kimi_client: KimiModelsClient,
+    kimi_client: RwLock<KimiModelsClient>,
     /// Serialize Codex cache/network refreshes. Session startup waits for an
     /// already-running refresh so it resolves against the same catalog rather
     /// than racing past the initial `OnlineIfUncached` request.
@@ -194,6 +194,7 @@ impl ModelsManager {
         auth_manager: Arc<AuthManager>,
         cfg: config::Config,
     ) -> Self {
+        let kimi_endpoint = cfg.models.kimi_endpoint;
         Self::new_with_provider_catalogs(
             prefetched,
             None,
@@ -203,7 +204,7 @@ impl ModelsManager {
             auth_manager,
             cfg,
             CodexModelsClient::new(),
-            KimiModelsClient::new(),
+            KimiModelsClient::new(kimi_endpoint),
         )
     }
 
@@ -238,7 +239,7 @@ impl ModelsManager {
                 gateway: RwLock::new(None),
                 cache: ModelsCacheManager::new(),
                 codex_client,
-                kimi_client,
+                kimi_client: RwLock::new(kimi_client),
                 codex_refresh_lock: tokio::sync::Mutex::new(()),
                 kimi_refresh_lock: tokio::sync::Mutex::new(()),
                 codex_catalog_generation: AtomicU64::new(0),
@@ -295,7 +296,7 @@ impl ModelsManager {
         let has_prefetched = prefetched_models.is_some();
         let codex_client = CodexModelsClient::new();
         let codex_catalog = codex_client.load_fresh_cache();
-        let kimi_client = KimiModelsClient::new();
+        let kimi_client = KimiModelsClient::new(cfg.models.kimi_endpoint);
         let kimi_catalog = None;
         let catalog = resolve_model_catalog_with_provider_catalogs(
             cfg,
@@ -439,7 +440,8 @@ impl ModelsManager {
     }
 
     fn start_kimi_models_query(&self) {
-        if !self.inner.kimi_client.has_usable_api_key() {
+        let client = self.inner.kimi_client.read().clone();
+        if !client.supports_models_query() || !client.has_usable_api_key() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -459,15 +461,14 @@ impl ModelsManager {
     pub(crate) async fn refresh_kimi_models(&self) -> anyhow::Result<bool> {
         let _refresh_guard = self.inner.kimi_refresh_lock.lock().await;
         let generation = self.inner.kimi_catalog_generation.load(Ordering::Acquire);
-        let Some(refreshed) = self.inner.kimi_client.query().await? else {
+        let client = self.inner.kimi_client.read().clone();
+        let Some(refreshed) = client.query().await? else {
             tracing::debug!("Kimi model query skipped: no Kimi API key");
             return Ok(false);
         };
         if generation != self.inner.kimi_catalog_generation.load(Ordering::Acquire)
-            || !self
-                .inner
-                .kimi_client
-                .catalog_matches_current_credential(&refreshed)
+            || !client.catalog_matches_current_credential(&refreshed)
+            || self.inner.kimi_client.read().endpoint() != client.endpoint()
         {
             tracing::debug!(
                 "discarded Kimi model query completed after catalog clear or credential change"
@@ -501,6 +502,26 @@ impl ModelsManager {
         had_catalog
     }
 
+    /// Apply a Kimi service selection to the resident model manager. The
+    /// embedded partition is rebuilt synchronously; Platform then attempts a
+    /// live `/models` refresh, while Code deliberately keeps its embedded
+    /// two-model catalog without depending on that endpoint.
+    pub async fn apply_kimi_endpoint(&self, endpoint: KimiApiEndpoint) -> anyhow::Result<bool> {
+        let mut cfg = self.inner.cfg.read().clone();
+        cfg.models.kimi_endpoint = endpoint;
+        self.apply_config(cfg);
+
+        if self.kimi_endpoint() != endpoint {
+            anyhow::bail!("Kimi endpoint change was rejected by model catalog validation");
+        }
+
+        if self.inner.kimi_client.read().supports_models_query() {
+            self.refresh_kimi_models().await
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Swap config, rebuild catalog, and reselect the model.
     ///
     /// Calls `reselect_default_model` when the preferred model changed
@@ -512,6 +533,8 @@ impl ModelsManager {
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
             return;
         }
+        let old_kimi_endpoint = self.inner.cfg.read().models.kimi_endpoint;
+        let kimi_endpoint_changed = old_kimi_endpoint != new_config.models.kimi_endpoint;
         let prefetched = self.inner.prefetched.read().clone();
         let new_catalog = {
             let codex_catalog = self.inner.codex_catalog.read();
@@ -520,7 +543,11 @@ impl ModelsManager {
                 &new_config,
                 prefetched,
                 codex_catalog.as_ref(),
-                kimi_catalog.as_ref(),
+                if kimi_endpoint_changed {
+                    None
+                } else {
+                    kimi_catalog.as_ref()
+                },
             )
         };
         let has_real_catalog = *self.inner.has_fetched_real_catalog.read();
@@ -540,6 +567,14 @@ impl ModelsManager {
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         *self.inner.fetch_auth.write() =
             ModelFetchAuth::resolve(&new_config.endpoints, has_session);
+        if kimi_endpoint_changed {
+            self.inner
+                .kimi_catalog_generation
+                .fetch_add(1, Ordering::AcqRel);
+            self.inner.kimi_catalog.write().take();
+            *self.inner.kimi_client.write() =
+                KimiModelsClient::new(new_config.models.kimi_endpoint);
+        }
         *self.inner.cfg.write() = new_config.clone();
         // Recompute the prompt-block flag so a corrective reload unblocks.
         if has_real_catalog {
@@ -598,6 +633,14 @@ impl ModelsManager {
 
     pub fn endpoints(&self) -> config::EndpointsConfig {
         self.inner.cfg.read().endpoints.clone()
+    }
+
+    pub fn kimi_endpoint(&self) -> KimiApiEndpoint {
+        self.inner.cfg.read().models.kimi_endpoint
+    }
+
+    pub fn effective_kimi_endpoint(&self) -> KimiApiEndpoint {
+        self.inner.kimi_client.read().endpoint()
     }
 
     /// Explicit recap helper-model override. `None` means apply the
@@ -2628,6 +2671,35 @@ mod tests {
             mgr.inner.kimi_catalog_generation.load(Ordering::Acquire),
             start + 1
         );
+    }
+
+    #[tokio::test]
+    async fn kimi_endpoint_switch_rebuilds_only_the_selected_partition() {
+        let mgr = test_manager();
+
+        let refreshed = mgr
+            .apply_kimi_endpoint(KimiApiEndpoint::Code)
+            .await
+            .unwrap();
+
+        assert!(!refreshed, "Kimi Code must not depend on /models");
+        assert_eq!(mgr.kimi_endpoint(), KimiApiEndpoint::Code);
+        assert_eq!(mgr.effective_kimi_endpoint(), KimiApiEndpoint::Code);
+        let models = mgr.models();
+        assert!(models.contains_key("kimi-for-coding"));
+        assert!(models.contains_key("kimi-for-coding-highspeed"));
+        assert!(!models.contains_key("kimi-k3"));
+
+        let mut cfg = mgr.inner.cfg.read().clone();
+        cfg.models.kimi_endpoint = KimiApiEndpoint::Platform;
+        mgr.apply_config(cfg);
+
+        assert_eq!(mgr.kimi_endpoint(), KimiApiEndpoint::Platform);
+        assert_eq!(mgr.effective_kimi_endpoint(), KimiApiEndpoint::Platform);
+        let models = mgr.models();
+        assert!(models.contains_key("kimi-k3"));
+        assert!(!models.contains_key("kimi-for-coding"));
+        assert!(!models.contains_key("kimi-for-coding-highspeed"));
     }
 
     #[test]
