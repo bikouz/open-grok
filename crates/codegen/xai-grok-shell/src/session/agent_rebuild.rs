@@ -47,7 +47,6 @@ use xai_grok_agent::error::AgentBuildError;
 use xai_grok_agent::prompt::context::PromptAudience;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_agent::{Agent, AgentBuilder, CompactionPolicy, ReminderPolicy};
-use xai_grok_sampling_types::ToolMode;
 use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
 use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest;
 use xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig;
@@ -322,11 +321,10 @@ impl AgentRebuildSpec {
             builder = builder.with_preloaded_skills(skills);
         }
         let mut agent = builder.build().await?;
-        agent.set_tool_mode(if *code_mode_enabled {
-            ToolMode::CodeModeOnly
-        } else {
-            ToolMode::Direct
-        });
+        agent.set_tool_mode(crate::agent::config::effective_tool_mode(
+            None,
+            *code_mode_enabled,
+        ));
         let model_validator = models_manager.clone();
         agent
             .tool_bridge()
@@ -470,6 +468,25 @@ mod tests {
             .find(|definition| definition.function.name == task_name)
             .and_then(|definition| definition.function.description)
             .expect("GrokBuild Task description should be present")
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebuild_uses_mixed_code_mode_for_settings_fallback() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut spec = test_rebuild_spec_default();
+                Arc::get_mut(&mut spec)
+                    .expect("test rebuild spec should be uniquely owned")
+                    .code_mode_enabled = true;
+                let agent = spec
+                    .build_agent(AgentDefinition::default_grok_build())
+                    .await
+                    .expect("agent build should succeed");
+                assert_eq!(
+                    agent.tool_mode(),
+                    xai_grok_sampling_types::ToolMode::CodeMode
+                );
+            })
+            .await;
     }
     #[tokio::test(flavor = "current_thread")]
     async fn rebuild_projects_fresh_public_model_keys_into_task_description() {

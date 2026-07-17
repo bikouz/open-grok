@@ -43,12 +43,12 @@ pub fn default_agent_type() -> String {
     DEFAULT_AGENT_TYPE.to_owned()
 }
 /// Resolve the session's tool presentation using Codex's model-first
-/// precedence. The Settings switch only supplies a fallback for models that do
-/// not declare their own mode.
+/// precedence. The Settings switch supplies mixed Code Mode only for models
+/// that do not declare their own mode.
 pub fn effective_tool_mode(model_mode: Option<ToolMode>, code_mode_enabled: bool) -> ToolMode {
     model_mode.unwrap_or({
         if code_mode_enabled {
-            ToolMode::CodeModeOnly
+            ToolMode::CodeMode
         } else {
             ToolMode::Direct
         }
@@ -7285,16 +7285,24 @@ reasoning_effort = "low"
         assert_eq!(resolved["direct"].info.tool_mode, None);
     }
     #[test]
-    fn effective_tool_mode_is_model_first() {
+    fn effective_tool_mode_uses_mixed_settings_fallback_and_model_first_override() {
         assert_eq!(
             effective_tool_mode(Some(ToolMode::Direct), true),
             ToolMode::Direct
         );
         assert_eq!(
+            effective_tool_mode(Some(ToolMode::CodeMode), false),
+            ToolMode::CodeMode
+        );
+        assert_eq!(
             effective_tool_mode(Some(ToolMode::CodeModeOnly), false),
             ToolMode::CodeModeOnly
         );
-        assert_eq!(effective_tool_mode(None, true), ToolMode::CodeModeOnly);
+        assert_eq!(
+            effective_tool_mode(Some(ToolMode::CodeModeOnly), true),
+            ToolMode::CodeModeOnly
+        );
+        assert_eq!(effective_tool_mode(None, true), ToolMode::CodeMode);
         assert_eq!(effective_tool_mode(None, false), ToolMode::Direct);
     }
     /// Messages backend (Anthropic) auto-defaults supports_reasoning_effort=true.

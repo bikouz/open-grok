@@ -63,7 +63,7 @@ Implementation:
 ```rust
 // effective_tool_mode(model_mode, code_mode_enabled)
 model_mode.unwrap_or(if code_mode_enabled {
-    ToolMode::CodeModeOnly
+    ToolMode::CodeMode
 } else {
     ToolMode::Direct
 })
@@ -72,7 +72,7 @@ model_mode.unwrap_or(if code_mode_enabled {
 **Invariants:**
 
 1. **Model metadata wins.** A catalog entry with `tool_mode: code_mode_only` (e.g. GPT-5.6 Sol) cannot be forced off by Settings.
-2. Settings **On** only applies when the model does **not** declare a tool mode → effective `CodeModeOnly`.
+2. Settings **On** only applies when the model does **not** declare a tool mode → effective mixed `CodeMode`, with ordinary tools retained top-level.
 3. Settings **Off** (default) → `Direct` when the model is silent.
 4. The **running session keeps** its tool mode until a **new** session starts (restart messaging on the setting).
 5. Codex catalog may supply `tool_mode` on live entries (`codex_models.rs`); Kimi entries force `Direct`.
@@ -365,7 +365,7 @@ Deliberate Open Grok notes in the port doc: in-process V8 only; UI mirrors Codex
 | Protocol | `xai-grok-code-mode-protocol` (e.g. `description`, `session_tests`) | Pragma parse, names, descriptions |
 | Runtime | `xai-grok-code-mode` `service_tests`, `cell_actor/*_tests`, `session_runtime/tests`, `tests/jit.rs` | Cells, yield/wait, tools, store, shutdown |
 | Shell adapter | `session/code_mode.rs` module tests | Transport helpers, exec/wait tool shape, hosted-search policy, direct-only list |
-| Tool mode | `agent/config.rs` `effective_tool_mode_is_model_first`; `agent/models.rs` resolve tests | Precedence |
+| Tool mode | `agent/config.rs` mixed-fallback/model-first test; `agent/models.rs` resolve tests | Precedence |
 | Turn / nested | Shell session tests + `tool_calls` behavior | Sink, prepare path |
 | Replay | `session/storage/mod.rs` `replay_hides_code_mode_transport_*` | Nested cards kept; wrappers dropped |
 | Settings | pager settings registry / modal tests for `code_mode` | Restart-required, default off |

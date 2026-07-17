@@ -412,6 +412,8 @@ fn code_mode_registry_contract_is_restart_required_and_off_by_default() {
     assert_eq!(meta.owner, SettingOwner::Shell);
     assert!(meta.restart_required);
     assert!(matches!(meta.kind, SettingKind::Bool { default: false }));
+    assert!(meta.description.contains("mixed Code Mode"));
+    assert!(meta.description.contains("Code Mode Only"));
 }
 
 #[test]

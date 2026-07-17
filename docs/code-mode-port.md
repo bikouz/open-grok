@@ -50,8 +50,9 @@ Settings gains a restart-required **Code mode** switch:
 
 - Off (default): preserve the current direct-tool behavior unless the selected
   model's catalog metadata requires another tool mode.
-- On: use `code_mode_only` for newly started sessions when the selected model
-  does not declare an explicit tool mode.
+- On: use mixed `code_mode` for newly started sessions when the selected model
+  does not declare an explicit tool mode. Ordinary tools remain available
+  top-level alongside `exec` and `wait`.
 
 Model metadata takes precedence, matching Codex. A model such as GPT-5.6 Sol that
 declares `code_mode_only` cannot be made incompatible by turning the preference
