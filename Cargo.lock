@@ -13786,6 +13786,7 @@ version = "0.1.0"
 dependencies = [
  "assert_matches",
  "async-openai",
+ "base64",
  "indexmap",
  "reqwest 0.12.24",
  "serde",

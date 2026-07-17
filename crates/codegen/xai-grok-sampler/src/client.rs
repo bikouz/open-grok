@@ -25,12 +25,12 @@ use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
+    ModelProvider, NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
     ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
     rs,
 };
 #[cfg(test)]
-use xai_grok_sampling_types::{ModelProvider, ReasoningEffort};
+use xai_grok_sampling_types::ReasoningEffort;
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 #[cfg(test)]
@@ -2917,6 +2917,20 @@ impl SamplingClient {
 
         if request.reasoning_effort.is_none() {
             request.reasoning_effort = self.defaults.reasoning_effort;
+        }
+
+        // Codex rejects invalid base64 data URLs, remote image URLs, and
+        // detail=low tool images with a non-retryable 400 that bricks the
+        // turn. Prepare images before conversion (parity with codex-rs
+        // `prepare_response_items`). Other providers keep existing behavior.
+        if self.defaults.provider == ModelProvider::Codex {
+            let prepared = request.prepare_images_for_codex();
+            if prepared > 0 {
+                tracing::warn!(
+                    prepared,
+                    "replaced {prepared} unsendable image(s) before Codex request"
+                );
+            }
         }
 
         Ok(())

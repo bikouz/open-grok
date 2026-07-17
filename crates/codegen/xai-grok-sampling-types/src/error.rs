@@ -226,6 +226,11 @@ impl SamplingError {
     /// The API rejected the request because an inline image could not be
     /// processed. Matches both direct 400 and proxy-wrapped 500 responses.
     /// Exact-case match — consistent with `is_encrypted_content_error`.
+    ///
+    /// Also matches Codex/OpenAI Responses rejections of the form
+    /// `Invalid 'input[N].output[M].image_url' … invalid base64-encoded value`
+    /// (and user-message `input_image` variants) so the sampler can strip
+    /// images and retry once instead of hard-failing the turn.
     pub fn is_image_processing_error(&self) -> bool {
         matches!(
             self,
@@ -233,7 +238,9 @@ impl SamplingError {
                 status,
                 message,
                 ..
-            } if matches!(status.as_u16(), 400 | 500) && message.contains("Could not process image")
+            } if matches!(status.as_u16(), 400 | 500)
+                && (message.contains("Could not process image")
+                    || is_codex_invalid_image_url_error(message))
         )
     }
 
@@ -289,6 +296,20 @@ impl SamplingError {
             _ => false,
         }
     }
+}
+
+/// Codex/OpenAI Responses: `Invalid '…image_url'. Expected a base64-encoded data URL…`
+/// (invalid base64, missing image MIME, or similar).
+fn is_codex_invalid_image_url_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    // Wire path: input[N].output[M].image_url or content parts with image_url.
+    let mentions_image_url = lower.contains("image_url") || lower.contains("input_image");
+    let invalid = lower.contains("invalid")
+        && (lower.contains("base64")
+            || lower.contains("data url")
+            || lower.contains("data-url")
+            || lower.contains("mime"));
+    mentions_image_url && invalid
 }
 
 impl From<reqwest::Error> for SamplingError {
@@ -695,6 +716,25 @@ mod tests {
         };
         assert!(err.is_image_processing_error());
         assert!(!err.is_encrypted_content_error());
+    }
+
+    #[test]
+    fn image_processing_error_codex_invalid_image_url_detected() {
+        let err = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "API error (status 400 Bad Request): invalid_request_error: Invalid \
+                      'input[20].output[2].image_url'. Expected a base64-encoded data URL with \
+                      an image MIME type (e.g. 'data:image/png;base64,aW1nIGJ5dGVzIGhlcmU='), \
+                      but got an invalid base64-encoded value."
+                .into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        assert!(
+            err.is_image_processing_error(),
+            "Codex invalid image_url 400 must strip-and-retry"
+        );
     }
 
     #[test]

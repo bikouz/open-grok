@@ -1362,6 +1362,20 @@ impl ConversationRequest {
         occurrences
     }
 
+    /// Prepare inline images for a strict Responses backend (notably Codex).
+    ///
+    /// Mirrors codex-rs `image_preparation::prepare_response_items` for the
+    /// failure modes that brick a turn with HTTP 400:
+    /// - remote `http(s)://` image URLs (Codex does not fetch them)
+    /// - `data:` URLs with invalid base64, missing `;base64,`, or non-image MIME
+    /// - `detail: low` tool-output images (unsupported by Codex)
+    ///
+    /// Failed images are replaced with short text placeholders so the rest of
+    /// the history remains sendable. Returns the number of images replaced.
+    pub fn prepare_images_for_codex(&mut self) -> usize {
+        prepare_conversation_images_for_codex(&mut self.items)
+    }
+
     /// Strip all inline image data from the conversation to reduce payload size.
     ///
     /// Replaces `ContentPart::Image` entries with a text placeholder so the
@@ -1411,6 +1425,168 @@ impl ConversationRequest {
         }
         stripped
     }
+}
+
+// ============================================================================
+// Codex image preparation (parity with codex-rs image_preparation)
+// ============================================================================
+
+/// Placeholder when a data URL cannot be decoded or revalidated.
+pub const CODEX_IMAGE_PROCESSING_ERROR_PLACEHOLDER: &str =
+    "image content omitted because it could not be processed";
+/// Placeholder when the backend refuses remote image URLs.
+pub const CODEX_REMOTE_IMAGE_URL_PLACEHOLDER: &str =
+    "image content omitted because remote image URLs are not supported";
+/// Placeholder when tool-output `detail: low` is rejected (Codex).
+pub const CODEX_UNSUPPORTED_LOW_DETAIL_PLACEHOLDER: &str =
+    "image content omitted because detail 'low' is not supported; use 'high', 'original', or 'auto'";
+
+/// Walk conversation items and replace images the Codex Responses API would
+/// reject (invalid base64 data URLs, remote URLs, unsupported low detail).
+///
+/// Used by the sampler immediately before building the wire body so mid-session
+/// tool outputs (Code Mode `image()`, MCP images, PDF pages) cannot brick the
+/// turn with `Invalid 'input[N].output[M].image_url'`.
+pub fn prepare_conversation_images_for_codex(items: &mut [ConversationItem]) -> usize {
+    let mut prepared = 0usize;
+    for item in items.iter_mut() {
+        match item {
+            ConversationItem::User(user) => {
+                for part in user.content.iter_mut() {
+                    if let ContentPart::Image { url } = part
+                        && let Err(placeholder) = codex_prepare_image_url(url.as_ref(), None)
+                    {
+                        *part = ContentPart::Text {
+                            text: Arc::<str>::from(placeholder),
+                        };
+                        prepared += 1;
+                    }
+                }
+            }
+            ConversationItem::ToolResult(result) => {
+                let before = result.images.len();
+                result.images.retain(|part| {
+                    !matches!(
+                        part,
+                        ContentPart::Image { url }
+                            if codex_prepare_image_url(url.as_ref(), None).is_err()
+                    )
+                });
+                // Dropped tool-result images leave a text breadcrumb so the model
+                // still knows something was omitted (ordered_content path below
+                // keeps order; the parallel `images` vec is best-effort).
+                let dropped = before - result.images.len();
+                if dropped > 0 {
+                    prepared += dropped;
+                    if result.content.is_empty() {
+                        result.content = Arc::<str>::from(CODEX_IMAGE_PROCESSING_ERROR_PLACEHOLDER);
+                    } else if !result.content.contains("image content omitted") {
+                        result.content = Arc::<str>::from(format!(
+                            "{}\n[{CODEX_IMAGE_PROCESSING_ERROR_PLACEHOLDER}]",
+                            result.content
+                        ));
+                    }
+                }
+                for part in result.ordered_content.iter_mut() {
+                    if let CustomToolOutputContent::Image { url, detail } = part
+                        && let Err(placeholder) =
+                            codex_prepare_image_url(url.as_ref(), Some(*detail))
+                    {
+                        *part = CustomToolOutputContent::text(placeholder);
+                        prepared += 1;
+                    }
+                }
+            }
+            ConversationItem::CustomToolOutput(output) => {
+                for part in output.content.iter_mut() {
+                    if let CustomToolOutputContent::Image { url, detail } = part
+                        && let Err(placeholder) =
+                            codex_prepare_image_url(url.as_ref(), Some(*detail))
+                    {
+                        *part = CustomToolOutputContent::text(placeholder);
+                        prepared += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    prepared
+}
+
+fn is_remote_image_url(image_url: &str) -> bool {
+    image_url.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
+fn is_data_url(image_url: &str) -> bool {
+    image_url
+        .get(.."data:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+}
+
+/// Validate an image URL for Codex. Returns `Ok(())` when the URL may be sent
+/// as-is, or `Err(placeholder)` when it must be replaced with text.
+fn codex_prepare_image_url(
+    image_url: &str,
+    detail: Option<CustomToolOutputImageDetail>,
+) -> Result<(), &'static str> {
+    if is_remote_image_url(image_url) {
+        return Err(CODEX_REMOTE_IMAGE_URL_PLACEHOLDER);
+    }
+    if matches!(detail, Some(CustomToolOutputImageDetail::Low)) {
+        return Err(CODEX_UNSUPPORTED_LOW_DETAIL_PLACEHOLDER);
+    }
+    if !is_data_url(image_url) {
+        // codex-rs leaves non-data non-remote URLs alone; the Code Mode helper
+        // already rejects those at ingest. Allow through here for parity.
+        return Ok(());
+    }
+    if codex_data_url_is_sendable(image_url) {
+        Ok(())
+    } else {
+        Err(CODEX_IMAGE_PROCESSING_ERROR_PLACEHOLDER)
+    }
+}
+
+/// True when a `data:` URL has an image MIME type and a STANDARD-decodable
+/// base64 payload (Codex/OpenAI reject unpadded or corrupt payloads).
+fn codex_data_url_is_sendable(image_url: &str) -> bool {
+    use base64::Engine as _;
+    let Some(rest) = image_url
+        .get(.."data:".len())
+        .filter(|p| p.eq_ignore_ascii_case("data:"))
+        .and_then(|_| image_url.get("data:".len()..))
+    else {
+        return false;
+    };
+    let Some((metadata, payload)) = rest.split_once(',') else {
+        return false;
+    };
+    if !metadata
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        return false;
+    }
+    // First metadata token is the MIME type (may be empty for `data:;base64,`).
+    let mime = metadata
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !mime.starts_with("image/") {
+        return false;
+    }
+    // Reject empty or whitespace-tainted payloads early (API is strict).
+    if payload.is_empty() || payload.bytes().any(|b| b.is_ascii_whitespace()) {
+        return false;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .is_ok()
 }
 
 /// Bounded provider-neutral context used until the selected transport restores
@@ -9555,6 +9731,139 @@ mod tests {
 
         let stripped = req.strip_images();
         assert_eq!(stripped, 3);
+    }
+
+    // ========== prepare_images_for_codex tests ==========
+
+    #[test]
+    fn prepare_images_for_codex_replaces_invalid_base64_tool_output() {
+        // Unpadded / corrupt payloads match the live Codex 400:
+        // Invalid 'input[N].output[M].image_url' … invalid base64-encoded value
+        let mut req = ConversationRequest::from_items(vec![
+            ConversationItem::tool_result_with_ordered_content(
+                "call-wait",
+                vec![
+                    CustomToolOutputContent::text("before"),
+                    CustomToolOutputContent::image(
+                        "data:image/png;base64,%%%",
+                        CustomToolOutputImageDetail::High,
+                    ),
+                    CustomToolOutputContent::image(
+                        "data:image/png;base64,AAA", // invalid padding
+                        CustomToolOutputImageDetail::Original,
+                    ),
+                    CustomToolOutputContent::text("after"),
+                ],
+            ),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::new(
+                "call-exec",
+                [CustomToolOutputContent::image(
+                    "https://example.com/remote.png",
+                    CustomToolOutputImageDetail::High,
+                )],
+            )),
+        ]);
+
+        let prepared = req.prepare_images_for_codex();
+        assert_eq!(prepared, 3);
+
+        let ConversationItem::ToolResult(result) = &req.items[0] else {
+            panic!("expected ToolResult");
+        };
+        assert_matches!(
+            &result.ordered_content[..],
+            [
+                CustomToolOutputContent::Text { .. },
+                CustomToolOutputContent::Text { text: t1 },
+                CustomToolOutputContent::Text { text: t2 },
+                CustomToolOutputContent::Text { .. },
+            ] if t1.as_ref() == CODEX_IMAGE_PROCESSING_ERROR_PLACEHOLDER
+                && t2.as_ref() == CODEX_IMAGE_PROCESSING_ERROR_PLACEHOLDER
+        );
+
+        let ConversationItem::CustomToolOutput(output) = &req.items[1] else {
+            panic!("expected CustomToolOutput");
+        };
+        assert_matches!(
+            &output.content[..],
+            [CustomToolOutputContent::Text { text }]
+                if text.as_ref() == CODEX_REMOTE_IMAGE_URL_PLACEHOLDER
+        );
+
+        // Wire body must not retain any input_image for these items.
+        let wire = serde_json::to_value(rs::CreateResponse::from(&req)).unwrap();
+        let input = wire["input"].as_array().unwrap();
+        for item in input {
+            if let Some(output) = item.get("output").and_then(|v| v.as_array()) {
+                for part in output {
+                    assert_ne!(
+                        part.get("type").and_then(|t| t.as_str()),
+                        Some("input_image"),
+                        "invalid images must not reach the wire: {part}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_images_for_codex_keeps_valid_padded_data_url() {
+        use base64::Engine as _;
+        // Minimal 1x1 PNG (same fixture used by Code Mode / Codex tests).
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        // Sanity: STANDARD accepts this payload.
+        base64::engine::general_purpose::STANDARD
+            .decode(png_b64)
+            .expect("fixture base64");
+        let good = format!("data:image/png;base64,{png_b64}");
+
+        let mut req = ConversationRequest::from_items(vec![
+            ConversationItem::tool_result_with_ordered_content(
+                "call-1",
+                vec![CustomToolOutputContent::image(
+                    good.clone(),
+                    CustomToolOutputImageDetail::High,
+                )],
+            ),
+        ]);
+        assert_eq!(req.prepare_images_for_codex(), 0);
+        assert_matches!(
+            &req.items[0],
+            ConversationItem::ToolResult(r)
+                if matches!(
+                    &r.ordered_content[..],
+                    [CustomToolOutputContent::Image { url, .. }] if url.as_ref() == good
+                )
+        );
+    }
+
+    #[test]
+    fn prepare_images_for_codex_rejects_detail_low() {
+        use base64::Engine as _;
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        base64::engine::general_purpose::STANDARD
+            .decode(png_b64)
+            .unwrap();
+        let good = format!("data:image/png;base64,{png_b64}");
+        let mut req = ConversationRequest::from_items(vec![
+            ConversationItem::custom_tool_output(CustomToolOutputItem::new(
+                "call-exec",
+                [CustomToolOutputContent::image(
+                    good,
+                    CustomToolOutputImageDetail::Low,
+                )],
+            )),
+        ]);
+        assert_eq!(req.prepare_images_for_codex(), 1);
+        assert_matches!(
+            &req.items[0],
+            ConversationItem::CustomToolOutput(o)
+                if matches!(
+                    &o.content[..],
+                    [CustomToolOutputContent::Text { text }]
+                        if text.as_ref() == CODEX_UNSUPPORTED_LOW_DETAIL_PLACEHOLDER
+                )
+        );
     }
 
     // ── Tool result with images tests ──────────────────────────────────────────

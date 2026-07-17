@@ -123,6 +123,31 @@ non-default auxiliary model configured by the user remains an explicit
 cross-provider opt-in. Auto-mode classification already inherits the active
 model unless a dedicated classifier model is configured.
 
+## Image preparation (tool outputs and history)
+
+Codex's Responses endpoint rejects unsendable `image_url` values with a
+non-retryable 400 of the form
+`Invalid 'input[N].output[M].image_url' … invalid base64-encoded value`.
+Open Grok follows codex-rs `image_preparation::prepare_response_items` on the
+outbound request path:
+
+- Before each Codex sample (and compaction), `ConversationRequest::prepare_images_for_codex`
+  walks user messages, tool results, and custom-tool outputs.
+- Remote `http(s)://` URLs, invalid `data:` base64 payloads (including unpadded
+  or whitespace-tainted payloads), non-image MIME types, and tool-output
+  `detail: low` are replaced with short text placeholders so the turn can
+  continue.
+- Code Mode's JS `image()` / `generatedImage()` helpers require a `data:` scheme
+  (parity with codex-rs code-mode), rejecting bare paths and other schemes at
+  the V8 boundary.
+- As a safety net, `SamplingError::is_image_processing_error` also matches the
+  Codex invalid-`image_url` 400 so the sampler can strip remaining images and
+  retry once if a bad image still reaches the wire.
+
+Open Grok does not yet re-encode/resize images through the full codex-utils-image
+pipeline on every send; valid padded base64 data URLs pass through as-is after
+the checks above.
+
 ## Sticky provider boundary
 
 Each session persists an `ever_used_codex` marker. Once set, it is monotonic:
