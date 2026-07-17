@@ -40,6 +40,7 @@ mod reasons {
     pub const SESSION_DENY: &str = "session_deny";
     pub const PROMPT_DENY: &str = "prompt_deny";
     pub const NEEDS_USER: &str = "needs_user";
+    pub const REQUESTER_GONE: &str = "requester_gone";
 }
 
 /// Canonical permission-mode string for the uploaded artifact. Matches
@@ -1040,7 +1041,7 @@ fn spawn_permission_manager_with_pin(
                 PermissionCommand::Request {
                     access,
                     tool_call_update,
-                    respond_to,
+                    mut respond_to,
                     session_id: request_session_id,
                     subagent_type: request_subagent_type,
                     subagent_description: request_subagent_description,
@@ -1124,6 +1125,18 @@ fn spawn_permission_manager_with_pin(
                             };
                             let _ = event_tx.send(event);
                         };
+
+                    if respond_to.is_closed() {
+                        tracing::info!(tool = %tool_name, "permission requester gone; skipped at dequeue");
+                        emit_event(
+                            &Decision::Cancelled,
+                            false,
+                            false,
+                            None,
+                            Some(reasons::REQUESTER_GONE),
+                        );
+                        continue;
+                    }
 
                     // Evaluate managed policy (direct access + per-segment Bash command
                     // rules + Bash shell-file args) up front so the YOLO/sandbox fast
@@ -1240,7 +1253,7 @@ fn spawn_permission_manager_with_pin(
                             AutoFastPath::Classify => {
                                 let verdict = if let Some(ref clf) = auto_classifier {
                                     use crate::permission::auto_mode::ClassifierContext;
-                                    clf.classify(
+                                    let classify = clf.classify(
                                         &tool_name,
                                         &access,
                                         access_detail.as_deref(),
@@ -1248,12 +1261,26 @@ fn spawn_permission_manager_with_pin(
                                             turns: classifier_turns.clone(),
                                             project_instructions: project_instructions.clone(),
                                         },
-                                    )
-                                    .await
+                                    );
+                                    tokio::select! {
+                                        verdict = classify => Some(verdict),
+                                        _ = respond_to.closed() => None,
+                                    }
                                 } else {
                                     // No classifier wired: treat as unavailable, which
                                     // prompts the user (never a silent allow).
-                                    ClassifierVerdict::Unavailable
+                                    Some(ClassifierVerdict::Unavailable)
+                                };
+                                let Some(verdict) = verdict else {
+                                    tracing::info!(tool = %tool_name, "permission requester gone; classify abandoned");
+                                    emit_event(
+                                        &Decision::Cancelled,
+                                        false,
+                                        false,
+                                        None,
+                                        Some(reasons::REQUESTER_GONE),
+                                    );
+                                    continue;
                                 };
                                 // Allow runs without a prompt; Block/Unavailable
                                 // both surface the interactive picker (never a
@@ -1490,6 +1517,17 @@ fn spawn_permission_manager_with_pin(
                     } else {
                         auto_prompt_reason.unwrap_or(reasons::NEEDS_USER)
                     };
+                    if respond_to.is_closed() {
+                        tracing::info!(tool = %tool_name, "permission requester gone; prompt suppressed");
+                        emit_event(
+                            &Decision::Cancelled,
+                            false,
+                            false,
+                            None,
+                            Some(reasons::REQUESTER_GONE),
+                        );
+                        continue;
+                    }
                     let (decision, outcome_str, user_prompted) = match &access {
                         AccessKind::Bash(cmd) => {
                             // Segment evaluation above still auto-allows fully-safe
@@ -1498,7 +1536,10 @@ fn spawn_permission_manager_with_pin(
                             // not open one permission UI per unsafe chained segment
                             // (e.g. `curl … && sh` must not become two separate
                             // prompts for `curl …` then `sh`).
-                            let prompt_outcome = prompter.request(&access, &tool_call_update).await;
+                            let prompt_outcome = tokio::select! {
+                                outcome = prompter.request(&access, &tool_call_update) => outcome,
+                                _ = respond_to.closed() => PromptOutcome::Cancelled,
+                            };
 
                             // One event per decision is emitted by the shared `emit_event`
                             // after this match; do not emit inline here.
@@ -1551,7 +1592,10 @@ fn spawn_permission_manager_with_pin(
                         }
                         _ => {
                             // Non-bash access kinds keep the single-prompt flow.
-                            let prompt_outcome = prompter.request(&access, &tool_call_update).await;
+                            let prompt_outcome = tokio::select! {
+                                outcome = prompter.request(&access, &tool_call_update) => outcome,
+                                _ = respond_to.closed() => PromptOutcome::Cancelled,
+                            };
                             let (decision, outcome_str) = match &prompt_outcome {
                                 PromptOutcome::AllowOnce => (Decision::Allow, "allow_once"),
                                 PromptOutcome::AllowEditsForSession => {
@@ -1681,12 +1725,20 @@ fn spawn_permission_manager_with_pin(
                             (decision, outcome_str, true)
                         }
                     };
+                    let trigger = if matches!(decision, Decision::Cancelled)
+                        && respond_to.is_closed()
+                    {
+                        tracing::info!(tool = %tool_name, "permission requester gone; open prompt abandoned");
+                        reasons::REQUESTER_GONE
+                    } else {
+                        prompt_trigger
+                    };
                     emit_event(
                         &decision,
                         false,
                         user_prompted,
                         Some(outcome_str),
-                        Some(prompt_trigger),
+                        Some(trigger),
                     );
                     let _ = respond_to.send(decision);
                 }
@@ -2699,6 +2751,177 @@ mod tests {
                     d,
                     Decision::Allow,
                     "bash-safe `ls` with no policy must auto-allow, got {d:?}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dead_requester_is_skipped_without_prompting() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, mut events) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+
+                let PermissionHandle::Actor { ref cmd_tx, .. } = mgr else {
+                    panic!("recording-client manager must be actor-backed");
+                };
+                let (tx, rx) = oneshot::channel::<Decision>();
+                drop(rx);
+                cmd_tx
+                    .send(PermissionCommand::Request {
+                        access: AccessKind::Bash("curl http://example.com".into()),
+                        tool_call_update: tool_call(),
+                        respond_to: tx,
+                        session_id: None,
+                        subagent_type: None,
+                        subagent_description: None,
+                    })
+                    .expect("actor alive");
+
+                let d = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    mgr.request(
+                        AccessKind::Bash("curl http://example.com".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .expect("control request must resolve, not hang");
+
+                assert_eq!(
+                    prompts.borrow().len(),
+                    1,
+                    "only the control request may prompt; the dead request must be skipped"
+                );
+                assert!(
+                    matches!(d, Decision::Reject(_)),
+                    "control decision must reflect the prompt answer, got {d:?}"
+                );
+                let ev = events
+                    .try_recv()
+                    .expect("the skipped request must still emit an artifact event");
+                assert_eq!(ev.decision, "cancelled");
+                assert_eq!(ev.decision_reason.as_deref(), Some("requester_gone"));
+                assert!(!ev.user_prompted, "skipped request must never prompt");
+            })
+            .await;
+    }
+
+    struct HangingFirstPromptClient {
+        prompts: std::rc::Rc<std::cell::RefCell<Vec<acp::RequestPermissionRequest>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for HangingFirstPromptClient {
+        async fn request_permission(
+            &self,
+            args: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            let first = self.prompts.borrow().is_empty();
+            self.prompts.borrow_mut().push(args.clone());
+            if first {
+                futures::future::pending::<()>().await;
+                unreachable!("pending() never resolves");
+            }
+            let option_id = args
+                .options
+                .iter()
+                .find(|o| o.kind == acp::PermissionOptionKind::RejectOnce)
+                .map(|o| o.option_id.clone())
+                .expect("prompt must offer a reject-once option");
+            Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                    option_id,
+                )),
+            ))
+        }
+
+        async fn session_notification(&self, _: acp::SessionNotification) -> acp::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn requester_death_mid_prompt_frees_actor() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let prompts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let client = HangingFirstPromptClient {
+                    prompts: prompts.clone(),
+                };
+                let (gateway, receiver) = xai_acp_lib::acp_gateway::<acp::AgentSide, _>(client);
+                tokio::task::spawn_local(receiver.run());
+                let (mgr, _events) = spawn_permission_manager_with_pin(
+                    acp::SessionId::new(Arc::from("test-session")),
+                    gateway,
+                    cwd.clone(),
+                    ClientType::Generic,
+                    None,
+                    vec![],
+                    vec![],
+                    false,
+                    None,
+                    true,
+                    None,
+                    None,
+                );
+                let PermissionHandle::Actor { ref cmd_tx, .. } = mgr else {
+                    panic!("manager must be actor-backed");
+                };
+
+                let (tx, rx) = oneshot::channel::<Decision>();
+                cmd_tx
+                    .send(PermissionCommand::Request {
+                        access: AccessKind::Bash("curl http://example.com".into()),
+                        tool_call_update: tool_call(),
+                        respond_to: tx,
+                        session_id: None,
+                        subagent_type: None,
+                        subagent_description: None,
+                    })
+                    .expect("actor alive");
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while prompts.borrow().is_empty() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("first prompt must open");
+                drop(rx);
+
+                let d = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    mgr.request(
+                        AccessKind::Bash("curl http://example.com".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .expect("requests behind a dead prompt must not hang");
+
+                assert!(
+                    matches!(d, Decision::Reject(_)),
+                    "follow-up decision must reflect its own prompt answer, got {d:?}"
+                );
+                assert_eq!(
+                    prompts.borrow().len(),
+                    2,
+                    "both prompts open; only the dead one is abandoned"
                 );
             })
             .await;
