@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Open Grok Upstream"
+  short_description: "Replay safe upstream changes into the fork"
+  default_prompt: "Use $sync-open-grok-upstream to compare upstream and selectively port compatible changes."

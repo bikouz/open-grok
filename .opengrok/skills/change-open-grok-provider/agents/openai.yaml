@@ -1,0 +1,4 @@
+interface:
+  display_name: "Change Open Grok Provider"
+  short_description: "Extend providers without credential or wire leakage"
+  default_prompt: "Use $change-open-grok-provider to implement and verify this provider or model change."

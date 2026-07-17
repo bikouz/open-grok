@@ -4,7 +4,7 @@ Instructions for AI coding agents (and humans) working in this repository.
 
 **Product:** Open Grok (`open-grok`) — community fork of [Grok Build](https://github.com/xai-org/grok-build) with ChatGPT Codex, multi-provider support, and Code Mode.  
 **Version file:** [`OPEN_GROK_VERSION`](OPEN_GROK_VERSION)  
-**Deeper docs:** [`docs/agents/`](docs/agents/) · fork contracts: [`docs/`](docs/) · end-user guide: [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
+**Deeper docs:** [`docs/agents/`](docs/agents/) · fork contracts: [`docs/`](docs/) · repo skills: [`.opengrok/skills/`](.opengrok/skills/) · end-user guide: [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
 
 ---
 
@@ -71,6 +71,9 @@ Full crate map: [`docs/agents/architecture.md`](docs/agents/architecture.md).
 10. **No secrets in commits.** No real API keys, OAuth tokens, release binaries, or user session dumps.
 11. **Scoped changes.** Prefer the smallest crate/module set that implements the behavior; add tests next to the behavior.
 12. **Hooks fail open.** They are not a security boundary alone — combine with deny rules and sandbox.
+13. **Preserve concurrent work.** This checkout may be shared by multiple tasks. Check `git status` before and after long builds, format only owned files when unrelated edits are present, and stage explicit paths.
+14. **Commit tested units as they land.** Do not wait until the end of a large task. Each coherent commit should state the behavior or invariant it adds and include its focused verification.
+15. **A release is the published artifact.** Source push, tag push, and local build are intermediate states; release work ends only after public asset and installer verification.
 
 ---
 
@@ -144,10 +147,19 @@ After any non-xAI profile that denies xAI services, the session export boundary 
 
 ### 5.1 Before coding
 
-1. Identify the layer: **pager (UI)** vs **shell (agent)** vs **tools** vs **sampler** vs **workspace**.
-2. Read the nearest module docs / existing tests.
-3. For provider, Code Mode, or auth changes, read the matching file under `docs/` first.
-4. Prefer extending existing patterns over inventing parallel ones.
+1. Run `git status --short --branch`; identify unrelated or concurrent edits before formatting, testing, or staging.
+2. Identify the layer: **pager (UI)** vs **shell (agent)** vs **tools** vs **sampler** vs **workspace**.
+3. Read the nearest module docs / existing tests.
+4. For provider, Code Mode, auth, release, session-forensics, or upstream-sync work, load the matching repo skill below.
+5. Prefer extending existing patterns over inventing parallel ones.
+
+| Repeated task | Repo skill |
+| --- | --- |
+| Build or change this checkout | [`develop-open-grok`](.opengrok/skills/develop-open-grok/SKILL.md) |
+| Add/change provider, model, auth, or wire behavior | [`change-open-grok-provider`](.opengrok/skills/change-open-grok-provider/SKILL.md) |
+| Prove compaction, resume, or subagent persistence | [`verify-open-grok-session`](.opengrok/skills/verify-open-grok-session/SKILL.md) |
+| Build and publish a macOS release | [`release-open-grok`](.opengrok/skills/release-open-grok/SKILL.md) |
+| Compare or replay an upstream snapshot | [`sync-open-grok-upstream`](.opengrok/skills/sync-open-grok-upstream/SKILL.md) |
 
 ### 5.2 While coding
 
@@ -157,6 +169,8 @@ After any non-xAI profile that denies xAI services, the session export boundary 
 - When changing permissions: update rule docs + unit tests under `xai-grok-workspace/src/permission/`.
 - When changing plan mode: update `plan_mode.rs` **and** `plan_mode_edit_gate` tests.
 - Brand user-facing strings as **Open Grok**; crate names remain `xai-grok-*` (upstream heritage).
+- For live provider/settings mutations, preserve FIFO dispatch order, hold sends fail-closed while state is unresolved, and cover send-now, queued, interject, and subagent paths.
+- For auxiliary work (recap, memory, title generation, embeddings), treat the selected provider/model as an explicit route with its own credentials and export policy; do not inherit the active chat provider accidentally.
 
 ### 5.3 After coding
 
@@ -172,10 +186,24 @@ cargo test --locked -p <crate> -- <filter>
 
 See [`docs/agents/development.md`](docs/agents/development.md) for full build/test/release commands.
 
-### 5.4 PR / change hygiene
+Interpret failures before broadening the patch: the Rust workspace has long compile/link phases and some suites share global state. Re-run a failing test alone to distinguish a deterministic regression from suite interference, but do not hide repeatable failures. Run `bash -n` on changed shell scripts. Use an isolated `OPENGROK_HOME` for tests and installer smokes.
+
+### 5.4 History-backed completion contracts
+
+| Task | Complete only when… |
+| --- | --- |
+| Local setup | The target package compiles/tests, the repo-local runner reports the expected version, and CLI smoke (such as completions) works without replacing an installed release. |
+| Provider/model/auth | Registry/request/stream coverage passes; credentials, caches, hosted tools, opaque history, 401 refresh, logout, auxiliary routing, and export boundaries stay provider-local; live model/provider switches rebind before sends resume. |
+| Code Mode | Model metadata controls effective mode; raw-JS `exec`, persistent V8, nested tool dispatch, permissions, and TUI suppression/rendering all stay aligned. |
+| Session/compaction | The exact session id is found on disk; `summary.json`, `updates.jsonl`/`events.jsonl`, child `subagents/`, and referenced checkpoints agree. For auto-compaction, prove `auto_compact_started` → checkpoint persistence → `auto_compact_completed`. |
+| Release | A clean exact commit produces a version/commit-verified arm64 binary; signature and checksum pass; the canonical five assets are published; GitHub digests match; latest/tag-specific installer smoke and the managed installed binary report the expected version. |
+| Upstream sync | Merge-base state is checked first; imports are replayed in reviewable batches; fork naming, paths, updater, provider/auth, Code Mode, and security contracts survive; baseline and focused tests are recorded. |
+
+### 5.5 PR / change hygiene
 
 - Scoped diffs; explain user-visible behavior.
 - Add or update tests for the changed path.
+- Stage explicit owned paths and commit each tested unit with a descriptive subject; never sweep concurrent work into the commit.
 - Do not commit `target/`, release artifacts under `dist/` (except intentional release workflow), or credentials.
 - Upstream-only bugs: report upstream; fork-specific issues belong here.
 - License: Apache-2.0 first-party; preserve third-party notices for ported Codex code.
@@ -196,7 +224,7 @@ cargo build --locked -p xai-grok-pager-bin --bin open-grok
 ./bin/open-grok-dev agent stdio
 ```
 
-Release (Apple Silicon, clean tree): `./scripts/build-macos-release.sh` reads `OPEN_GROK_VERSION`.
+Release (Apple Silicon, clean tree): `./scripts/build-macos-release.sh` reads `OPEN_GROK_VERSION`. The builder requires the pinned arm64 `ripgrep 15.0.0` through `GROK_TOOLS_BUNDLE_RG_PATH`; do not substitute a newer Homebrew binary. Use [`release-open-grok`](.opengrok/skills/release-open-grok/SKILL.md) for the publication and installer-verification sequence.
 
 ---
 

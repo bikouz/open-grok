@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Open Grok"
+  short_description: "Build, publish, and verify the macOS release"
+  default_prompt: "Use $release-open-grok to build, publish, and verify this Open Grok release end to end."

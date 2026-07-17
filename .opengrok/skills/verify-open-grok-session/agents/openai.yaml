@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify Open Grok Session"
+  short_description: "Prove session and compaction state from disk"
+  default_prompt: "Use $verify-open-grok-session to inspect this session id and report the persisted evidence."

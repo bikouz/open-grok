@@ -1,0 +1,4 @@
+interface:
+  display_name: "Develop Open Grok"
+  short_description: "Build, test, and commit scoped Open Grok changes"
+  default_prompt: "Use $develop-open-grok to implement and verify a scoped change in this checkout."
