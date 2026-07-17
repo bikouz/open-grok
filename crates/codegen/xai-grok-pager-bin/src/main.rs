@@ -961,9 +961,14 @@ async fn run_agent_command(
         leader_eligible,
     );
     tracing::info!(use_leader, ?policy_disable_reason, "leader mode resolved");
-    if stdio_direct_update_eligible(is_stdio, use_leader)
-        && should_check_for_updates(no_auto_update)
-    {
+    let managed_application = xai_grok_config::grok_application();
+    let managed_install = is_managed_install(std::env::current_exe().ok(), &managed_application);
+    if stdio_auto_update_enabled(
+        is_stdio,
+        use_leader,
+        should_check_for_updates(no_auto_update),
+        managed_install,
+    ) {
         let update_config = update_config.clone();
         tokio::spawn(async move {
             auto_update::run_update_if_available(
@@ -974,6 +979,8 @@ async fn run_agent_command(
             .await
             .ok();
         });
+    } else if is_stdio && !use_leader && !managed_install {
+        tracing::debug!("stdio auto-update skipped: not the managed install");
     }
     if use_leader {
         if !agent_args.plugin_dirs.is_empty() {
@@ -2007,17 +2014,32 @@ fn update_checks_allowed(
 ) -> bool {
     !no_auto_update_flag && !debug_build && !disabled_by_env
 }
-/// Mode-gate for the direct stdio agent's background auto-update.
-///
-/// Only the *direct* stdio agent is newly eligible: every other agent mode
-/// already self-updates at the top of `run_agent_command`, and a leader-backed
-/// stdio process is a thin bridge whose updates are owned by the leader
-/// (`LeaderAutoUpdateConfig`). Update suppression (`--no-auto-update`,
-/// `OPENGROK_DISABLE_AUTOUPDATER` (with the legacy Grok alias), debug builds)
-/// is layered on separately via
-/// [`should_check_for_updates`].
-fn stdio_direct_update_eligible(is_stdio: bool, use_leader: bool) -> bool {
-    is_stdio && !use_leader
+/// Gate for the direct stdio agent's background auto-update. Other modes
+/// update in `run_agent_command`, while leader-backed stdio delegates updates
+/// to the leader.
+fn stdio_auto_update_enabled(
+    is_stdio: bool,
+    use_leader: bool,
+    updates_enabled: bool,
+    managed_install: bool,
+) -> bool {
+    is_stdio && !use_leader && updates_enabled && managed_install
+}
+
+/// Return true only when `exe` resolves to the canonical managed Open Grok
+/// application. Canonicalization failures are treated as unmanaged so pinned
+/// binaries and SDK-spawned agents never stage an update they cannot adopt.
+fn is_managed_install(exe: Option<std::path::PathBuf>, managed: &std::path::Path) -> bool {
+    if managed.as_os_str().is_empty() {
+        return false;
+    }
+    let Some(exe) = exe else {
+        return false;
+    };
+    match (dunce::canonicalize(exe), dunce::canonicalize(managed)) {
+        (Ok(exe), Ok(managed)) => exe == managed,
+        _ => false,
+    }
 }
 /// Map the mutually-exclusive channel flags to a channel name. clap enforces
 /// that at most one is set, so the order is irrelevant.
@@ -2299,27 +2321,55 @@ mod tests {
         xai_grok_shell::heap_profile::dump_to_path(dump.path()).expect("shell dump");
         dump.assert_nonempty_dump();
     }
-    /// Only the direct (non-leader) stdio agent is newly eligible for the
-    /// background auto-update. Leader-backed stdio defers to the leader's own
-    /// updater, and non-stdio modes already update at the top of
-    /// `run_agent_command`.
+    #[cfg(unix)]
     #[test]
-    fn stdio_direct_update_eligible_only_for_non_leader_stdio() {
+    fn is_managed_install_matches_only_the_bin_open_grok_target() {
+        let home = std::env::temp_dir().join(format!(
+            "open-grok-pager-managed-install-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::create_dir_all(home.join("downloads")).unwrap();
+        let managed = home.join("bin").join("open-grok");
+
+        assert!(!is_managed_install(Some(managed.clone()), &managed));
+        assert!(!is_managed_install(None, &managed));
+        assert!(!is_managed_install(
+            Some(managed.clone()),
+            std::path::Path::new("")
+        ));
+
+        let target = home.join("downloads").join("open-grok-1.2.3");
+        std::fs::write(&target, b"binary").unwrap();
+        std::os::unix::fs::symlink(&target, &managed).unwrap();
+        assert!(is_managed_install(Some(managed.clone()), &managed));
+        assert!(is_managed_install(Some(target.clone()), &managed));
+
+        let pinned = home.join("bin").join("open-grok-9.9.9");
+        std::fs::write(&pinned, b"binary").unwrap();
+        assert!(!is_managed_install(Some(pinned), &managed));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn stdio_auto_update_requires_direct_stdio_enabled_and_managed() {
+        assert!(stdio_auto_update_enabled(true, false, true, true));
         assert!(
-            stdio_direct_update_eligible(true, false),
-            "direct stdio agent should be eligible",
+            !stdio_auto_update_enabled(true, true, true, true),
+            "leader bridge",
         );
         assert!(
-            !stdio_direct_update_eligible(true, true),
-            "leader-backed stdio defers to the leader's updater",
+            !stdio_auto_update_enabled(false, false, true, true),
+            "non-stdio",
         );
         assert!(
-            !stdio_direct_update_eligible(false, false),
-            "non-stdio modes update at the top of run_agent_command",
+            !stdio_auto_update_enabled(true, false, false, true),
+            "updates off",
         );
         assert!(
-            !stdio_direct_update_eligible(false, true),
-            "non-stdio leader path is not stdio-eligible",
+            !stdio_auto_update_enabled(true, false, true, false),
+            "pinned binary",
         );
     }
 
