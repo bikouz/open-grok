@@ -942,7 +942,13 @@ pub(crate) async fn run(
             crate::notifications::load_notification_config(raw),
         );
         if let Some(table) = raw.as_table() {
-            app.voice_config = xai_grok_voice::VoiceConfig::from_config_table(table);
+            let endpoints_base =
+                xai_grok_shell::agent::config::EndpointsConfig::from_config_value(raw)
+                    .xai_api_base_url;
+            app.voice_config = xai_grok_voice::VoiceConfig::from_config_table(
+                table,
+                Some(&endpoints_base),
+            );
         }
     }
     // Stamp request-identity headers so the STT handshake attributes voice usage

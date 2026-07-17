@@ -297,7 +297,8 @@ impl EndpointsConfig {
     }
     /// Layer the `[endpoints]` table from `config` over the env/default base.
     /// No field is derived from another — defaulting is done by the resolvers.
-    pub(crate) fn from_config_value(config: &toml::Value) -> Self {
+    /// `pub`: the pager resolves the voice STT base through this same path.
+    pub fn from_config_value(config: &toml::Value) -> Self {
         let default = Self::default();
         let external_otel_master_switch = default.external_otel_master_switch;
         let mut base = match toml::Value::try_from(default) {
