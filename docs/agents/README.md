@@ -11,8 +11,16 @@ This directory is for **contributors and AI coding agents** working on the Open 
 | Document | Audience / use |
 | --- | --- |
 | [architecture.md](architecture.md) | Crate map, layering, binary entry, request flow |
-| [agent-runtime.md](agent-runtime.md) | Session actor, turns, tools, permissions, plan, subagents, sessions, ACP |
+| [agent-runtime.md](agent-runtime.md) | Session actor, turns, tools, permissions, plan, subagents, sessions |
+| [acp.md](acp.md) | ACP transports, methods, extensions, reverse-RPC, meta keys, leader, headless |
+| [sessions.md](sessions.md) | Session identity, on-disk layout, persistence actor, resume/fork/rewind, idle flush/dream |
+| [subagents.md](subagents.md) | Task spawn, coordinator drain, depth, isolation, resume, usage fold, orphan reconcile |
 | [editing.md](editing.md) | How file edits work (`search_replace`, `apply_patch`, hunks, plan mode, Code Mode) |
+| [code-mode.md](code-mode.md) | Code Mode / Only, V8 runtime, exec/wait, nested tools, transport UI, lifecycle |
+| [tools.md](tools.md) | Tool packs, registry/finalize, taxonomy, major tools, caps, Computer Hub, add-a-tool checklist |
+| [permissions-and-sandbox.md](permissions-and-sandbox.md) | Permission pipeline, rules, bash policy, folder trust, OS sandbox |
+| [memory-and-goals.md](memory-and-goals.md) | Cross-session memory, flush/dream, memory tools, goal tracker / `update_goal` |
+| [hooks-plugins-skills.md](hooks-plugins-skills.md) | Hooks discovery/events, plugins/marketplace, skills/commands session load |
 | [tui-and-config.md](tui-and-config.md) | Pager Action/Effect, config layers, slash commands, hooks, plugins, skills, MCP |
 | [providers.md](providers.md) | xAI / Codex / Kimi isolation, auth stores, compaction, safe extension checklist |
 | [development.md](development.md) | Build, test, release, PR hygiene |

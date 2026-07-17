@@ -113,6 +113,7 @@ Subagents **inherit** the parent `PermissionHandle` (including always-approve). 
 - Spawn via `task` / spawn_subagent tool → `SubagentCoordinator`.
 - Optional worktree isolation (`xai-fast-worktree` + workspace worktree).
 - Children are full sessions; usage folds back into parent.
+- Deep map: [`docs/agents/subagents.md`](docs/agents/subagents.md).
 
 ### 4.5 Code Mode
 
@@ -121,7 +122,8 @@ When **Code Mode Only** is effective (model metadata wins over Settings):
 - Top-level: freeform `exec` (raw JS), `wait`, plus direct-only tools (human interaction / multi-agent).
 - Ordinary tools remain registered for `tools.*` only.
 - Persistent V8 session for the agent session; disposed on session end.
-- Contract: [`docs/code-mode-port.md`](docs/code-mode-port.md).
+- Deep map: [`docs/agents/code-mode.md`](docs/agents/code-mode.md).
+- Parity contract: [`docs/code-mode-port.md`](docs/code-mode-port.md).
 
 ### 4.6 Multi-provider
 
@@ -217,7 +219,15 @@ Project rules for **user projects** (not this repo’s own guide) are documented
 | [`docs/agents/README.md`](docs/agents/README.md) | Index of agent developer docs |
 | [`docs/agents/architecture.md`](docs/agents/architecture.md) | Crate map, layering, request flow |
 | [`docs/agents/agent-runtime.md`](docs/agents/agent-runtime.md) | Turns, tools, sessions, subagents, plan, permissions |
+| [`docs/agents/acp.md`](docs/agents/acp.md) | ACP transports, methods, extensions, reverse-RPC, meta keys, leader |
+| [`docs/agents/sessions.md`](docs/agents/sessions.md) | Session dirs, persistence, resume/fork/rewind, compaction host, idle flush |
+| [`docs/agents/subagents.md`](docs/agents/subagents.md) | Spawn, coordinator, depth, worktrees, resume, usage, orphans |
 | [`docs/agents/editing.md`](docs/agents/editing.md) | File edits, hunks, plan-mode edits, Code Mode nested edits |
+| [`docs/agents/code-mode.md`](docs/agents/code-mode.md) | Code Mode / Only, V8, exec/wait, nested tools, transport UI |
+| [`docs/agents/tools.md`](docs/agents/tools.md) | Tool packs, registry, taxonomy, major tools, caps, how to add a tool |
+| [`docs/agents/permissions-and-sandbox.md`](docs/agents/permissions-and-sandbox.md) | Permission pipeline, rules, bash policy, folder trust, OS sandbox |
+| [`docs/agents/memory-and-goals.md`](docs/agents/memory-and-goals.md) | Memory storage/search, flush/dream, goals / `update_goal` |
+| [`docs/agents/hooks-plugins-skills.md`](docs/agents/hooks-plugins-skills.md) | Hooks, plugins/marketplace, skills session load |
 | [`docs/agents/tui-and-config.md`](docs/agents/tui-and-config.md) | Pager, config, slash, hooks, plugins, skills, MCP |
 | [`docs/agents/providers.md`](docs/agents/providers.md) | Multi-provider, auth isolation, compaction |
 | [`docs/agents/development.md`](docs/agents/development.md) | Build, test, release, contribution workflow |

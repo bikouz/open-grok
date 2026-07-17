@@ -95,7 +95,7 @@ Model tool_call
 
 `bash`, `read_file`, `search_replace`, `list_dir`, `grep`, `todo`, `task` / task wait-kill, `monitor`, `scheduler_*`, `enter_plan_mode` / `exit_plan_mode`, `ask_user_question`, `update_goal`, `web_search`, `web_fetch`, `lsp`, image/video generation, …
 
-See [editing.md](editing.md) for file mutation details.
+Full pack / registry / taxonomy map: [tools.md](tools.md). File mutation details: [editing.md](editing.md).
 
 ### Tool invariants
 
@@ -157,7 +157,11 @@ OS sandbox: `xai-grok-sandbox/` — process-wide, irreversible for the session l
 - High-frequency progress is gateway-only (avoid JSONL blowup).
 - Synthetic origins: `GoalSummary`, `GoalClassifierNudge`.
 
+Deep map: [memory-and-goals.md](memory-and-goals.md).
+
 ## Subagents
+
+Deep implementation map: [subagents.md](subagents.md).
 
 | Piece | Path |
 | --- | --- |
@@ -188,6 +192,8 @@ OS sandbox: `xai-grok-sandbox/` — process-wide, irreversible for the session l
 
 ## Sessions, storage, compaction
 
+Deep dive: **[sessions.md](sessions.md)** (identity, file layout, persistence actor, resume/fork/rewind, idle flush/dream, tests).
+
 Under `$OPENGROK_HOME/sessions/<encoded-cwd>/<session-id>/`:
 
 | File | Role |
@@ -212,6 +218,8 @@ Modules: `session/storage/`, `session/persistence.rs`, `session/compaction*.rs`,
 
 ## Code Mode (runtime)
 
+Deep map: **[code-mode.md](code-mode.md)**. Parity contract: [`../code-mode-port.md`](../code-mode-port.md).
+
 | Piece | Path |
 | --- | --- |
 | Protocol | `xai-grok-code-mode-protocol/` |
@@ -229,6 +237,8 @@ When CodeModeOnly:
 - Mark transport with meta (`open-grok/codeModeTransport`); **do not** key UI on tool name alone (MCP might define `exec`).
 
 ## ACP surfaces
+
+Full map (transports, extensions, reverse-RPC, meta keys, leader, headless, tests): **[acp.md](acp.md)**.
 
 | Piece | Path |
 | --- | --- |
@@ -271,6 +281,13 @@ Headless: permission prompts cancel rather than block.
 
 ## See also
 
+- [acp.md](acp.md)
+- [subagents.md](subagents.md)
+- [tools.md](tools.md)
+- [code-mode.md](code-mode.md)
 - [editing.md](editing.md)
+- [memory-and-goals.md](memory-and-goals.md)
+- [hooks-plugins-skills.md](hooks-plugins-skills.md)
+- [permissions-and-sandbox.md](permissions-and-sandbox.md)
 - [providers.md](providers.md)
 - [architecture.md](architecture.md)

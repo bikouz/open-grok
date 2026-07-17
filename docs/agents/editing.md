@@ -125,7 +125,7 @@ Do **not**:
 - Allow `exec` to nest another `exec`/`wait` from inside JS
 - Expose freeform `exec` as a JSON-schema function tool
 
-Contract: [`../code-mode-port.md`](../code-mode-port.md).
+Deep map: [code-mode.md](code-mode.md). Parity contract: [`../code-mode-port.md`](../code-mode-port.md).
 
 ## Permissions that affect edits
 
@@ -175,5 +175,6 @@ cargo test --locked -p xai-grok-shell -- plan_mode
 ## See also
 
 - [agent-runtime.md](agent-runtime.md)
+- [tools.md](tools.md)
 - [providers.md](providers.md) (Codex toolset selection)
 - User guide: plan mode, permissions, sessions

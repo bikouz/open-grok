@@ -175,6 +175,8 @@ Locations: `$OPENGROK_HOME/hooks/*.json`, project `.opengrok/hooks/`, vendor com
 **Trust:** project hooks require folder trust (`trusted_folders.toml`).  
 **Security:** only **PreToolUse** can block; hooks fail open — not a sole security boundary.
 
+Deep map: [hooks-plugins-skills.md](hooks-plugins-skills.md).
+
 ## Plugins and marketplace
 
 | Item | Path |
@@ -187,6 +189,8 @@ Plugin layout: `skills/`, `commands/`, `agents/`, `hooks/hooks.json`, `.mcp.json
 
 Scopes: user `$OPENGROK_HOME/plugins/`, project `.opengrok/plugins/`, CLI `--plugin-dir`, session meta.
 
+Deep map: [hooks-plugins-skills.md](hooks-plugins-skills.md).
+
 ## Skills
 
 | Item | Path |
@@ -198,6 +202,8 @@ Scopes: user `$OPENGROK_HOME/plugins/`, project `.opengrok/plugins/`, CLI `--plu
 Priority (high → low): cwd / repo `.opengrok/skills` & `commands`, `.agents/`, vendor dirs (compat toggles), user `$OPENGROK_HOME/skills`.  
 Flat `commands/*.md` become slash commands.  
 Skill roots are **not** filtered by `.gitignore` — use `[skills] ignore` / `disabled`.
+
+Deep map: [hooks-plugins-skills.md](hooks-plugins-skills.md).
 
 ## MCP
 
