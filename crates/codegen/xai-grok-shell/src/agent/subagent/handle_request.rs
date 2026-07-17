@@ -1269,6 +1269,8 @@ pub(crate) async fn handle_subagent_request(
     };
     if cancel_token.is_cancelled() {
         pending_guard.defuse();
+        ctx.workspace_ops
+            .end_local_session(child_session_id.0.as_ref());
         cancel_pending_subagent_at_promote(
                 request,
                 &child_handle,
@@ -1952,6 +1954,8 @@ pub(crate) async fn handle_subagent_request(
         (None, None) => {}
     }
     let _ = child_handle.cmd_tx.send(SessionCommand::Shutdown);
+    ctx.workspace_ops
+        .end_local_session(child_session_id.0.as_ref());
     let mut disposed_snapshot_ref: Option<String> = None;
     let mut worktree_removed = false;
     if let Some(ref wt_path) = worktree_path {

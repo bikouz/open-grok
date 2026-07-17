@@ -58,7 +58,15 @@ impl MvpAgent {
         self.session_threads.borrow_mut().remove(id);
         self.session_index_claims.borrow_mut().remove(id);
         self.require_gateway_sessions.borrow_mut().remove(id);
+        self.model_unavailable_sessions
+            .borrow_mut()
+            .remove(id.0.as_ref());
+        self.permission_event_receivers.borrow_mut().remove(id);
+        self.session_turn_numbers.borrow_mut().remove(id);
         self.session_live_state.borrow_mut().remove(id);
+        if let Some(ops) = self.workspace_ops.borrow().as_ref() {
+            ops.end_local_session(id.0.as_ref());
+        }
     }
     /// Get-or-create the per-session prompt-intake lock (see
     /// [`Self::prompt_intake_locks`]). Cheap clone of the shared `Rc`.
