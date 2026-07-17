@@ -200,6 +200,11 @@ async fn run_setup_command(json: bool) {
                 "Your team doesn't have a managed configuration yet. A team admin can set one up at console.x.ai."
             );
         }
+        SetupOutcome::Skipped => {
+            eprintln!(
+                "Managed configuration was not applied this run (another process held the apply lock, or the credential changed during the fetch). Run `open-grok setup` again."
+            );
+        }
         SetupOutcome::Failed(e) => {
             eprintln!("Couldn't apply managed configuration. {e}");
             std::process::exit(1);
