@@ -20,7 +20,7 @@ fn select_memory_embedding_route(
         return (route.base_url.clone(), route.api_key.clone());
     }
     if active.provider == xai_grok_sampling_types::ModelProvider::Xai
-        && crate::util::is_first_party_xai_url(&active.base_url)
+        && crate::util::is_xai_api_bearer_url(&active.base_url)
     {
         return (active.base_url.clone(), active.api_key.clone());
     }
@@ -32,7 +32,7 @@ fn memory_embedding_uses_live_xai_auth(
     route_key: Option<&str>,
     xai_auth_key: Option<&str>,
 ) -> bool {
-    crate::util::is_first_party_xai_url(base_url)
+    crate::util::is_xai_api_bearer_url(base_url)
         && xai_auth_key.is_some_and(|xai_key| route_key.is_none_or(|key| key == xai_key))
 }
 
@@ -564,7 +564,7 @@ pub(crate) async fn spawn_session_actor(
         resolved_xai_embedding.as_ref(),
         &endpoints.resolve_inference_base_url(),
     );
-    let embedding_route_is_first_party = crate::util::is_first_party_xai_url(&embed_base_url);
+    let embedding_route_is_first_party = crate::util::is_xai_api_bearer_url(&embed_base_url);
     let embedding_uses_live_xai_auth = memory_embedding_uses_live_xai_auth(
         &embed_base_url,
         embed_api_key.as_deref(),
@@ -890,6 +890,19 @@ pub(crate) async fn spawn_session_actor(
         } else {
             None
         };
+        let embedding_api_key_provider = (embedding_route_is_first_party
+            && (embed_api_key.is_none() || embedding_uses_live_xai_auth))
+            .then(|| api_key_provider.clone())
+            .flatten();
+        let embedding_auth_manager = embedding_uses_live_xai_auth
+            .then(|| auth_manager.as_ref())
+            .flatten();
+        let embedding_credentials = crate::auth::credential_provider::embedding_session_credentials(
+            &embed_base_url,
+            embedding_auth_manager,
+            embedding_api_key_provider,
+            embedding_alpha_test_key.clone(),
+        );
         let params = crate::session::memory::MemoryBackendParams {
             session_id: session_info.id.to_string(),
             embed_config: memory_embedding_config.clone(),
@@ -901,26 +914,10 @@ pub(crate) async fn spawn_session_actor(
             watcher,
             stale_claim_secs: watcher_config.stale_claim_secs,
             search_source: "tool",
-            // Only first-party xAI routes may consult the shared xAI auth
-            // cell. Custom/BYOK endpoints retain their own resolved static
-            // credential and never receive the logged-in xAI bearer.
-            api_key_provider: (embedding_route_is_first_party
-                && (embed_api_key.is_none() || embedding_uses_live_xai_auth))
-                .then(|| api_key_provider.clone())
-                .flatten(),
-            auth_credentials: embedding_uses_live_xai_auth
-                .then(|| auth_manager.as_ref())
-                .flatten()
-                .map(|am| {
-                    std::sync::Arc::new(
-                        crate::auth::credential_provider::ShellAuthCredentialProvider::new(
-                            am.clone(),
-                            None,
-                            embedding_alpha_test_key.clone(),
-                        ),
-                    )
-                        as std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider>
-                }),
+            // Only the exact trusted HTTPS xAI route may consult the shared
+            // xAI auth cell. Custom/BYOK endpoints retain only their resolved
+            // route-owned static credential.
+            embedding_credentials,
         };
         let backend = crate::session::memory::MemoryBackendImpl::from_session_params(
             storage.clone(),

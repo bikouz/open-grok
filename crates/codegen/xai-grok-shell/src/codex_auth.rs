@@ -443,6 +443,9 @@ pub fn auth_required_error() -> agent_client_protocol::Error {
 }
 
 fn load_store_at(path: &Path) -> io::Result<Option<CodexAuthStore>> {
+    // A hand-copied or restored token store may carry loose permissions.
+    // Tighten it before reading any credential material into the process.
+    crate::util::secure_file::ensure_owner_only_permissions(path)?;
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -587,6 +590,7 @@ fn save_store_at(path: &Path, store: &CodexAuthStore) -> io::Result<()> {
         std::fs::remove_file(path)?;
     }
     std::fs::rename(&temp, path)?;
+    crate::util::secure_file::ensure_owner_only_permissions(path)?;
     clear_permanent_refresh_failure(path);
     Ok(())
 }
@@ -1592,14 +1596,24 @@ mod tests {
             last_refresh: Some(Utc::now()),
         };
         save_store_at(&path, &store).unwrap();
-        assert_eq!(load_store_at(&path).unwrap(), Some(store));
         assert!(!dir.path().join("auth.json").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert_eq!(load_store_at(&path).unwrap(), Some(store));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "loading a restored Codex credential store must tighten its permissions"
             );
         }
     }

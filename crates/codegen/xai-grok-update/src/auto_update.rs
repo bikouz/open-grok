@@ -477,11 +477,10 @@ pub async fn run_update_if_available(
     interactive: bool,
     update_config: &UpdateConfig,
 ) -> Result<bool> {
-    let installer = get_installer().await;
-    if installer.is_none() {
+    let Some(inst) = get_installer().await else {
         // Skip update check if no known installer.
         return Ok(false);
-    }
+    };
 
     if is_version_cache_fresh().await {
         return Ok(false);
@@ -509,8 +508,6 @@ pub async fn run_update_if_available(
     }
 
     let current_version = get_installed_grok_version();
-    // installer is guaranteed Some by the guard at the top of this function.
-    let inst = installer.unwrap();
     // Fetch without writing version.json — we only cache after confirming the
     // update is not needed or after a successful blocking install. This prevents
     // a failed background download from suppressing retries for the TTL window.

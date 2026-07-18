@@ -172,6 +172,7 @@ pub fn signed_team_body(
     requirements: Option<&str>,
 ) -> String {
     let payload = SignedPayload {
+        typ: xai_grok_config::signed_policy::MANAGED_POLICY_TYP.into(),
         version: prod_mc_cli_chat_proxy_types::SIGNED_PAYLOAD_VERSION,
         deployment_id: None,
         team_id: Some(team_id.to_owned()),

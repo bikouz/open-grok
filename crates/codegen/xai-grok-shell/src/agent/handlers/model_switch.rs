@@ -50,8 +50,8 @@ async fn apply_with_resolved_tool_policy(
     // Serialize the full harness/model transaction with prompt intake. A
     // prompt already enqueued wins FIFO and makes the actor's active-turn gate
     // reject this switch; a later prompt cannot enter the atomic actor command.
-    let prompt_intake_lock = agent.prompt_intake_lock(&session_id);
-    let _prompt_intake_guard = prompt_intake_lock.lock().await;
+    let dispatch_lock = agent.dispatch_lock(&session_id);
+    let _dispatch_guard = dispatch_lock.lock().await;
     let handle = agent
         .session_handle_waiting_for_load(&session_id)
         .await

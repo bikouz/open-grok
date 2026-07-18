@@ -307,6 +307,10 @@ pub struct SessionStateCopy {
 pub enum PersistenceMsg {
     /// A session update (ACP update or xAI extension update)
     Update(SessionUpdate),
+    AppendUpdateDurablyAndAck {
+        update: SessionUpdate,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     ContentChunk(PersistenceContentChunk),
     Chat(ConversationItem),
     /// Replace the entire chat history (used for compaction)
@@ -1682,38 +1686,76 @@ impl SessionPersistence {
         }
     }
 
-    async fn write_update(&mut self, update: &SessionUpdate) {
-        if let Err(e) = self.storage.append_update(&self.info, update).await {
-            tracing::warn!(?e, "failed to write update");
+    async fn write_update(
+        &self,
+        update: &SessionUpdate,
+    ) -> Result<(), crate::session::storage::AppendUpdateError> {
+        self.storage
+            .append_update_commit_aware(&self.info, update)
+            .await
+    }
+
+    fn queue_acp_sync(&self, notification: acp::SessionNotification) {
+        if !self.provider_boundary.allows_xai_export() {
+            return;
         }
+        if let Some(sync) = &self.remote_sync {
+            sync.queue(notification.clone());
+        }
+        if let Some(relay) = &self.relay_sync {
+            relay.queue(notification);
+        }
+    }
+
+    fn finish_pending_append(
+        pending: &mut Option<acp::SessionNotification>,
+        notification: acp::SessionNotification,
+        result: Result<(), crate::session::storage::AppendUpdateError>,
+    ) -> Result<acp::SessionNotification, io::Error> {
+        match result {
+            Ok(()) => Ok(notification),
+            Err(crate::session::storage::AppendUpdateError::NotCommitted(error)) => {
+                *pending = Some(notification);
+                Err(error)
+            }
+            Err(crate::session::storage::AppendUpdateError::Committed(error)) => Err(error),
+        }
+    }
+
+    async fn drain_pending(&mut self) -> io::Result<()> {
+        if let Some(notification) = self.pending_notification.take() {
+            let result = self
+                .write_update(&SessionUpdate::Acp(Box::new(notification.clone())))
+                .await;
+            match Self::finish_pending_append(
+                &mut self.pending_notification,
+                notification.clone(),
+                result,
+            ) {
+                Ok(notification) => self.queue_acp_sync(notification),
+                Err(error) => {
+                    // A committed append still belongs in remote sync. An
+                    // uncommitted append was restored to the pending slot.
+                    if self.pending_notification.is_none() {
+                        self.queue_acp_sync(notification);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Flush any pending merged ACP notification to disk and remote sync.
     async fn flush_pending(&mut self) {
-        // Write any pending merged ACP notification
-        if let Some(notification) = self.pending_notification.take() {
-            self.write_update(&SessionUpdate::Acp(Box::new(notification.clone())))
-                .await;
-            // HTTP-based remote sync (Writeback mode)
-            if self.provider_boundary.allows_xai_export()
-                && let Some(sync) = &self.remote_sync
-            {
-                sync.queue(notification.clone());
-            }
-            // WebSocket-based relay sync (real-time sharing)
-            if self.provider_boundary.allows_xai_export()
-                && let Some(relay) = &self.relay_sync
-            {
-                relay.queue(notification);
-            }
+        if let Err(error) = self.drain_pending().await {
+            tracing::warn!(?error, "failed to write pending update");
         }
-        // Flush HTTP sync
         if self.provider_boundary.allows_xai_export()
             && let Some(sync) = &self.remote_sync
         {
             sync.flush();
         }
-        // Flush WebSocket relay
         if self.provider_boundary.allows_xai_export()
             && let Some(relay) = &self.relay_sync
         {
@@ -1756,27 +1798,39 @@ impl SessionPersistence {
                         SessionUpdate::Acp(notification) => {
                             // ACP notifications use merging to coalesce consecutive text chunks
                             if let Some(to_write) = self.maybe_merge_notification(&notification) {
-                                self.write_update(&SessionUpdate::Acp(Box::new(to_write.clone())))
-                                    .await;
-                                // HTTP-based remote sync (Writeback mode)
-                                if self.provider_boundary.allows_xai_export()
-                                    && let Some(sync) = &self.remote_sync
+                                match self
+                                    .write_update(&SessionUpdate::Acp(Box::new(to_write.clone())))
+                                    .await
                                 {
-                                    sync.queue(to_write.clone());
-                                }
-                                // WebSocket-based relay sync (real-time sharing)
-                                if self.provider_boundary.allows_xai_export()
-                                    && let Some(relay) = &self.relay_sync
-                                {
-                                    relay.queue(to_write);
+                                    Ok(())
+                                    | Err(crate::session::storage::AppendUpdateError::Committed(
+                                        _,
+                                    )) => self.queue_acp_sync(to_write),
+                                    Err(error) => tracing::warn!(%error, "failed to write update"),
                                 }
                             }
                         }
                         SessionUpdate::Xai(_) => {
                             // xAI notifications are written directly without merging
-                            self.write_update(&update).await;
+                            if let Err(error) = self.write_update(&update).await {
+                                tracing::warn!(%error, "failed to write update");
+                            }
                         }
                     }
+                }
+                PersistenceMsg::AppendUpdateDurablyAndAck { update, respond_to } => {
+                    let result = async {
+                        self.drain_pending().await?;
+                        self.storage
+                            .append_update_durable(&self.info, &update)
+                            .await?;
+                        if let SessionUpdate::Acp(notification) = update {
+                            self.queue_acp_sync(*notification);
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::Chat(chat_msg) => {
                     if let Err(e) = self
@@ -2849,6 +2903,10 @@ fn classify_remote_delete(
         Err(e) => Err(DeleteSessionError::Remote(e)),
     }
 }
+
+#[cfg(test)]
+#[path = "persistence_tests.rs"]
+mod durable_update_tests;
 
 #[cfg(test)]
 mod delete_session_history_tests {

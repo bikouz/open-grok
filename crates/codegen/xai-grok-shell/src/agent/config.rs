@@ -4850,7 +4850,7 @@ fn trusted_built_in_session_endpoint(provider: ModelProvider, base_url: &str) ->
             provider.is_kimi() && crate::kimi_models::is_trusted_api_base_url(base_url)
         }
         xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
-            crate::util::is_first_party_xai_url(base_url)
+            crate::util::is_xai_api_bearer_url(base_url)
         }
         xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth => {
             crate::codex_auth::is_trusted_inference_base_url(base_url)
@@ -5018,7 +5018,7 @@ pub fn enforce_disable_api_key_auth(
 ) {
     if disable_api_key_auth
         && creds.auth_type == xai_chat_state::AuthType::ApiKey
-        && crate::util::is_first_party_xai_url(&creds.base_url)
+        && crate::util::is_xai_api_url(&creds.base_url)
     {
         creds.auth_type = xai_chat_state::AuthType::SessionToken;
         creds.api_key = session_key.map(str::to_owned);
