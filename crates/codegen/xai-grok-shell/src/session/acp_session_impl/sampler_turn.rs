@@ -153,21 +153,24 @@ pub(super) enum TurnAuthRefreshRoute {
 pub(super) fn turn_auth_refresh_route(
     provider: xai_grok_sampling_types::ModelProvider,
     auth_type: xai_chat_state::AuthType,
+    xai_session_gate_active: bool,
 ) -> TurnAuthRefreshRoute {
-    match (provider.profile().session_auth, auth_type) {
-        (
-            xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly,
-            xai_chat_state::AuthType::SessionToken,
-        ) => TurnAuthRefreshRoute::ConfigApiKey,
-        (
-            xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth,
-            xai_chat_state::AuthType::SessionToken,
-        ) => TurnAuthRefreshRoute::CodexOAuth,
-        (
-            xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession,
-            xai_chat_state::AuthType::SessionToken,
-        ) => TurnAuthRefreshRoute::XaiSession,
-        (_, xai_chat_state::AuthType::ApiKey) => TurnAuthRefreshRoute::ConfigApiKey,
+    match provider.profile().session_auth {
+        xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
+            TurnAuthRefreshRoute::ConfigApiKey
+        }
+        xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth
+            if auth_type == xai_chat_state::AuthType::SessionToken =>
+        {
+            TurnAuthRefreshRoute::CodexOAuth
+        }
+        xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession if xai_session_gate_active => {
+            TurnAuthRefreshRoute::XaiSession
+        }
+        xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth
+        | xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
+            TurnAuthRefreshRoute::ConfigApiKey
+        }
     }
 }
 /// Run a tool call; on an auth-shaped failure, attempt recovery via
@@ -382,8 +385,8 @@ impl SessionActor {
     }
     /// Gate inputs for `model_id` routed to `base_url`. See
     /// [`crate::agent::auth_method::session_token_auth_gate`] for the rationale
-    /// (`base_url` keeps an `Unknown` BYOK status refreshable only
-    /// against first-party xAI hosts).
+    /// (`base_url` keeps every session-token refresh restricted to first-party
+    /// xAI hosts, including models classified as definitely non-BYOK).
     fn auth_gate(&self, model_id: &str, base_url: &str) -> SessionTokenAuthGate {
         let byok = self.model_auth_facts(model_id).byok;
         let auth_method = self.auth_method_id.load();
@@ -1478,8 +1481,14 @@ impl SessionActor {
             .as_ref()
             .map(|config| config.provider)
             .unwrap_or_default();
+        let (model_id, base_url) = sampling_config
+            .as_ref()
+            .map(|config| (config.model.as_str(), config.base_url.as_str()))
+            .unwrap_or_default();
+        let xai_session_gate_active = provider == xai_grok_sampling_types::ModelProvider::Xai
+            && self.auth_gate(model_id, base_url).active();
 
-        match turn_auth_refresh_route(provider, creds.auth_type) {
+        match turn_auth_refresh_route(provider, creds.auth_type, xai_session_gate_active) {
             TurnAuthRefreshRoute::CodexOAuth => {
                 let credentials = match crate::codex_auth::fresh_credentials().await {
                     Ok(credentials) => credentials,
@@ -1506,10 +1515,6 @@ impl SessionActor {
                     );
                     return;
                 };
-                let (model_id, base_url) = sampling_config
-                    .as_ref()
-                    .map(|config| (config.model.as_str(), config.base_url.as_str()))
-                    .unwrap_or_default();
                 if self.auth_gate(model_id, base_url).active()
                     && let Ok(key) = am.get_valid_token().await
                 {

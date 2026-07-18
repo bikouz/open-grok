@@ -3991,6 +3991,8 @@ pub struct ConfigModelOverride {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub supports_reasoning_effort: Option<bool>,
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    pub supports_reasoning_summary_parameter: Option<bool>,
+    pub default_reasoning_summary: Option<ReasoningSummary>,
     pub supports_backend_search: Option<bool>,
     /// Aliases must be registered in `config_model_override_parse::ALIASES`;
     /// serde rejects a table that contains both spellings otherwise.
@@ -4065,8 +4067,13 @@ impl ConfigModelOverride {
             entry.info.reasoning_effort = None;
             entry.info.supports_reasoning_effort = false;
             entry.info.reasoning_efforts.clear();
-            entry.info.supports_reasoning_summary_parameter = false;
-            entry.info.default_reasoning_summary = ReasoningSummary::None;
+            let supports_reasoning_summary = entry.info.provider == ModelProvider::Codex;
+            entry.info.supports_reasoning_summary_parameter = supports_reasoning_summary;
+            entry.info.default_reasoning_summary = if supports_reasoning_summary {
+                ReasoningSummary::Detailed
+            } else {
+                ReasoningSummary::None
+            };
             entry.info.compactions_remaining = None;
             entry.info.compaction_at_tokens = None;
             entry.info.show_model_fingerprint = false;
@@ -4135,6 +4142,12 @@ impl ConfigModelOverride {
         }
         if !self.reasoning_efforts.is_empty() {
             entry.info.reasoning_efforts = self.reasoning_efforts.clone();
+        }
+        if let Some(v) = self.supports_reasoning_summary_parameter {
+            entry.info.supports_reasoning_summary_parameter = v;
+        }
+        if let Some(v) = self.default_reasoning_summary {
+            entry.info.default_reasoning_summary = v;
         }
         if let Some(v) = self.supports_backend_search {
             entry.info.supports_backend_search = v;
@@ -6667,7 +6680,13 @@ reasoning_effort = "low"
         let alias = "GROK_TEST_EMPTY_ENV_LC_ALIAS";
         let _primary = EnvGuard::set(primary, "");
         let _alias = EnvGuard::set(alias, "");
-        let mut model = test_model_entry("m", "https://inference.example/v1", None, None, None);
+        let mut model = test_model_entry(
+            "m",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+            None,
+            None,
+            None,
+        );
         model.env_key = Some(EnvKeys::new([primary, alias]));
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, Some("session-jwt"));
@@ -6687,7 +6706,13 @@ reasoning_effort = "low"
         let _alias = EnvGuard::set(alias, "");
         let _global = EnvGuard::set(XAI_API_KEY_ENV_VAR, sentinel);
         let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        let mut model = test_model_entry("m", "https://inference.example/v1", None, None, None);
+        let mut model = test_model_entry(
+            "m",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+            None,
+            None,
+            None,
+        );
         model.env_key = Some(EnvKeys::new([primary, alias]));
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, None);
@@ -6697,7 +6722,13 @@ reasoning_effort = "low"
     #[test]
     fn resolve_credentials_empty_api_key_falls_through_to_session() {
         use xai_chat_state::AuthType;
-        let model = test_model_entry("m", "https://inference.example/v1", Some(""), None, None);
+        let model = test_model_entry(
+            "m",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+            Some(""),
+            None,
+            None,
+        );
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, Some("session-jwt"));
         assert_eq!(creds.auth_type, AuthType::SessionToken);
@@ -6727,7 +6758,13 @@ reasoning_effort = "low"
     #[test]
     fn resolve_credentials_sets_auth_type() {
         use xai_chat_state::AuthType;
-        let model = test_model_entry("m", "https://example.com/v1", None, None, None);
+        let model = test_model_entry(
+            "m",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
+            None,
+            None,
+            None,
+        );
         let creds = resolve_credentials(&model, Some("tok"));
         assert_eq!(creds.auth_type, AuthType::SessionToken);
         let byok = test_model_entry("m", "https://example.com/v1", Some("key"), None, None);
@@ -8704,10 +8741,10 @@ reasoning_effort = "low"
         );
         let model_no_key = test_model_entry(
             "test",
-            "https://proxy.api/v1",
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
             None,
             None,
-            Some("https://api.x.ai/v1"),
+            Some(XAI_API_BASE_URL_DEFAULT),
         );
         let sampling = resolve_sampling(&model_no_key, Some("session-key"));
         assert_eq!(
@@ -8716,7 +8753,8 @@ reasoning_effort = "low"
             "session token should beat env key when model has no own credentials"
         );
         assert_eq!(
-            sampling.base_url, "https://proxy.api/v1",
+            sampling.base_url,
+            crate::env::PROD_CLI_CHAT_PROXY_BASE_URL,
             "session auth should use base_url, not api_base_url"
         );
         let sampling = resolve_sampling(&model_no_key, None);
@@ -8726,7 +8764,7 @@ reasoning_effort = "low"
             "env key should be used when no session and no model credentials"
         );
         assert_eq!(
-            sampling.base_url, "https://api.x.ai/v1",
+            sampling.base_url, XAI_API_BASE_URL_DEFAULT,
             "env key should route to api_base_url"
         );
         unsafe { std::env::remove_var("XAI_API_KEY") };
@@ -8794,7 +8832,28 @@ reasoning_effort = "low"
             !resolved.contains_key(crate::models::default_model()),
             "xAI default must not leak into enterprise model list"
         );
-        assert_eq!(resolved.len(), 1, "only the prefetched enterprise model");
+        let xai_entries = resolved
+            .iter()
+            .filter(|(_, entry)| entry.info.provider == ModelProvider::Xai)
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            xai_entries,
+            vec!["acme-model"],
+            "the enterprise catalog replaces only the xAI provider partition"
+        );
+        assert!(
+            resolved
+                .values()
+                .any(|entry| entry.info.provider == ModelProvider::Codex),
+            "isolated Codex fallbacks remain available"
+        );
+        assert!(
+            resolved
+                .values()
+                .any(|entry| entry.info.provider == ModelProvider::Kimi),
+            "isolated Kimi fallbacks remain available"
+        );
     }
     #[test]
     fn e2e_default_endpoint_still_injects_defaults() {
@@ -12477,6 +12536,8 @@ default = "grok-4.5"
             tool_mode: Some(ToolMode::CodeMode),
             agent_type: Some("custom-harness".to_owned()),
             supports_backend_search: Some(true),
+            supports_reasoning_summary_parameter: Some(true),
+            default_reasoning_summary: Some(ReasoningSummary::Detailed),
             extra_headers: [("x-custom".to_owned(), "fresh".to_owned())]
                 .into_iter()
                 .collect(),
@@ -12491,6 +12552,11 @@ default = "grok-4.5"
         assert_eq!(entry.info.tool_mode, Some(ToolMode::CodeMode));
         assert_eq!(entry.info.agent_type, "custom-harness");
         assert!(entry.info.supports_backend_search);
+        assert!(entry.info.supports_reasoning_summary_parameter);
+        assert_eq!(
+            entry.info.default_reasoning_summary,
+            ReasoningSummary::Detailed
+        );
         assert!(!entry.info.codex_multi_agent_v2);
         assert_eq!(entry.info.auth_scheme, AuthScheme::XApiKey);
         assert_eq!(entry.info.extra_headers["x-custom"], "fresh");

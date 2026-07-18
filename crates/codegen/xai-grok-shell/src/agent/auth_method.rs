@@ -373,22 +373,16 @@ impl ModelByok {
 /// a live session to non-refreshable api-key mode: that re-sends the stale
 /// buffered token on every turn and 401s with `bad-credentials` until restart
 /// (the stale-token regression this gate addresses; fall back rather than
-/// demote on `Unknown`). It refreshes when `endpoint_is_first_party` — the
-/// request targets a first-party host (cli-chat-proxy / first-party API),
-/// where sending the session token cannot leak to a third-party BYOK
-/// endpoint. A definite `NotByok` always refreshes (it only ever routes to
-/// the session endpoint); a definite `Byok` never does.
+/// demote on `Unknown`). Every refresh also requires
+/// `endpoint_is_first_party`: even a definite `NotByok` model can be routed to
+/// a custom endpoint, and built-in session credentials must never cross that
+/// trust boundary. A definite `Byok` never refreshes.
 pub fn session_token_auth_gate(
     is_session_based_method: bool,
     model_byok: ModelByok,
     endpoint_is_first_party: bool,
 ) -> bool {
-    is_session_based_method
-        && match model_byok {
-            ModelByok::NotByok => true,
-            ModelByok::Byok => false,
-            ModelByok::Unknown => endpoint_is_first_party,
-        }
+    is_session_based_method && endpoint_is_first_party && model_byok != ModelByok::Byok
 }
 
 pub const AUTH_ERROR_SESSION_EXPIRED: &str =

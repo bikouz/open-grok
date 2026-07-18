@@ -640,7 +640,7 @@ impl SessionActor {
             .map(|config| config.provider)
             .unwrap_or_default();
         let summary_auth_type = self.chat_state_handle.get_credentials().await.auth_type;
-        if turn_auth_refresh_route(summary_auth_provider, summary_auth_type)
+        if turn_auth_refresh_route(summary_auth_provider, summary_auth_type, false)
             == TurnAuthRefreshRoute::CodexOAuth
         {
             self.refresh_token_if_expired().await;

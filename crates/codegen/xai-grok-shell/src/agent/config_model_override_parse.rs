@@ -269,7 +269,8 @@ mod tests {
     use super::*;
     use crate::sampling::ApiBackend;
     use xai_grok_sampling_types::{
-        CompactionAtTokens, CompactionsRemaining, ReasoningEffort, ReasoningEffortOption, ToolMode,
+        CompactionAtTokens, CompactionsRemaining, ReasoningEffort, ReasoningEffortOption,
+        ReasoningSummary, ToolMode,
     };
 
     fn parse_cfg(toml_str: &str) -> crate::agent::config::Config {
@@ -534,6 +535,8 @@ mod tests {
                 description: Some("Deep reasoning".to_string()),
                 default: true,
             }],
+            supports_reasoning_summary_parameter: Some(true),
+            default_reasoning_summary: Some(ReasoningSummary::Detailed),
             supports_backend_search: Some(false),
             compactions_remaining: Some(CompactionsRemaining::Fixed(1)),
             compaction_at_tokens: Some(CompactionAtTokens::Fixed(100_000)),

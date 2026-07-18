@@ -107,6 +107,15 @@ async fn make_actor_with_method_and_credentials(
     let mut actor = create_test_actor(50_000, 100_000, 85, gateway_tx, persistence_tx).await;
     actor.auth_manager = auth_manager;
     actor.auth_method_id = test_auth_method_id(auth_method_id);
+    let mut sampling_config = actor
+        .chat_state_handle
+        .get_sampling_config()
+        .await
+        .expect("test actor has sampling config");
+    sampling_config.base_url = crate::env::PROD_CLI_CHAT_PROXY_BASE_URL.to_owned();
+    actor
+        .chat_state_handle
+        .update_sampling_config(sampling_config);
     actor
         .chat_state_handle
         .update_credentials(xai_chat_state::Credentials {
@@ -581,18 +590,66 @@ fn session_token_auth_gate_truth_table() {
         assert!(!gate(false, ModelByok::NotByok, fp));
         assert!(!gate(false, ModelByok::Byok, fp));
         assert!(!gate(false, ModelByok::Unknown, fp));
-        // Session method: a definite classification ignores the endpoint —
-        // NotByok always refreshes (only ever routes to the session endpoint),
-        // a genuine per-model Byok never does.
-        assert!(gate(true, ModelByok::NotByok, fp));
+        // A genuine per-model BYOK model never refreshes.
         assert!(!gate(true, ModelByok::Byok, fp));
     }
-    // Session method + Unknown BYOK: refresh only against a first-party xAI
-    // host, so a transiently-unclassifiable config can't demote a live session
-    // (the stale-token 401 regression) yet the session token never leaks to a
-    // third-party BYOK endpoint. This arm was unconditionally `false` pre-fix.
+    // Both definite non-BYOK and transiently Unknown models refresh only
+    // against a first-party xAI host. This heals stale session tokens without
+    // allowing any built-in credential onto a custom endpoint.
+    assert!(gate(true, ModelByok::NotByok, true));
+    assert!(!gate(true, ModelByok::NotByok, false));
     assert!(gate(true, ModelByok::Unknown, true));
     assert!(!gate(true, ModelByok::Unknown, false));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pre_flight_refresh_never_sends_session_token_to_untrusted_not_byok_endpoint() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("must-not-reach-vendor");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::ApiKey,
+                "unchanged-buffered-key".to_string(),
+            )
+            .await;
+
+            let mut chat_config = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has sampling config");
+            chat_config.base_url = "https://vendor.example/v1".to_owned();
+            let model = chat_config.model.clone();
+            actor.chat_state_handle.update_sampling_config(chat_config);
+            actor.model_auth_facts.replace(Some((
+                model,
+                ModelAuthFacts {
+                    byok: ModelByok::NotByok,
+                    auth_scheme: Default::default(),
+                    provider: xai_grok_sampling_types::ModelProvider::Xai,
+                },
+            )));
+
+            actor.refresh_token_if_expired().await;
+
+            assert_eq!(
+                actor
+                    .chat_state_handle
+                    .get_credentials()
+                    .await
+                    .api_key
+                    .as_deref(),
+                Some("unchanged-buffered-key"),
+                "an untrusted endpoint must never receive the built-in xAI session token"
+            );
+        })
+        .await;
 }
 
 /// Pre-fix, the gate read `auth_type` and skipped recovery here, 401'ing every
@@ -792,6 +849,7 @@ fn turn_auth_refresh_route_is_provider_and_provenance_aware() {
         turn_auth_refresh_route(
             xai_grok_sampling_types::ModelProvider::Codex,
             xai_chat_state::AuthType::SessionToken,
+            false,
         ),
         TurnAuthRefreshRoute::CodexOAuth,
     );
@@ -799,6 +857,7 @@ fn turn_auth_refresh_route_is_provider_and_provenance_aware() {
         turn_auth_refresh_route(
             xai_grok_sampling_types::ModelProvider::Xai,
             xai_chat_state::AuthType::SessionToken,
+            true,
         ),
         TurnAuthRefreshRoute::XaiSession,
     );
@@ -806,8 +865,36 @@ fn turn_auth_refresh_route_is_provider_and_provenance_aware() {
         turn_auth_refresh_route(
             xai_grok_sampling_types::ModelProvider::Codex,
             xai_chat_state::AuthType::ApiKey,
+            true,
         ),
         TurnAuthRefreshRoute::ConfigApiKey,
+    );
+    assert_eq!(
+        turn_auth_refresh_route(
+            xai_grok_sampling_types::ModelProvider::Xai,
+            xai_chat_state::AuthType::ApiKey,
+            true,
+        ),
+        TurnAuthRefreshRoute::XaiSession,
+        "the stable xAI session gate heals a transient ApiKey classification",
+    );
+    assert_eq!(
+        turn_auth_refresh_route(
+            xai_grok_sampling_types::ModelProvider::Xai,
+            xai_chat_state::AuthType::SessionToken,
+            false,
+        ),
+        TurnAuthRefreshRoute::ConfigApiKey,
+        "an inactive gate keeps session credentials away from BYOK or untrusted endpoints",
+    );
+    assert_eq!(
+        turn_auth_refresh_route(
+            xai_grok_sampling_types::ModelProvider::Kimi,
+            xai_chat_state::AuthType::SessionToken,
+            true,
+        ),
+        TurnAuthRefreshRoute::ConfigApiKey,
+        "API-key-only providers never inherit a built-in session refresh",
     );
 }
 
