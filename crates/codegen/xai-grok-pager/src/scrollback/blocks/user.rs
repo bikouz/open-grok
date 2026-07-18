@@ -255,8 +255,29 @@ impl UserPromptBlock {
         let theme = Theme::current();
         // Minimal mode engages this lock; read it here instead of app state.
         let terminal_native = crate::theme::cache::terminal_native_locked();
-        let (prefix_style, text_style, skill_style) = Self::prompt_styles(&theme, terminal_native);
-        let band = Self::prompt_band_color_for(&theme, is_selected, terminal_native);
+        self.wrap_prompt_lines_with_theme(
+            width,
+            max_lines,
+            show_prefix,
+            is_selected,
+            &theme,
+            terminal_native,
+        )
+    }
+
+    /// Shared implementation used by production with the detected theme and
+    /// by color-sensitive tests with an explicit, unquantized palette.
+    fn wrap_prompt_lines_with_theme(
+        &self,
+        width: u16,
+        max_lines: Option<usize>,
+        show_prefix: bool,
+        is_selected: bool,
+        theme: &Theme,
+        terminal_native: bool,
+    ) -> Vec<BlockLine> {
+        let (prefix_style, text_style, skill_style) = Self::prompt_styles(theme, terminal_native);
+        let band = Self::prompt_band_color_for(theme, is_selected, terminal_native);
         // Semantic line bg (not a "panel") so it survives minimal's flat_background.
         let with_band = |line: BlockLine| -> BlockLine {
             match band {
@@ -542,6 +563,27 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// Keep semantic color assertions meaningful when the outer test runner
+    /// sets `NO_COLOR=1` or uses `TERM=dumb`.
+    fn wrap_with_color_theme(
+        block: &UserPromptBlock,
+        width: u16,
+        max_lines: Option<usize>,
+        show_prefix: bool,
+        is_selected: bool,
+    ) -> (Vec<BlockLine>, Theme) {
+        let theme = Theme::groknight();
+        let lines = block.wrap_prompt_lines_with_theme(
+            width,
+            max_lines,
+            show_prefix,
+            is_selected,
+            &theme,
+            false,
+        );
+        (lines, theme)
+    }
+
     #[test]
     fn test_short_prompt_no_truncation() {
         let block = UserPromptBlock::new("hello");
@@ -629,10 +671,9 @@ mod tests {
     #[test]
     fn skill_with_args_only_command_is_teal() {
         let block = UserPromptBlock::skill("/pr-workflow create a ticket for this");
-        let lines = block.wrap_prompt_lines(80, None, true, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 80, None, true, false);
         assert_eq!(lines.len(), 1);
 
-        let theme = Theme::current();
         let spans = &lines[0].content.spans;
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[1].content.as_ref(), "/pr-workflow");
@@ -644,10 +685,9 @@ mod tests {
     #[test]
     fn skill_without_args_all_teal() {
         let block = UserPromptBlock::skill("/pr-workflow");
-        let lines = block.wrap_prompt_lines(80, None, true, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 80, None, true, false);
         assert_eq!(lines.len(), 1);
 
-        let theme = Theme::current();
         let spans = &lines[0].content.spans;
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[1].content.as_ref(), "/pr-workflow");
@@ -657,10 +697,9 @@ mod tests {
     #[test]
     fn skill_multiline_only_first_token_teal() {
         let block = UserPromptBlock::skill("/foo bar\nbaz");
-        let lines = block.wrap_prompt_lines(80, None, true, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 80, None, true, false);
         assert_eq!(lines.len(), 2);
 
-        let theme = Theme::current();
         let line0 = &lines[0].content.spans;
         assert_eq!(line0[1].content.as_ref(), "/foo");
         assert_eq!(line0[1].style.fg, Some(theme.accent_skill));
@@ -678,10 +717,9 @@ mod tests {
     fn mid_text_token_only_token_is_teal() {
         let text = "great /pr-workflow all good now";
         let block = UserPromptBlock::with_skill_tokens(text, vec![6..18]);
-        let lines = block.wrap_prompt_lines(80, None, true, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 80, None, true, false);
         assert_eq!(lines.len(), 1);
 
-        let theme = Theme::current();
         let spans = &lines[0].content.spans;
         assert_eq!(spans.len(), 4);
         assert_eq!(spans[1].content.as_ref(), "great ");
@@ -696,10 +734,9 @@ mod tests {
     fn mid_text_multiple_tokens_each_teal() {
         let text = "run /commit then /review please";
         let block = UserPromptBlock::with_skill_tokens(text, vec![4..11, 17..24]);
-        let lines = block.wrap_prompt_lines(80, None, true, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 80, None, true, false);
         assert_eq!(lines.len(), 1);
 
-        let theme = Theme::current();
         let teal: Vec<&str> = lines[0]
             .content
             .spans
@@ -715,10 +752,9 @@ mod tests {
         let text = "first line\nthen /model here";
         // "/model" starts after "first line\nthen " = 16 bytes.
         let block = UserPromptBlock::with_skill_tokens(text, vec![16..22]);
-        let lines = block.wrap_prompt_lines(80, None, true, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 80, None, true, false);
         assert_eq!(lines.len(), 2);
 
-        let theme = Theme::current();
         let line0 = &lines[0].content.spans;
         assert!(
             line0.iter().all(|s| s.style.fg != Some(theme.accent_skill)),
@@ -747,8 +783,7 @@ mod tests {
         );
         assert_eq!(block.skill_token_ranges, vec![7..13]);
 
-        let lines = block.wrap_prompt_lines(80, None, true, false);
-        let theme = Theme::current();
+        let (lines, theme) = wrap_with_color_theme(&block, 80, None, true, false);
         let teal: Vec<&str> = lines[0]
             .content
             .spans
@@ -763,8 +798,7 @@ mod tests {
     fn all_token_ranges_invalid_renders_plain() {
         let block = UserPromptBlock::with_skill_tokens("plain text", vec![100..200]);
         assert!(block.skill_token_ranges.is_empty());
-        let lines = block.wrap_prompt_lines(80, None, true, false);
-        let theme = Theme::current();
+        let (lines, theme) = wrap_with_color_theme(&block, 80, None, true, false);
         assert_eq!(lines[0].content.spans[1].style.fg, Some(theme.text_primary));
     }
 
@@ -786,10 +820,9 @@ mod tests {
         // truncating re-wrap must keep the visible head teal.
         let text = "one\ntwo\n/pr-workflow tail";
         let block = UserPromptBlock::with_skill_tokens(text, vec![8..20]);
-        let lines = block.wrap_prompt_lines(8, Some(3), false, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 8, Some(3), false, false);
         assert_eq!(lines.len(), 3);
 
-        let theme = Theme::current();
         let last = &lines[2].content;
         assert!(line_text(last).ends_with(" \u{2026}"));
         let teal = teal_text(last, &theme);
@@ -805,10 +838,9 @@ mod tests {
         // the ellipsis-reduced width, so it must survive whole and teal.
         let text = "one\ntwo\n/do-it more words here";
         let block = UserPromptBlock::with_skill_tokens(text, vec![8..14]);
-        let lines = block.wrap_prompt_lines(20, Some(3), false, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 20, Some(3), false, false);
         assert_eq!(lines.len(), 3);
 
-        let theme = Theme::current();
         let last = &lines[2].content;
         assert!(line_text(last).ends_with(" \u{2026}"));
         assert_eq!(teal_text(last, &theme), "/do-it");
@@ -827,10 +859,9 @@ mod tests {
         // the wrapper splits it mid-token; every piece must stay teal.
         let text = "aa /pr-workflow zz";
         let block = UserPromptBlock::with_skill_tokens(text, vec![3..15]);
-        let lines = block.wrap_prompt_lines(8, None, false, false);
+        let (lines, theme) = wrap_with_color_theme(&block, 8, None, false, false);
         assert!(lines.len() >= 2);
 
-        let theme = Theme::current();
         let teal_by_line: Vec<String> = lines
             .iter()
             .map(|l| teal_text(&l.content, &theme))

@@ -3219,7 +3219,9 @@ mod tests {
 
         // A `show_search_hint: false` picker (command palette / arg-picker family):
         // the cursor must track focus (`search_active`), not render always-on.
-        let theme = Theme::current();
+        // Use an explicit raw palette so `NO_COLOR=1` cannot collapse the
+        // inverse-video cursor and ordinary cells onto `Color::Reset`.
+        let theme = Theme::groknight();
         let config = cfg(false, false);
         let area = Rect::new(0, 0, 60, 16);
 

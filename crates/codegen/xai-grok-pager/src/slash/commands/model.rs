@@ -370,12 +370,15 @@ mod tests {
         // Enter so the effort sub-menu can render.
         let reasoning = items
             .iter()
-            .find(|i| i.match_text == "Reasoning X")
-            .unwrap();
+            .find(|i| i.insert_text.trim_end() == "Reasoning X")
+            .expect("reasoning model row");
         assert_eq!(reasoning.insert_text, "Reasoning X ");
 
         // Plain model has no trailing space -- Enter commits immediately.
-        let plain = items.iter().find(|i| i.match_text == "Grok 4.5").unwrap();
+        let plain = items
+            .iter()
+            .find(|i| i.insert_text == "Grok 4.5")
+            .expect("plain model row");
         assert_eq!(plain.insert_text, "Grok 4.5");
     }
 

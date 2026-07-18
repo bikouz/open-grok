@@ -2769,9 +2769,10 @@ mod command_palette_vim_input_tests {
             }
             let area = Rect::new(0, 0, 80, 24);
             let mut buf = Buffer::empty(area);
-            agent.draw_active_modal(area, &mut buf, crate::theme::Theme::current(), false);
-
-            let theme = crate::theme::Theme::current();
+            // Use an explicit raw palette so `NO_COLOR=1` cannot collapse the
+            // inverse-video cursor and ordinary cells onto `Color::Reset`.
+            let theme = crate::theme::Theme::groknight();
+            agent.draw_active_modal(area, &mut buf, theme, false);
             let search_bar = match agent.active_modal.as_ref() {
                 Some(ActiveModal::CommandPalette { state, .. }) => {
                     state
