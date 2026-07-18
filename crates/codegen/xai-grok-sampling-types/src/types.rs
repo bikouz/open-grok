@@ -1265,6 +1265,9 @@ pub struct ProviderProfile {
     pub code_mode_transport: CodeModeTransport,
     /// `None` means the provider accepts no hosted tools.
     pub hosted_tool_dialect: Option<HostedToolDialect>,
+    /// Whether this provider supplies its own model-facing web search.
+    /// Client-side fallback search must only be declared when this is false.
+    pub native_web_search: bool,
     pub request_metadata: RequestMetadataPolicy,
     pub session_auth: BuiltInSessionAuthKind,
     pub xai_services: XaiServicePolicy,
@@ -1280,6 +1283,7 @@ impl ProviderProfile {
         },
         code_mode_transport: CodeModeTransport::FunctionEnvelope,
         hosted_tool_dialect: Some(HostedToolDialect::Xai),
+        native_web_search: true,
         request_metadata: RequestMetadataPolicy::XGrokHeaders,
         session_auth: BuiltInSessionAuthKind::XaiSession,
         xai_services: XaiServicePolicy::Allowed,
@@ -1294,6 +1298,7 @@ impl ProviderProfile {
         },
         code_mode_transport: CodeModeTransport::NativeCustomGrammar,
         hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
+        native_web_search: true,
         request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
         session_auth: BuiltInSessionAuthKind::CodexOAuth,
         xai_services: XaiServicePolicy::Denied,
@@ -1311,6 +1316,7 @@ impl ProviderProfile {
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
+        native_web_search: false,
         request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
         session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
         xai_services: XaiServicePolicy::Denied,
@@ -1338,6 +1344,10 @@ impl ProviderProfile {
 
     pub const fn allows_xai_services(self) -> bool {
         self.xai_services.allows()
+    }
+
+    pub const fn has_native_web_search(self) -> bool {
+        self.native_web_search
     }
 
     pub const fn supports_backend(self, backend: &ApiBackend) -> bool {
@@ -1620,6 +1630,7 @@ mod tests {
             backends: ProviderBackends,
             code_mode_transport: CodeModeTransport,
             hosted_tools: Option<HostedToolDialect>,
+            native_web_search: bool,
             request_metadata: RequestMetadataPolicy,
             session_auth: BuiltInSessionAuthKind,
             xai_services: XaiServicePolicy,
@@ -1637,6 +1648,7 @@ mod tests {
                 },
                 code_mode_transport: CodeModeTransport::FunctionEnvelope,
                 hosted_tools: Some(HostedToolDialect::Xai),
+                native_web_search: true,
                 request_metadata: RequestMetadataPolicy::XGrokHeaders,
                 session_auth: BuiltInSessionAuthKind::XaiSession,
                 xai_services: XaiServicePolicy::Allowed,
@@ -1652,6 +1664,7 @@ mod tests {
                 },
                 code_mode_transport: CodeModeTransport::NativeCustomGrammar,
                 hosted_tools: Some(HostedToolDialect::OpenAi),
+                native_web_search: true,
                 request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
                 session_auth: BuiltInSessionAuthKind::CodexOAuth,
                 xai_services: XaiServicePolicy::Denied,
@@ -1667,6 +1680,7 @@ mod tests {
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
+                native_web_search: false,
                 request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
                 session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
                 xai_services: XaiServicePolicy::Denied,
@@ -1682,6 +1696,7 @@ mod tests {
             assert_eq!(profile.code_mode_transport, case.code_mode_transport);
             assert_eq!(profile.responses_dialect(), case.backends.responses);
             assert_eq!(profile.hosted_tool_dialect, case.hosted_tools);
+            assert_eq!(profile.has_native_web_search(), case.native_web_search);
             assert_eq!(profile.request_metadata, case.request_metadata);
             assert_eq!(profile.session_auth, case.session_auth);
             assert_eq!(profile.xai_services, case.xai_services);

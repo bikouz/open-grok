@@ -158,7 +158,13 @@ impl WebFetchToolConfig {
 #[serde(default)]
 pub struct ShellToolsetConfig {
     pub bash: BashToolConfig,
+    /// Runtime-only sampler configuration. This is resolved from the active
+    /// model and credentials and must never be written to config.toml.
+    #[serde(skip)]
     pub web_search: SamplerConfig,
+    /// Opt-in Perplexity fallback for providers without native web search.
+    #[serde(default)]
+    pub perplexity_web_search: PerplexityWebSearchToolConfig,
     /// Web fetch tool parameters (`[toolset.web_fetch]`).
     #[serde(default)]
     pub web_fetch: WebFetchToolConfig,
@@ -243,6 +249,7 @@ impl ShellToolsetConfig {
         let mut toolset = base.unwrap_or_else(|| Self {
             bash: BashToolConfig::default(),
             web_search: web_search_sampling_config(default_base),
+            perplexity_web_search: PerplexityWebSearchToolConfig::default(),
             web_fetch: WebFetchToolConfig::default(),
             ask_user_question: AskUserQuestionToolConfig::default(),
             file_toolset: FileToolset::default(),
@@ -275,6 +282,13 @@ impl ShellToolsetConfig {
         }
         self.file_toolset
     }
+}
+
+/// Persisted configuration for the Perplexity-backed local web search tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PerplexityWebSearchToolConfig {
+    pub enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +431,26 @@ impl FileToolset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perplexity_web_search_defaults_disabled_and_serializes_without_runtime_sampler() {
+        let mut config = ShellToolsetConfig::default();
+        config.web_search.api_key = Some("runtime-secret".to_owned());
+        config.perplexity_web_search.enabled = true;
+
+        let serialized = toml::to_string(&config).expect("toolset config serializes");
+
+        assert!(serialized.contains("[perplexity_web_search]"));
+        assert!(serialized.contains("enabled = true"));
+        assert!(!serialized.contains("runtime-secret"));
+        assert!(!serialized.contains("api.x.ai"));
+
+        let parsed: ShellToolsetConfig =
+            toml::from_str("[perplexity_web_search]\nenabled = true\n")
+                .expect("persisted Perplexity config parses");
+        assert!(parsed.perplexity_web_search.enabled);
+        assert!(parsed.web_search.api_key.is_none());
+    }
 
     #[test]
     fn file_toolset_default_is_standard() {

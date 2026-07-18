@@ -363,6 +363,7 @@ fn provider_api_key_scope(provider: ModelProvider) -> String {
 }
 
 const KIMI_CODE_API_KEY_SCOPE: &str = "kimi_code::api_key";
+const PERPLEXITY_API_KEY_SCOPE: &str = "perplexity::api_key";
 
 fn kimi_api_key_scope(endpoint: KimiApiEndpoint) -> String {
     match endpoint {
@@ -519,6 +520,39 @@ pub fn clear_kimi_api_key(grok_home: &Path, endpoint: KimiApiEndpoint) -> std::i
     clear_scoped_api_key(grok_home, &kimi_api_key_scope(endpoint))
 }
 
+/// Read the Perplexity Search API key from its isolated auth.json scope.
+pub fn read_perplexity_api_key(grok_home: &Path) -> Option<String> {
+    let path = grok_home.join("auth.json");
+    let map = read_auth_json(&path).ok()?;
+    map.get(PERPLEXITY_API_KEY_SCOPE)
+        .map(|auth| auth.key.clone())
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Return Perplexity credential presence without cloning secret material.
+pub fn perplexity_api_key_is_configured(grok_home: &Path) -> bool {
+    let path = grok_home.join("auth.json");
+    let Ok(map) = read_auth_json(&path) else {
+        return false;
+    };
+    map.get(PERPLEXITY_API_KEY_SCOPE)
+        .is_some_and(|auth| !auth.key.trim().is_empty())
+}
+
+/// Store the Perplexity Search API key in owner-only auth.json.
+pub fn store_perplexity_api_key(grok_home: &Path, api_key: &str) -> std::io::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return clear_perplexity_api_key(grok_home);
+    }
+    store_scoped_api_key(grok_home, PERPLEXITY_API_KEY_SCOPE, api_key)
+}
+
+/// Clear only the Perplexity credential scope.
+pub fn clear_perplexity_api_key(grok_home: &Path) -> std::io::Result<()> {
+    clear_scoped_api_key(grok_home, PERPLEXITY_API_KEY_SCOPE)
+}
+
 #[cfg(test)]
 mod provider_api_key_tests {
     use super::*;
@@ -595,6 +629,39 @@ mod provider_api_key_tests {
             read_kimi_api_key(dir.path(), KimiApiEndpoint::Code).as_deref(),
             Some("code-secret")
         );
+    }
+
+    #[test]
+    fn perplexity_key_round_trip_and_clear_preserve_unrelated_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        store_api_key(dir.path(), "xai-secret").unwrap();
+        store_kimi_api_key(dir.path(), KimiApiEndpoint::Code, "kimi-code-secret").unwrap();
+        store_perplexity_api_key(dir.path(), "pplx-secret").unwrap();
+
+        assert_eq!(
+            read_perplexity_api_key(dir.path()).as_deref(),
+            Some("pplx-secret")
+        );
+        assert!(perplexity_api_key_is_configured(dir.path()));
+
+        clear_perplexity_api_key(dir.path()).unwrap();
+
+        assert!(!perplexity_api_key_is_configured(dir.path()));
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+        assert_eq!(
+            read_kimi_api_key(dir.path(), KimiApiEndpoint::Code).as_deref(),
+            Some("kimi-code-secret")
+        );
+    }
+
+    #[test]
+    fn empty_perplexity_key_clears_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        store_perplexity_api_key(dir.path(), "pplx-secret").unwrap();
+
+        store_perplexity_api_key(dir.path(), "  ").unwrap();
+
+        assert!(read_perplexity_api_key(dir.path()).is_none());
     }
 
     #[test]
