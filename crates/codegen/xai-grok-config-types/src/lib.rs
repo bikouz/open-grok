@@ -815,6 +815,9 @@ pub struct ContextualHintsRemote {
     /// Word-select tip after double-click fold/nav (settings discoverability).
     #[serde(default)]
     pub word_select: Option<bool>,
+    /// SSH wrap session-load tip (recommend `open-grok wrap ssh` for remote sessions).
+    #[serde(default)]
+    pub ssh_wrap: Option<bool>,
 }
 /// Tolerant deserializer for `Option<Vec<RemoteAnnouncement>>`.
 /// Parses as Vec<Value>, tries each as RemoteAnnouncement, drops failures.

@@ -70,7 +70,7 @@ Source construction: `discover_hook_source_paths` → global then project; proje
 
 Compat vendor dirs are gated by `CompatConfig` (claude/cursor hooks toggles). After Claude import mark, raw `.claude/settings.json` may be skipped while native `.opengrok/hooks/` still loads.
 
-Load API: `xai_grok_hooks::discovery::load_hooks_from_sources`. Global hooks are name-prefixed `global/…`; project `project/…`. Snapshot is **session-scoped** — disk edits need reload (`HooksAction::Reload` / session restart). Matcher recompile after deserialize is fail-open (bad pattern → match-all).
+Load API: `xai_grok_hooks::discovery::load_hooks_from_sources`. Global hooks are name-prefixed `global/…`; project `project/…`. Snapshot is **session-scoped** — disk edits need reload (`HooksAction::Reload` / session restart). Matcher recompile after deserialize is fail-closed for that hook (bad pattern → never-match); an intentionally absent matcher remains match-all.
 
 ### Events
 
@@ -296,7 +296,7 @@ cargo test --locked -p xai-grok-shell -- plugin
 8. **Skill roots ignore `.gitignore`** — large vendor trees need `[skills] ignore` / compat toggles / denylists.
 9. **Native skills beat plugins on bare names** — document qualified names for plugin skills.
 10. **Do not scan `skills-cursor/`** — product-specific Cursor default trees are intentionally excluded.
-11. **Matcher recompile fail-open** — invalid matcher becomes match-all after deserialize; prefer logging + tests over fail-closed silence.
+11. **Matcher recompile is narrow-fail-closed** — an invalid matcher becomes never-match after deserialize, while an intentionally absent matcher remains match-all; keep the distinction covered by tests.
 12. **HTTP hook URL display** — show pre-expansion `raw_url` in UI to avoid leaking `${TOKEN}` expansions.
 
 ---

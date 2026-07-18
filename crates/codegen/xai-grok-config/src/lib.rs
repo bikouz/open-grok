@@ -15,7 +15,7 @@
 
 pub mod campaigns;
 pub mod config_override;
-mod fs_atomic;
+pub mod fs_atomic;
 mod loader;
 mod macos_managed;
 mod managed_cache;
@@ -40,11 +40,11 @@ pub use loader::{
 };
 pub use macos_managed::MDM_REQUIREMENTS_SOURCE;
 pub use managed_cache::{
-    MANAGED_CONFIG_CACHE_FILE, ServingIdentity, SyncMarker, confirmed_team_switch,
-    confirmed_team_switch_at, is_managed_config_hard_stale_for, is_managed_config_stale_for,
-    managed_config_identity_changed, managed_config_identity_changed_at, managed_deployment_id,
-    managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
-    normalize_identity,
+    MANAGED_CONFIG_CACHE_FILE, ServingIdentity, SyncMarker, bump_rollback_floor,
+    bump_rollback_floor_with_now, confirmed_team_switch, confirmed_team_switch_at,
+    is_managed_config_hard_stale_for, is_managed_config_stale_for, managed_config_identity_changed,
+    managed_config_identity_changed_at, managed_deployment_id, managed_policy_compromised_for,
+    mark_managed_config_synced, mark_managed_config_synced_at, normalize_identity,
 };
 pub use paths::{
     claude_managed_settings_path, claude_managed_settings_probe_path, decode_cwd_from_dirname,
