@@ -335,11 +335,14 @@ impl SessionActor {
         tool_name: &str,
         provider: xai_grok_sampling_types::ModelProvider,
     ) -> bool {
+        let web_search = self.rebuild_spec.web_search_state();
+        if tool_name == "web_search" {
+            return web_search.allowed_for_provider(provider);
+        }
         if provider.profile().allows_xai_services() {
             return true;
         }
         match tool_name {
-            "web_search" => !self.rebuild_spec.implicit_local_web_search,
             "image_gen" | "image_edit" | "image_to_video" | "reference_to_video" => false,
             // Memory storage and FTS are local/provider-neutral. Semantic
             // search may independently use the user's connected xAI embedding

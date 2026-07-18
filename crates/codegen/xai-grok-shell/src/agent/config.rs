@@ -5656,12 +5656,11 @@ pub fn resolve_web_search_sampling_config(
     resolved.map(crate::tools::config::web_search_sampling_config)
 }
 
-/// A local web-search sampler plus the provenance needed to enforce provider
-/// boundaries after an in-place model switch. The compiled default is an xAI
-/// helper; a non-default configured model is an explicit cross-provider opt-in.
+/// A resolved local web-search backend plus the provenance needed to enforce
+/// provider boundaries after an in-place model switch.
 #[derive(Clone)]
-pub(crate) struct PreparedWebSearchSamplingConfig {
-    pub sampler: SamplerConfig,
+pub(crate) struct PreparedWebSearchConfig {
+    pub config: xai_grok_tools::implementations::web_search::WebSearchConfig,
     pub is_implicit_default: bool,
 }
 

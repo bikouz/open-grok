@@ -946,6 +946,28 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
+        SettingMeta {
+            key: "toolset.perplexity_web_search.enabled",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Perplexity web search",
+            description: "Add the local web_search fallback to authenticated Kimi sessions. Grok and Codex keep their native search declarations.",
+            keywords: &["perplexity", "web", "search", "kimi", "fallback", "tool"],
+            kind: SettingKind::Bool { default: false },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "perplexity_api_key",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Perplexity API key",
+            description: "API key for the Perplexity Search API. Stored only in owner-protected auth.json and applied live to Kimi sessions.",
+            keywords: &["perplexity", "api", "key", "credential", "search", "kimi"],
+            kind: SettingKind::Secret,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned auxiliary model pins. Empty-string default maps to
         // provider-aware Automatic; explicit IDs may intentionally select a
         // model from another authenticated provider.

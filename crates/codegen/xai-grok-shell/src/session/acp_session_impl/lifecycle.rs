@@ -65,6 +65,7 @@ async fn release_lifecycle_mutation_and_resume(
     completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
 ) {
     session.end_lifecycle_mutation(kind).await;
+    session.maybe_apply_pending_web_search_reload().await;
     SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
     SessionActor::maybe_drain_notifications(session, completion_tx).await;
 }

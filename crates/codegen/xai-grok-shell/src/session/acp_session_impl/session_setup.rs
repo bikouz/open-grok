@@ -662,6 +662,7 @@ impl SessionActor {
                 tool_mode,
                 sampling_config.provider,
                 &sampling_config.api_backend,
+                self.rebuild_spec.web_search_state().config.is_perplexity(),
             ) {
                 Ok(surface) => Some(surface),
                 Err(error) => {

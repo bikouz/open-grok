@@ -571,6 +571,11 @@ pub enum Action {
     ClearKimiApiKey {
         endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
     },
+    SetPerplexityWebSearch(bool),
+    SetPerplexityApiKey {
+        key: crate::settings::SecretInput,
+    },
+    ClearPerplexityApiKey,
     /// Clear the persisted default model (`cfg.models.default = None`).
     /// Active session's model is unchanged; next session resolves
     /// via the shell's default-resolution chain.
@@ -1426,6 +1431,12 @@ pub enum Effect {
         generation: u64,
         key: Option<crate::settings::SecretInput>,
     },
+    UpdatePerplexityWebSearch {
+        enabled: Option<bool>,
+        generation: u64,
+        key: Option<crate::settings::SecretInput>,
+        clear_key: bool,
+    },
     /// Rebind one loaded Kimi session to the live service profile without
     /// changing the user's preferred model setting.
     RebindKimiModel {
@@ -2176,6 +2187,13 @@ pub enum SubagentKillOutcome {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    PerplexityWebSearchUpdated {
+        enabled: bool,
+        api_key_configured: bool,
+        generation: u64,
+        error: Option<String>,
+        reconciled: bool,
+    },
     /// Completion of the dedicated Kimi credential workflow. Contains only
     /// status and scrubbed diagnostics, never credential material.
     KimiApiKeyUpdated {

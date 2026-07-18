@@ -512,6 +512,10 @@ fn handle_editing_secret(state: &mut SettingsModalState, key: &KeyEvent) -> Sett
                 "kimi_code_api_key" => Some(xai_grok_shell::kimi_models::KimiApiEndpoint::Code),
                 _ => None,
             };
+            if setting_key == "perplexity_api_key" {
+                state.transition_to_browse();
+                return SettingsKeyOutcome::Action(Action::SetPerplexityApiKey { key: secret });
+            }
             if let Some(endpoint) = endpoint {
                 let action = Action::SetKimiApiKey {
                     endpoint,

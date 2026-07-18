@@ -9,8 +9,8 @@
 //! - Session → Client: `session_notification` via a shared gateway handle
 //!
 use super::commands::{
-    LifecycleMutationBlock, LifecycleMutationKind, ParsedPromptInfo, PromptCompletionKind,
-    PromptTurnOk, PromptTurnResult, SessionCommand, ok_end_turn,
+    LifecycleMutationBlock, LifecycleMutationKind, ParsedPromptInfo, PendingWebSearchReload,
+    PromptCompletionKind, PromptTurnOk, PromptTurnResult, SessionCommand, ok_end_turn,
 };
 use super::handle::SessionHandle;
 use super::notifications::NotificationSender;
@@ -278,6 +278,7 @@ pub(crate) struct State {
     /// `pending_inputs`, but no scheduler path may promote them until the gate
     /// is released.
     pub(crate) lifecycle_mutation: Option<LifecycleMutationKind>,
+    pub(crate) pending_web_search_reload: Option<PendingWebSearchReload>,
     /// When true, notifications are buffered but not drained until the next
     /// user-initiated prompt arrives. Set on cancel, cleared on user Prompt.
     pub(crate) notifications_suppressed: bool,

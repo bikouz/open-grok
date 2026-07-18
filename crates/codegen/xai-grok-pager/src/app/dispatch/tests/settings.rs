@@ -1534,6 +1534,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "toolset.ask_user_question.timeout_enabled" => {
             let _ = dispatch(Action::SetAskUserQuestionTimeoutEnabled(false), app);
         }
+        "toolset.perplexity_web_search.enabled" => {
+            let _ = dispatch(Action::SetPerplexityWebSearch(true), app);
+        }
         "keep_text_selection" => {
             let _ = dispatch(
                 Action::SetKeepTextSelection(crate::appearance::TextSelection::Hold),

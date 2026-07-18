@@ -68,6 +68,7 @@ pub type PromptTurnResult = Result<PromptTurnOk, acp::Error>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleMutationKind {
     ModelSwitch,
+    ToolsetReload,
     Rewind,
     ManualCompaction,
     HistoryRepair,
@@ -77,6 +78,7 @@ impl LifecycleMutationKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ModelSwitch => "model switch",
+            Self::ToolsetReload => "toolset reload",
             Self::Rewind => "rewind",
             Self::ManualCompaction => "manual compaction",
             Self::HistoryRepair => "history repair",
@@ -88,6 +90,11 @@ impl LifecycleMutationKind {
 pub(crate) enum LifecycleMutationBlock {
     ActiveTurn,
     MutationInProgress(LifecycleMutationKind),
+}
+
+pub(crate) struct PendingWebSearchReload {
+    pub(crate) state: crate::session::agent_rebuild::ResolvedWebSearchState,
+    pub(crate) responds_to: oneshot::Sender<Result<(), acp::Error>>,
 }
 
 impl LifecycleMutationBlock {
@@ -230,6 +237,10 @@ pub enum SessionCommand {
         /// the selected route; current model requirements still take priority.
         resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
+    },
+    ReloadWebSearchToolset {
+        state: crate::session::agent_rebuild::ResolvedWebSearchState,
+        responds_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Override the model name and optionally inject extra HTTP headers
     /// into the session's sampling config.

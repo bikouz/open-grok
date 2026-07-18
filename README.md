@@ -58,6 +58,10 @@ The public command is `open-grok`. It can be installed beside the upstream
 - **Provider-aware hosted search.** xAI models receive xAI web/X search tools;
   Codex models receive OpenAI `web_search`. Open Grok does not pass one
   provider's credentials or provider-only tools to the other.
+- **Optional Kimi web-search fallback.** Settings can enable Perplexity's raw
+  Search API for Kimi Platform and Kimi Code while keeping the public
+  `web_search(query, allowed_domains?)` schema. The isolated key lives only in
+  owner-protected `auth.json`; xAI and Codex continue using native search.
 - **One harness across providers.** Codex keeps the same subagent, scheduler,
   monitor, goal, plan, and user-question features as Grok while using Codex's
   file tools, prompt, transport, and model metadata.

@@ -11,6 +11,80 @@ fn provider_model_info(model_id: &acp::ModelId, name: &str, provider: &str) -> a
     acp::ModelInfo::new(model_id.clone(), name.to_string()).meta(Some(meta))
 }
 
+#[test]
+fn pending_perplexity_reload_holds_a_session_that_switches_into_kimi() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let codex_id = acp::ModelId::new("codex-test");
+    let kimi_id = acp::ModelId::new("kimi-test");
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.session.models.available.insert(
+            codex_id.clone(),
+            provider_model_info(&codex_id, "Codex Test", "codex"),
+        );
+        agent.session.models.available.insert(
+            kimi_id.clone(),
+            provider_model_info(&kimi_id, "Kimi Test", "kimi"),
+        );
+        agent.session.models.current = Some(codex_id.clone());
+        agent.session.model_switch_pending = true;
+    }
+    app.perplexity_web_search_update_pending = true;
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id,
+            model_id: kimi_id,
+            effort: None,
+            result: Ok(()),
+            prev_model_id: Some(codex_id),
+        }),
+        &mut app,
+    );
+
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(app.pending_perplexity_rebuild_agents.contains(&agent_id));
+}
+
+#[test]
+fn pending_perplexity_reload_releases_a_session_that_switches_out_of_kimi() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let kimi_id = acp::ModelId::new("kimi-test");
+    let codex_id = acp::ModelId::new("codex-test");
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.session.models.available.insert(
+            kimi_id.clone(),
+            provider_model_info(&kimi_id, "Kimi Test", "kimi"),
+        );
+        agent.session.models.available.insert(
+            codex_id.clone(),
+            provider_model_info(&codex_id, "Codex Test", "codex"),
+        );
+        agent.session.models.current = Some(kimi_id.clone());
+        agent.session.model_switch_pending = true;
+        agent.session.provider_rebind_pending = true;
+    }
+    app.perplexity_web_search_update_pending = true;
+    app.pending_perplexity_rebuild_agents.insert(agent_id);
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id,
+            model_id: codex_id,
+            effort: None,
+            result: Ok(()),
+            prev_model_id: Some(kimi_id),
+        }),
+        &mut app,
+    );
+
+    assert!(!app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(!app.pending_perplexity_rebuild_agents.contains(&agent_id));
+}
+
 fn prepare_kimi_rebind(
     app: &mut AppView,
     agent_id: AgentId,

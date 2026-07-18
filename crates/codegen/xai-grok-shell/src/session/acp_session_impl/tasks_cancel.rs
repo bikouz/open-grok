@@ -561,6 +561,7 @@ impl SessionActor {
                 structured_output: None,
                 usage: None,
             }));
+            self.maybe_apply_pending_web_search_reload().await;
             return;
         }
 
@@ -612,6 +613,7 @@ impl SessionActor {
                 }))
                 .ok();
         }
+        self.maybe_apply_pending_web_search_reload().await;
     }
 }
 

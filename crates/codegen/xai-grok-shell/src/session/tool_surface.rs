@@ -204,6 +204,7 @@ impl EffectiveToolSurface {
         tool_mode: ToolMode,
         provider: ModelProvider,
         backend: &ApiBackend,
+        perplexity_web_search: bool,
     ) -> Result<Self, String> {
         let code_mode_transport = resolve_code_mode_transport(tool_mode, provider, backend)?;
         let code_mode_only = tool_mode == ToolMode::CodeModeOnly;
@@ -236,6 +237,7 @@ impl EffectiveToolSurface {
                     nested_definitions,
                     provider,
                     &hosted_tools,
+                    perplexity_web_search,
                 );
             match transport {
                 CodeModeTransport::NativeCustomGrammar => {
@@ -353,6 +355,7 @@ mod tests {
             ToolMode::Direct,
             ModelProvider::Xai,
             &ApiBackend::Responses,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -376,6 +379,7 @@ mod tests {
             ToolMode::CodeMode,
             ModelProvider::Xai,
             &ApiBackend::Responses,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -417,6 +421,7 @@ mod tests {
             ToolMode::CodeModeOnly,
             ModelProvider::Xai,
             &ApiBackend::Responses,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -458,6 +463,7 @@ mod tests {
             ToolMode::CodeMode,
             ModelProvider::Codex,
             &ApiBackend::Responses,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -497,6 +503,7 @@ mod tests {
             ToolMode::CodeModeOnly,
             ModelProvider::Codex,
             &ApiBackend::Responses,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -528,6 +535,7 @@ mod tests {
             ToolMode::CodeMode,
             ModelProvider::Xai,
             &ApiBackend::Responses,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -555,6 +563,7 @@ mod tests {
             ToolMode::CodeMode,
             ModelProvider::Kimi,
             &ApiBackend::ChatCompletions,
+            false,
         )
         .unwrap_err();
         assert!(error.contains("Responses-backed"));

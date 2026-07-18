@@ -24,6 +24,122 @@ fn code_mode_runtime_reset_required(
 }
 
 impl SessionActor {
+    async fn current_provider_has_native_web_search(&self) -> bool {
+        self.chat_state_handle
+            .get_sampling_config()
+            .await
+            .is_some_and(|config| config.provider.profile().has_native_web_search())
+    }
+
+    async fn apply_web_search_toolset_state(
+        &self,
+        state: crate::session::agent_rebuild::ResolvedWebSearchState,
+    ) -> Result<(), acp::Error> {
+        let previous = self.rebuild_spec.replace_web_search_state(state);
+        if self.current_provider_has_native_web_search().await {
+            return Ok(());
+        }
+        let definition = self.agent.borrow().definition().clone();
+        let tool_mode = self.agent.borrow().tool_mode();
+        match self.build_agent_for_definition(definition, tool_mode).await {
+            Ok(agent) => {
+                self.install_rebuilt_agent(agent, true).await;
+                Ok(())
+            }
+            Err(error) => {
+                self.rebuild_spec.replace_web_search_state(previous);
+                Err(error)
+            }
+        }
+    }
+
+    async fn apply_claimed_web_search_reload(
+        &self,
+        request: crate::session::PendingWebSearchReload,
+    ) {
+        let result = self.apply_web_search_toolset_state(request.state).await;
+        if result.is_ok() {
+            self.end_lifecycle_mutation(LifecycleMutationKind::ToolsetReload)
+                .await;
+        }
+        let _ = request.responds_to.send(result);
+    }
+
+    pub(super) async fn handle_reload_web_search_toolset(
+        self: &Arc<Self>,
+        state: crate::session::agent_rebuild::ResolvedWebSearchState,
+        responds_to: tokio::sync::oneshot::Sender<Result<(), acp::Error>>,
+    ) {
+        if self.current_provider_has_native_web_search().await {
+            self.rebuild_spec.replace_web_search_state(state);
+            let _ = responds_to.send(Ok(()));
+            return;
+        }
+
+        let request = crate::session::PendingWebSearchReload { state, responds_to };
+        let request = {
+            let mut actor_state = self.state.lock().await;
+            let turn_active = actor_state.running_task.is_some()
+                || self
+                    .session_turn_active
+                    .load(std::sync::atomic::Ordering::Acquire);
+            match actor_state.lifecycle_mutation {
+                Some(LifecycleMutationKind::ToolsetReload) if !turn_active => Some(request),
+                Some(_) | None if turn_active => {
+                    if actor_state.pending_web_search_reload.is_none() {
+                        actor_state.pending_web_search_reload = Some(request);
+                    } else {
+                        let _ = request.responds_to.send(Err(acp::Error::invalid_request()
+                            .data("a web search reload is already pending")));
+                    }
+                    None
+                }
+                Some(active) => {
+                    if actor_state.pending_web_search_reload.is_none() {
+                        actor_state.pending_web_search_reload = Some(request);
+                    } else {
+                        let _ = request
+                            .responds_to
+                            .send(Err(acp::Error::invalid_request().data(format!(
+                                "a session {} is already in progress",
+                                active.as_str()
+                            ))));
+                    }
+                    None
+                }
+                None => {
+                    actor_state.lifecycle_mutation = Some(LifecycleMutationKind::ToolsetReload);
+                    Some(request)
+                }
+            }
+        };
+        if let Some(request) = request {
+            self.apply_claimed_web_search_reload(request).await;
+        }
+    }
+
+    pub(super) async fn maybe_apply_pending_web_search_reload(&self) {
+        let request = {
+            let mut state = self.state.lock().await;
+            if state.running_task.is_some()
+                || self
+                    .session_turn_active
+                    .load(std::sync::atomic::Ordering::Acquire)
+                || state.lifecycle_mutation.is_some()
+            {
+                return;
+            }
+            let request = state.pending_web_search_reload.take();
+            if request.is_some() {
+                state.lifecycle_mutation = Some(LifecycleMutationKind::ToolsetReload);
+            }
+            request
+        };
+        if let Some(request) = request {
+            self.apply_claimed_web_search_reload(request).await;
+        }
+    }
+
     pub(super) async fn handle_set_session_model(
         &self,
         selected_model_id: acp::ModelId,

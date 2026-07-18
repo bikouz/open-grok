@@ -1163,6 +1163,7 @@ pub(crate) async fn run(
     app.recap_model = auxiliary_models.recap;
     app.memory_model = auxiliary_models.memory;
     app.kimi_api_endpoint = auxiliary_models.kimi_api_endpoint;
+    app.perplexity_web_search_enabled = load_initial_perplexity_web_search_enabled();
     let configured_kimi_endpoint =
         xai_grok_shell::kimi_models::KimiApiEndpoint::from_canonical(&app.kimi_api_endpoint)
             .unwrap_or_default();
@@ -2678,6 +2679,17 @@ fn load_initial_auxiliary_models() -> InitialAuxiliaryModels {
         )
         .to_owned(),
     }
+}
+
+fn load_initial_perplexity_web_search_enabled() -> bool {
+    xai_grok_shell::config::load_effective_config()
+        .ok()
+        .as_ref()
+        .and_then(|root| root.get("toolset"))
+        .and_then(|toolset| toolset.get("perplexity_web_search"))
+        .and_then(|perplexity| perplexity.get("enabled"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Config `Option<bool>` mirrors seeded once at startup. `None` = no

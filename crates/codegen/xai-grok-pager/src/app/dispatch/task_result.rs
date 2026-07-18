@@ -364,6 +364,79 @@ fn after_kimi_session_ready(
     effects
 }
 
+fn mark_runtime_pending_perplexity_session(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    incoming_models: Option<&acp::SessionModelState>,
+) {
+    if !app.perplexity_web_search_update_pending {
+        return;
+    }
+    let incoming = incoming_models
+        .cloned()
+        .map(|models| crate::acp::model_state::ModelState::from(Some(models)));
+    let is_kimi = incoming.as_ref().map_or_else(
+        || {
+            app.agents.get(&agent_id).is_some_and(|agent| {
+                PrimaryProvider::for_current_model(&agent.session.models)
+                    == Some(PrimaryProvider::Kimi)
+            })
+        },
+        |models| PrimaryProvider::for_current_model(models) == Some(PrimaryProvider::Kimi),
+    );
+    if is_kimi && let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = true;
+        app.pending_perplexity_rebuild_agents.insert(agent_id);
+    }
+}
+
+fn finish_perplexity_web_search_update(app: &mut AppView) -> Vec<Effect> {
+    let agent_ids = app
+        .pending_perplexity_rebuild_agents
+        .drain()
+        .collect::<Vec<_>>();
+    let mut effects = Vec::new();
+    for agent_id in agent_ids {
+        if app.pending_kimi_rebind_agents.contains(&agent_id) {
+            continue;
+        }
+        if let Some(agent) = app.agents.get_mut(&agent_id) {
+            agent.session.provider_rebind_pending = false;
+            effects.extend(crate::app::dispatch::queue::maybe_drain_queue(agent));
+        }
+    }
+    effects
+}
+
+fn reconcile_pending_perplexity_session_after_model_switch(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+) -> Vec<Effect> {
+    if !app.perplexity_web_search_update_pending {
+        return vec![];
+    }
+    let is_kimi = app.agents.get(&agent_id).is_some_and(|agent| {
+        PrimaryProvider::for_current_model(&agent.session.models) == Some(PrimaryProvider::Kimi)
+    });
+    if is_kimi {
+        if let Some(agent) = app.agents.get_mut(&agent_id) {
+            agent.session.provider_rebind_pending = true;
+            app.pending_perplexity_rebuild_agents.insert(agent_id);
+        }
+        return vec![];
+    }
+
+    app.pending_perplexity_rebuild_agents.remove(&agent_id);
+    if app.pending_kimi_rebind_agents.contains(&agent_id) {
+        return vec![];
+    }
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    agent.session.provider_rebind_pending = false;
+    crate::app::dispatch::queue::maybe_drain_queue(agent)
+}
+
 fn mark_runtime_pending_kimi_session(
     app: &mut AppView,
     agent_id: crate::app::agent::AgentId,
@@ -535,6 +608,46 @@ fn kimi_credential_configured(endpoint: xai_grok_shell::kimi_models::KimiApiEndp
 
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
     match result {
+        TaskResult::PerplexityWebSearchUpdated {
+            enabled,
+            api_key_configured,
+            generation,
+            error,
+            reconciled,
+        } => {
+            if generation != app.perplexity_web_search_generation {
+                return vec![];
+            }
+            app.perplexity_web_search_enabled = enabled;
+            app.perplexity_web_search_update_pending = !reconciled;
+            super::settings::ui::refresh_open_settings_modals(app);
+            if let Some(error) = error {
+                app.show_toast(&format!(
+                    "✗ Could not update Perplexity web search: {}{}",
+                    scrub_error_for_toast(&error),
+                    if reconciled {
+                        ""
+                    } else {
+                        "; queued Kimi prompts remain paused"
+                    }
+                ));
+            } else {
+                app.show_toast(&format!(
+                    "✓ Perplexity web search: {}; API key {}",
+                    if enabled { "on" } else { "off" },
+                    if api_key_configured {
+                        "configured"
+                    } else {
+                        "required"
+                    }
+                ));
+            }
+            if reconciled {
+                finish_perplexity_web_search_update(app)
+            } else {
+                vec![]
+            }
+        }
         TaskResult::KimiApiKeyUpdated {
             endpoint,
             effective_endpoint,
@@ -723,6 +836,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             models: new_models,
         } => {
             mark_runtime_pending_kimi_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_session_created(app, agent_id, session_id, new_models);
             after_kimi_session_ready(app, agent_id, effects)
         }
@@ -744,6 +858,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             models: new_models,
         } => {
             mark_runtime_pending_kimi_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_worktree_session_created(
                 app,
                 agent_id,
@@ -830,6 +945,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             running_prompt_id,
         } => {
             mark_runtime_pending_kimi_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_session_loaded(
                 app,
                 agent_id,
@@ -1052,6 +1168,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 result,
                 prev_model_id,
             );
+            if switch_succeeded {
+                effects.extend(reconcile_pending_perplexity_session_after_model_switch(
+                    app, agent_id,
+                ));
+            }
             if app.pending_kimi_rebind_agents.contains(&agent_id)
                 && app.agents.get(&agent_id).is_some_and(|agent| {
                     agent.session.provider_rebind_pending && !agent.session.model_switch_pending

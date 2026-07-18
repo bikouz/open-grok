@@ -95,6 +95,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 pending_inputs: VecDeque::new(),
                 pending_notifications: Vec::new(),
                 lifecycle_mutation: None,
+                pending_web_search_reload: None,
                 notifications_suppressed: false,
                 rewindable: false,
                 nudges_used_this_session: 0,

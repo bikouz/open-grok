@@ -304,6 +304,8 @@ pub struct PagerLocalSnapshot {
     pub kimi_api_key_status: SecretStatus,
     /// Status-only mirror for the Kimi Code API-key source.
     pub kimi_code_api_key_status: SecretStatus,
+    pub perplexity_web_search_enabled: bool,
+    pub perplexity_api_key_status: SecretStatus,
     /// Active Kimi service profile (`platform` | `code`).
     pub kimi_api_endpoint: String,
     /// Whether the user has opted OUT of coding data sharing.
@@ -352,6 +354,8 @@ impl Default for PagerLocalSnapshot {
             memory_model: None,
             kimi_api_key_status: SecretStatus::Missing,
             kimi_code_api_key_status: SecretStatus::Missing,
+            perplexity_web_search_enabled: false,
+            perplexity_api_key_status: SecretStatus::Missing,
             kimi_api_endpoint: "platform".to_owned(),
             coding_data_sharing_opt_out: false,
             plan_mode_active: false,
@@ -741,6 +745,10 @@ pub fn current_value_for(
         )))),
         "kimi_api_key" => Some(SettingValue::SecretStatus(pager.kimi_api_key_status)),
         "kimi_code_api_key" => Some(SettingValue::SecretStatus(pager.kimi_code_api_key_status)),
+        "toolset.perplexity_web_search.enabled" => {
+            Some(SettingValue::Bool(pager.perplexity_web_search_enabled))
+        }
+        "perplexity_api_key" => Some(SettingValue::SecretStatus(pager.perplexity_api_key_status)),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
         // coding_data_sharing: inverts the `_opt_out` bool.
@@ -793,6 +801,24 @@ pub fn default_value_for(meta: &SettingMeta) -> SettingValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perplexity_settings_use_pager_snapshot_without_secret_material() {
+        let ui = UiConfig::default();
+        let pager = PagerLocalSnapshot {
+            perplexity_web_search_enabled: true,
+            perplexity_api_key_status: SecretStatus::Stored,
+            ..PagerLocalSnapshot::default()
+        };
+        assert_eq!(
+            current_value_for("toolset.perplexity_web_search.enabled", &ui, &pager,),
+            Some(SettingValue::Bool(true))
+        );
+        assert_eq!(
+            current_value_for("perplexity_api_key", &ui, &pager),
+            Some(SettingValue::SecretStatus(SecretStatus::Stored))
+        );
+    }
 
     #[test]
     fn auxiliary_model_choices_use_ids_and_automatic_sentinel() {
@@ -986,7 +1012,10 @@ mod tests {
                         "Kimi service must default to the backwards-compatible Platform profile",
                     );
                 }
-                ("kimi_api_key" | "kimi_code_api_key", SettingKind::Secret) => {
+                (
+                    "kimi_api_key" | "kimi_code_api_key" | "perplexity_api_key",
+                    SettingKind::Secret,
+                ) => {
                     // Credential presence is pager-local runtime state rather than UiConfig.
                     // `every_setting_has_dispatch_arm` pins the SecretStatus mapping.
                 }
@@ -1260,6 +1289,9 @@ mod tests {
                         "UiConfig::default().fork_secondary_model must equal \
                          models::default_model() — drift here breaks the empty-fold contract",
                     );
+                }
+                ("toolset.perplexity_web_search.enabled", SettingKind::Bool { default }) => {
+                    assert!(!default, "Perplexity web search must remain opt-in");
                 }
 
                 _ => panic!(

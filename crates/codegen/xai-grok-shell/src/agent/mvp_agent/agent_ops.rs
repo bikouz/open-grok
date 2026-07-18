@@ -1351,15 +1351,37 @@ impl MvpAgent {
             tier_restricted,
         }
     }
-    pub(super) fn prepare_web_search_sampling_config(
-        &self,
-    ) -> Option<config::PreparedWebSearchSamplingConfig> {
+    pub(super) fn prepare_web_search_config(&self) -> config::PreparedWebSearchConfig {
+        let cfg = self.cfg.borrow();
+        if cfg.disable_web_search {
+            return config::PreparedWebSearchConfig {
+                config: xai_grok_tools::implementations::WebSearchConfig::Disabled,
+                is_implicit_default: false,
+            };
+        }
+        if cfg.toolset.perplexity_web_search.enabled {
+            let grok_home = xai_grok_tools::util::grok_home::grok_home();
+            if let Some(api_key) = crate::auth::read_perplexity_api_key(&grok_home) {
+                return config::PreparedWebSearchConfig {
+                    config: xai_grok_tools::implementations::WebSearchConfig::Perplexity {
+                        api_key,
+                        base_url: xai_grok_tools::implementations::web_search::PERPLEXITY_SEARCH_API_BASE_URL
+                            .to_owned(),
+                    },
+                    is_implicit_default: false,
+                };
+            }
+            return config::PreparedWebSearchConfig {
+                config: xai_grok_tools::implementations::WebSearchConfig::Disabled,
+                is_implicit_default: false,
+            };
+        }
         let model_id = self.cfg.borrow().web_search_model.clone();
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
         let alpha_test_key = self.cfg.borrow().endpoints.alpha_test_key.clone();
         let client_version = self.cfg.borrow().client_version.clone();
-        let mut cfg = config::resolve_web_search_sampling_config(
+        let Some(mut resolved) = config::resolve_web_search_sampling_config(
             &model_id,
             &models,
             session.as_ref().map(|a| a.key.as_str()),
@@ -1367,17 +1389,32 @@ impl MvpAgent {
             alpha_test_key.clone(),
             client_version,
             &self.cfg.borrow().endpoints,
-        )?;
+        ) else {
+            return config::PreparedWebSearchConfig {
+                config: xai_grok_tools::implementations::WebSearchConfig::Disabled,
+                is_implicit_default: false,
+            };
+        };
         inject_proxy_headers(
-            &mut cfg.extra_headers,
-            cfg.client_version.as_deref(),
+            &mut resolved.extra_headers,
+            resolved.client_version.as_deref(),
             alpha_test_key.as_deref(),
-            &cfg.base_url,
+            &resolved.base_url,
         );
-        Some(config::PreparedWebSearchSamplingConfig {
-            sampler: cfg,
+        let config = match resolved.api_key {
+            Some(api_key) => xai_grok_tools::implementations::WebSearchConfig::Enabled {
+                api_key,
+                base_url: resolved.base_url,
+                model: resolved.model,
+                extra_headers: resolved.extra_headers,
+                alpha_test_key: alpha_test_key.clone(),
+            },
+            None => xai_grok_tools::implementations::WebSearchConfig::Disabled,
+        };
+        config::PreparedWebSearchConfig {
+            config,
             is_implicit_default: model_id == crate::models::default_web_search_model(),
-        })
+        }
     }
     /// Returns `Err` with a user-facing message on invalid config; the caller at
     /// the process boundary prints it and exits.
@@ -3408,7 +3445,7 @@ impl MvpAgent {
             .find(|entry| entry.info.model == sampling_config.model)
             .and_then(|entry| entry.info.max_retries);
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
-        let web_search_sampling_config = self.prepare_web_search_sampling_config();
+        let web_search_config = self.prepare_web_search_config();
         let image_gen_config = self.prepare_image_gen_config();
         let video_gen_config = self.prepare_video_gen_config();
         let app_builder_deployer_config = self.prepare_app_builder_deployer_config();
@@ -3638,7 +3675,7 @@ impl MvpAgent {
                     origin_client.as_ref().map(|o| o.product.clone()),
                     inference_idle_timeout_secs,
                     model_max_retries,
-                    web_search_sampling_config,
+                    web_search_config,
                     web_fetch_config,
                     image_gen_config,
                     video_gen_config,

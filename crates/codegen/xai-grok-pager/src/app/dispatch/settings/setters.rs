@@ -28,6 +28,25 @@ fn remember_loaded_kimi_sessions(app: &mut AppView) {
     app.pending_kimi_rebind_agents.extend(targets);
 }
 
+fn remember_loaded_perplexity_sessions(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models) == Some(PrimaryProvider::Kimi)
+        {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_perplexity_rebuild_agents.extend(targets);
+}
+
+fn next_perplexity_web_search_generation(app: &mut AppView) -> u64 {
+    app.perplexity_web_search_generation =
+        app.perplexity_web_search_generation.wrapping_add(1).max(1);
+    app.perplexity_web_search_update_pending = true;
+    app.perplexity_web_search_generation
+}
+
 fn next_kimi_operation_generation(app: &mut AppView) -> u64 {
     app.kimi_operation_generation = app.kimi_operation_generation.wrapping_add(1).max(1);
     app.kimi_operation_generation
@@ -145,6 +164,57 @@ pub(in crate::app::dispatch) fn clear_kimi_api_key(
         active,
         generation,
         key: None,
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_perplexity_web_search(
+    app: &mut AppView,
+    enabled: bool,
+) -> Vec<Effect> {
+    if app.perplexity_web_search_enabled == enabled && !app.perplexity_web_search_update_pending {
+        return vec![];
+    }
+    remember_loaded_perplexity_sessions(app);
+    let generation = next_perplexity_web_search_generation(app);
+    app.perplexity_web_search_enabled = enabled;
+    refresh_open_settings_modals(app);
+    app.show_toast(if enabled {
+        "Enabling Perplexity web search…"
+    } else {
+        "Disabling Perplexity web search…"
+    });
+    vec![Effect::UpdatePerplexityWebSearch {
+        enabled: Some(enabled),
+        generation,
+        key: None,
+        clear_key: false,
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_perplexity_api_key(
+    app: &mut AppView,
+    key: SecretInput,
+) -> Vec<Effect> {
+    remember_loaded_perplexity_sessions(app);
+    let generation = next_perplexity_web_search_generation(app);
+    app.show_toast("Saving Perplexity API key…");
+    vec![Effect::UpdatePerplexityWebSearch {
+        enabled: None,
+        generation,
+        key: Some(key),
+        clear_key: false,
+    }]
+}
+
+pub(in crate::app::dispatch) fn clear_perplexity_api_key(app: &mut AppView) -> Vec<Effect> {
+    remember_loaded_perplexity_sessions(app);
+    let generation = next_perplexity_web_search_generation(app);
+    app.show_toast("Removing Perplexity API key…");
+    vec![Effect::UpdatePerplexityWebSearch {
+        enabled: None,
+        generation,
+        key: None,
+        clear_key: true,
     }]
 }
 

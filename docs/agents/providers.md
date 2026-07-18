@@ -81,6 +81,7 @@ Home root: `$OPENGROK_HOME` or `~/.opengrok` via `xai_grok_config::grok_home()`.
 | Codex OAuth | `$OPENGROK_HOME/codex-auth.json` | `login --codex` / `logout --codex` |
 | Kimi Platform | `auth.json` scope `kimi::api_key` | Settings / `/login kimi` |
 | Kimi Code | `auth.json` scope `kimi_code::api_key` | Settings / `/login kimi` |
+| Perplexity Search fallback | `auth.json` scope `perplexity::api_key` | Settings |
 | Both providers | — | `logout --all` |
 
 Also isolated:
@@ -97,7 +98,7 @@ Also isolated:
 5. **Kimi Platform vs Code** keys, catalogs, and trusted hosts are non-interchangeable.
 6. **xAI-only services** (relay, some uploads, etc.) close via monotonic export boundary after non-xAI denied profiles. Compatibility field name remains `ever_used_codex` even when the triggering provider is not Codex; subagents mark the parent tree.
 7. **xAI media / Imagine** must not receive Codex bearer; hide media tools while Codex is active.
-8. **Hosted search** is dialect-scoped: xAI web/X search vs OpenAI `web_search` — no silent cross-provider fallback.
+8. **Hosted search** is dialect-scoped: xAI web/X search vs OpenAI `web_search`. The optional Perplexity raw-search fallback is declared only for profiles whose `native_web_search` capability is false, currently Kimi. Never infer this from model names or URLs.
 9. **Opaque history** (e.g. Codex compaction carriers, xAI-only items) is projected only by the matching dialect.
 
 ## Sampling, routing, compaction

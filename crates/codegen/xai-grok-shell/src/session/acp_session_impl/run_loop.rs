@@ -211,6 +211,7 @@ pub(super) async fn run_session(
             session.emit_buffered(notification). await; } let (turn_succeeded,
             infra_pause_message) = SessionActor::post_turn_goal_degradation_plan(&
             result); session.handle_completion(prompt_id, result). await; session
+            .maybe_apply_pending_web_search_reload().await; session
             .drain_monitor_buffer_to_pending(). await; if let Some(message) =
             infra_pause_message { session.apply_infra_pause_after_turn_err(message).
             await; } session.handle_turn_end(turn_succeeded). await; if session
@@ -316,7 +317,13 @@ pub(super) async fn run_session(
             await; let _ = responds_to.send(updated_model_id);
             SessionActor::maybe_start_running_task(session.clone(), completion_tx
             .clone()).await; SessionActor::maybe_drain_notifications(session.clone(),
-            completion_tx.clone()).await; } SessionCommand::OverrideModelName {
+            completion_tx.clone()).await; } SessionCommand::ReloadWebSearchToolset {
+            state, responds_to } => { session
+            .handle_reload_web_search_toolset(state, responds_to).await;
+            SessionActor::maybe_start_running_task(session.clone(),
+            completion_tx.clone()).await; SessionActor::maybe_drain_notifications(
+            session.clone(), completion_tx.clone()).await; }
+            SessionCommand::OverrideModelName {
             model_name, extra_headers, context_window } => { if let Some(mut cfg) =
             session.chat_state_handle.get_sampling_config(). await {
             tracing::info!(target : SESSION_LOG, session_id = % session.session_info.id,

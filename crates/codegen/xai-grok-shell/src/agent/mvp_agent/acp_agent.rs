@@ -58,6 +58,16 @@ struct KimiEndpointApplyParams {
     endpoint: crate::kimi_models::KimiApiEndpoint,
 }
 
+fn persisted_perplexity_web_search_enabled() -> anyhow::Result<bool> {
+    let root = crate::config::load_effective_config()?;
+    Ok(root
+        .get("toolset")
+        .and_then(|toolset| toolset.get("perplexity_web_search"))
+        .and_then(|perplexity| perplexity.get("enabled"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false))
+}
+
 pub(super) fn kimi_endpoint_apply_payload(
     endpoint: crate::kimi_models::KimiApiEndpoint,
     effective_endpoint: crate::kimi_models::KimiApiEndpoint,
@@ -3520,6 +3530,64 @@ impl acp::Agent for MvpAgent {
                     refreshed,
                     models,
                 )))
+            }
+            "open-grok/toolset/perplexity-web-search/reload" => {
+                let enabled = persisted_perplexity_web_search_enabled()?;
+                self.cfg
+                    .borrow_mut()
+                    .toolset
+                    .perplexity_web_search
+                    .enabled = enabled;
+                let prepared = self.prepare_web_search_config();
+                let state = crate::session::agent_rebuild::ResolvedWebSearchState {
+                    config: prepared.config,
+                    implicit_local_web_search: prepared.is_implicit_default,
+                };
+                let sessions = self
+                    .sessions
+                    .borrow()
+                    .iter()
+                    .map(|(session_id, handle)| (session_id.clone(), handle.cmd_tx.clone()))
+                    .collect::<Vec<_>>();
+                for (session_id, tx) in &sessions {
+                    let (responds_to, response) = tokio::sync::oneshot::channel();
+                    tx.send(SessionCommand::ReloadWebSearchToolset {
+                        state: state.clone(),
+                        responds_to,
+                    })
+                    .map_err(|_| {
+                        acp::Error::internal_error().data(format!(
+                            "failed to queue web search reload for session {}",
+                            session_id.0
+                        ))
+                    })?;
+                    match response.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                error = ?error,
+                                "resident session rejected web search reload"
+                            );
+                            return crate::extensions::to_ext_response::<serde_json::Value>(Err(
+                                anyhow::anyhow!(
+                                    "web search reload could not be applied to every loaded session"
+                                ),
+                            ));
+                        }
+                        Err(_) => {
+                            return crate::extensions::to_ext_response::<serde_json::Value>(Err(
+                                anyhow::anyhow!("web search reload response channel closed"),
+                            ));
+                        }
+                    }
+                }
+                let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                crate::extensions::to_ext_response(Ok(serde_json::json!({
+                    "enabled": enabled,
+                    "api_key_configured": crate::auth::perplexity_api_key_is_configured(&grok_home),
+                    "sessions_rebuilt": sessions.len(),
+                })))
             }
             "x.ai/getApiKey" | "x.ai/setApiKey" => {
                 crate::extensions::auth::handle(self, &args).await

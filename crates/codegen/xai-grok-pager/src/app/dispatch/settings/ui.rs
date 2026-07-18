@@ -32,6 +32,16 @@ pub(in crate::app::dispatch) fn kimi_code_api_key_status() -> crate::settings::S
     kimi_api_key_status_for(xai_grok_shell::kimi_models::KimiApiEndpoint::Code)
 }
 
+pub(in crate::app::dispatch) fn perplexity_api_key_status() -> crate::settings::SecretStatus {
+    if xai_grok_shell::auth::perplexity_api_key_is_configured(
+        &xai_grok_tools::util::grok_home::grok_home(),
+    ) {
+        crate::settings::SecretStatus::Stored
+    } else {
+        crate::settings::SecretStatus::Missing
+    }
+}
+
 fn kimi_api_key_status_for(
     endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
 ) -> crate::settings::SecretStatus {
@@ -87,7 +97,9 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let memory_model_from_app = app.memory_model.clone();
     let kimi_api_key_status = kimi_api_key_status();
     let kimi_code_api_key_status = kimi_code_api_key_status();
+    let perplexity_api_key_status = perplexity_api_key_status();
     let kimi_api_endpoint = app.kimi_api_endpoint.clone();
+    let perplexity_web_search_enabled = app.perplexity_web_search_enabled;
     for agent in app.agents.values_mut() {
         // Walk both `Settings` and `ResetSettingsConfirm` — the
         // confirm dialog embeds settings state that must stay fresh
@@ -118,6 +130,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 memory_model: memory_model_from_app.clone(),
                 kimi_api_key_status,
                 kimi_code_api_key_status,
+                perplexity_web_search_enabled,
+                perplexity_api_key_status,
                 kimi_api_endpoint: kimi_api_endpoint.clone(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 // Prefer optimistic pending over confirmed active.
@@ -250,6 +264,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
         memory_model: memory_model_from_app,
         kimi_api_key_status,
         kimi_code_api_key_status,
+        perplexity_web_search_enabled: app.perplexity_web_search_enabled,
+        perplexity_api_key_status: perplexity_api_key_status(),
         kimi_api_endpoint,
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         // Prefer optimistic pending over confirmed active.
@@ -784,6 +800,8 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         memory_model: app.memory_model.clone(),
         kimi_api_key_status: kimi_api_key_status(),
         kimi_code_api_key_status: kimi_code_api_key_status(),
+        perplexity_web_search_enabled: app.perplexity_web_search_enabled,
+        perplexity_api_key_status: perplexity_api_key_status(),
         kimi_api_endpoint: app.kimi_api_endpoint.clone(),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         plan_mode_active: agent_plan_mode(app),
@@ -842,6 +860,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         }
         ("toolset.ask_user_question.timeout_enabled", SettingValue::Bool(b)) => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(*b))
+        }
+        ("toolset.perplexity_web_search.enabled", SettingValue::Bool(b)) => {
+            Some(Action::SetPerplexityWebSearch(*b))
         }
         ("keep_text_selection", SettingValue::Enum(s)) => {
             crate::appearance::TextSelection::from_canonical(s).map(Action::SetKeepTextSelection)
@@ -1011,6 +1032,10 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ) => Some(Action::ClearKimiApiKey {
             endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
         }),
+        (
+            "perplexity_api_key",
+            SettingValue::SecretStatus(crate::settings::SecretStatus::Missing),
+        ) => Some(Action::ClearPerplexityApiKey),
 
         _ => None,
     }

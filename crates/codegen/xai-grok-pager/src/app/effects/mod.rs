@@ -42,6 +42,9 @@ use xai_grok_shell::session::{ExtMethodResult, SessionInfoResponse};
 static KIMI_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static KIMI_MUTATION_QUEUE: LazyLock<KimiMutationQueue> =
     LazyLock::new(KimiMutationQueue::new);
+static PERPLEXITY_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static PERPLEXITY_MUTATION_QUEUE: LazyLock<KimiMutationQueue> =
+    LazyLock::new(KimiMutationQueue::new);
 static NEXT_KIMI_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
 static LATEST_KIMI_ENDPOINT_SELECTION: AtomicU64 = AtomicU64::new(0);
 static LATEST_KIMI_ACTIVE_APPLY: AtomicU64 = AtomicU64::new(0);
@@ -374,6 +377,40 @@ async fn apply_kimi_endpoint(
     })
 }
 
+fn persisted_perplexity_web_search_enabled(fallback: bool) -> bool {
+    xai_grok_shell::config::load_from_disk()
+        .ok()
+        .as_ref()
+        .and_then(|root| root.get("toolset"))
+        .and_then(|toolset| toolset.get("perplexity_web_search"))
+        .and_then(|perplexity| perplexity.get("enabled"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(fallback)
+}
+
+async fn apply_perplexity_web_search(tx: &AcpAgentTx) -> Result<(), String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/toolset/perplexity-web-search/reload",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize Perplexity web search reload params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|_| "web search reload returned invalid JSON".to_string())?;
+    if let Some(error) = envelope.get("error").filter(|value| !value.is_null()) {
+        return Err(sanitize_user_error(
+            error.as_str().unwrap_or("web search reload failed"),
+        ));
+    }
+    if envelope.get("result").is_none() {
+        return Err("web search reload returned no result".to_string());
+    }
+    Ok(())
+}
+
 pub(crate) fn execute(
     effect: Effect,
     tasks: &mut JoinSet<TaskResult>,
@@ -385,6 +422,111 @@ pub(crate) fn execute(
     let mut meta = EffectMeta::default();
     let effect_is_send_now = matches!(effect, Effect::SendPromptNow { .. });
     match effect {
+        Effect::UpdatePerplexityWebSearch {
+            enabled,
+            generation,
+            key,
+            clear_key,
+        } => {
+            let mut mutation_ticket = PERPLEXITY_MUTATION_QUEUE.enqueue();
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                mutation_ticket.wait_turn().await;
+                let _guard = PERPLEXITY_MUTATION_LOCK.lock().await;
+                let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                let previous_enabled = persisted_perplexity_web_search_enabled(false);
+                let previous_key = xai_grok_shell::auth::read_perplexity_api_key(&grok_home)
+                    .map(crate::settings::SecretInput::new);
+                let desired_enabled = enabled.unwrap_or(previous_enabled);
+                let desired_key_configured = if key.is_some() {
+                    true
+                } else if clear_key {
+                    false
+                } else {
+                    previous_key.is_some()
+                };
+
+                let persist_result: anyhow::Result<()> = if let Some(enabled) = enabled {
+                    xai_grok_shell::util::config::set_perplexity_web_search_enabled(enabled)
+                        .await
+                } else if let Some(secret) = key.as_ref() {
+                    xai_grok_shell::auth::store_perplexity_api_key(
+                        &grok_home,
+                        secret.expose(),
+                    )
+                    .map_err(anyhow::Error::from)
+                } else if clear_key {
+                    xai_grok_shell::auth::clear_perplexity_api_key(&grok_home)
+                        .map_err(anyhow::Error::from)
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = persist_result {
+                    return TaskResult::PerplexityWebSearchUpdated {
+                        enabled: previous_enabled,
+                        api_key_configured: previous_key.is_some(),
+                        generation,
+                        error: Some(sanitize_user_error(&error.to_string())),
+                        reconciled: true,
+                    };
+                }
+
+                if let Err(apply_error) = apply_perplexity_web_search(&tx).await {
+                    let rollback_result: anyhow::Result<()> = if enabled.is_some() {
+                        xai_grok_shell::util::config::set_perplexity_web_search_enabled(
+                            previous_enabled,
+                        )
+                        .await
+                    } else if key.is_some() || clear_key {
+                        match previous_key.as_ref() {
+                            Some(secret) => xai_grok_shell::auth::store_perplexity_api_key(
+                                &grok_home,
+                                secret.expose(),
+                            )
+                            .map_err(anyhow::Error::from),
+                            None => xai_grok_shell::auth::clear_perplexity_api_key(&grok_home)
+                                .map_err(anyhow::Error::from),
+                        }
+                    } else {
+                        Ok(())
+                    };
+                    let mut error = apply_error;
+                    let reconciled = match rollback_result {
+                        Ok(()) => match apply_perplexity_web_search(&tx).await {
+                            Ok(()) => true,
+                            Err(reconcile_error) => {
+                                error = format!(
+                                    "{error}; live rollback also failed: {reconcile_error}"
+                                );
+                                false
+                            }
+                        },
+                        Err(rollback_error) => {
+                            error = format!(
+                                "{error}; persistence rollback also failed: {}",
+                                sanitize_user_error(&rollback_error.to_string())
+                            );
+                            false
+                        }
+                    };
+                    return TaskResult::PerplexityWebSearchUpdated {
+                        enabled: previous_enabled,
+                        api_key_configured: previous_key.is_some(),
+                        generation,
+                        error: Some(error),
+                        reconciled,
+                    };
+                }
+
+                TaskResult::PerplexityWebSearchUpdated {
+                    enabled: desired_enabled,
+                    api_key_configured: desired_key_configured,
+                    generation,
+                    error: None,
+                    reconciled: true,
+                }
+            });
+        }
         Effect::UpdateKimiApiEndpoint {
             endpoint,
             previous,

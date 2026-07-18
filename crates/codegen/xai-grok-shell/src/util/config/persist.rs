@@ -56,6 +56,7 @@ pub async fn save_config(config: &Config) -> Result<()> {
     merge_section(table, "harness", &config.harness);
     merge_section(table, "session", &config.session);
     merge_ask_user_question_section(table, &config.ask_user_question);
+    merge_perplexity_web_search_section(table, &config.perplexity_web_search);
 
     if config.skills == SkillsConfig::default() {
         table.remove("skills");
@@ -190,6 +191,21 @@ fn merge_ask_user_question_section(
     }
 }
 
+fn merge_perplexity_web_search_section(
+    table: &mut TomlMap<String, TomlValue>,
+    perplexity: &crate::tools::config::PerplexityWebSearchToolConfig,
+) {
+    let toolset = table
+        .entry("toolset".to_string())
+        .or_insert_with(|| TomlValue::Table(TomlMap::new()));
+    if !matches!(toolset, TomlValue::Table(_)) {
+        *toolset = TomlValue::Table(TomlMap::new());
+    }
+    if let TomlValue::Table(toolset_table) = toolset {
+        merge_section(toolset_table, "perplexity_web_search", perplexity);
+    }
+}
+
 /// Merge serialized fields of `value` into `table[key]`, preserving any
 /// existing keys not present in the serialized output. This prevents
 /// unmodeled fields (e.g. pager-written `show_timestamps`, `auto_dark_theme`)
@@ -315,6 +331,39 @@ mod tests {
             Some(false),
             "scalar [toolset] must be replaced so the write lands"
         );
+    }
+
+    #[test]
+    fn perplexity_merge_preserves_unrelated_toolset_entries() {
+        let root_val: TomlValue =
+            toml::from_str("[toolset.bash]\nenabled = false\n[unrelated]\nvalue = 7\n").unwrap();
+        let mut root = root_val.as_table().unwrap().clone();
+        merge_perplexity_web_search_section(
+            &mut root,
+            &crate::tools::config::PerplexityWebSearchToolConfig { enabled: true },
+        );
+        assert_eq!(
+            root.get("toolset")
+                .and_then(|value| value.get("bash"))
+                .and_then(|value| value.get("enabled"))
+                .and_then(TomlValue::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            root.get("toolset")
+                .and_then(|value| value.get("perplexity_web_search"))
+                .and_then(|value| value.get("enabled"))
+                .and_then(TomlValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            root.get("unrelated")
+                .and_then(|value| value.get("value"))
+                .and_then(TomlValue::as_integer),
+            Some(7)
+        );
+        let reparsed = load_config_from_toml(&TomlValue::Table(root));
+        assert!(reparsed.perplexity_web_search.enabled);
     }
 
     #[test]

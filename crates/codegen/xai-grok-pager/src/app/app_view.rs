@@ -666,6 +666,11 @@ pub struct AppView {
     /// Loaded Kimi sessions awaiting a sampler rebuild for the selected
     /// service. Targets remain pending while that service has no credential.
     pub(crate) pending_kimi_rebind_agents: std::collections::HashSet<AgentId>,
+    /// Optimistic mirror of `[toolset.perplexity_web_search].enabled`.
+    pub perplexity_web_search_enabled: bool,
+    pub(crate) perplexity_web_search_generation: u64,
+    pub(crate) perplexity_web_search_update_pending: bool,
+    pub(crate) pending_perplexity_rebuild_agents: std::collections::HashSet<AgentId>,
     /// Working directory.
     pub cwd: PathBuf,
     /// Whether the project picker question has already been shown this session.
@@ -1473,6 +1478,10 @@ impl AppView {
             kimi_active_operation_generation: 0,
             kimi_runtime_update_pending: false,
             pending_kimi_rebind_agents: Default::default(),
+            perplexity_web_search_enabled: false,
+            perplexity_web_search_generation: 0,
+            perplexity_web_search_update_pending: false,
+            pending_perplexity_rebuild_agents: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             project_picker_shown: false,
             project_picker_disabled: false,
@@ -5606,6 +5615,10 @@ pub(crate) mod tests {
             kimi_active_operation_generation: 0,
             kimi_runtime_update_pending: false,
             pending_kimi_rebind_agents: Default::default(),
+            perplexity_web_search_enabled: false,
+            perplexity_web_search_generation: 0,
+            perplexity_web_search_update_pending: false,
+            pending_perplexity_rebuild_agents: Default::default(),
             cwd: std::path::PathBuf::from("/tmp"),
             project_picker_shown: true,
             project_picker_disabled: false,

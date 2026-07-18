@@ -220,7 +220,7 @@ Nested results must not append as ordinary model tool history (`ModelToolResultS
 
 ### Provider / toolset
 
-Provider profile and agent definition choose tool packs (e.g. Codex sessions use Codex read/`apply_patch`). Do **not** infer pack from model slug. Hosted web search may be provider-side (sampler) in addition to client `web_search` tool.
+Provider profile and agent definition choose tool packs (e.g. Codex sessions use Codex read/`apply_patch`). Do **not** infer pack from model slug. Hosted web search may be provider-side (sampler) in addition to the client `web_search` tool. The client tool can use either the legacy Responses-backed helper or the opt-in Perplexity raw Search API backend; the latter is exposed only when the active provider profile lacks native web search.
 
 ## Tool packs
 
@@ -272,7 +272,17 @@ Paths under `xai-grok-tools/src/implementations/` unless noted.
 | Edit | `search_replace` | `grok_build/search_replace/` | **Details: [editing.md](editing.md)** |
 | Patch (Codex) | `apply_patch` | `codex/apply_patch/` | Freeform; plan-mode always reject |
 | List / search FS | `list_dir`, `grep` | `grok_build/list_dir/`, `grok_build/grep/` | Versioned list_dir schemas |
-| Web | `web_search`, `web_fetch` | `grok_build/web_search/`, `web_fetch/` | Config-gated; SSRF checks on fetch |
+| Web | `web_search`, `web_fetch` | `web_search/`, `grok_build/web_fetch/` | Search supports Responses and Perplexity raw-result backends; fetch applies SSRF checks |
+
+### Perplexity web-search fallback
+
+- Public schema remains `web_search(query, allowed_domains?)`.
+- Enable with `[toolset.perplexity_web_search].enabled = true` or **Settings → Models → Perplexity web search**.
+- Save the key through **Perplexity API key**. It is stored only in owner-protected `auth.json` under `perplexity::api_key`; it never enters `config.toml`, session persistence, provider credentials, or diagnostics.
+- The backend calls Perplexity `POST /search`, forwards `allowed_domains` as `search_domain_filter`, requests ten ranked results, and returns title, URL, date, snippet, and deduplicated URL citations for the active model to synthesize.
+- Enabling without a key is valid configuration but leaves the tool unavailable and displays **API key required**.
+- `--disable-web-search` remains the top-level kill switch for both native declarations and this fallback.
+- Settings changes apply live. The pager pauses new Kimi sends and queue draining until persistence and every resident-session rebuild are confirmed; failures restore durable state and reconcile the runtime before releasing the queue.
 | Subagents | `task`, wait/kill helpers | `grok_build/task/`, `task_output/`, `kill_task/` | `MAX_SUBAGENT_DEPTH = 1` |
 | Background I/O | `get_task_output` / wait / kill | `task_output/`, `kill_task/` | Terminal + subagent tasks |
 | Monitor | `monitor` | `grok_build/monitor/` | Line → notifications; rate limited |

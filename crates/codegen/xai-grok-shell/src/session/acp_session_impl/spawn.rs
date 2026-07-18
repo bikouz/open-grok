@@ -311,7 +311,7 @@ pub(crate) async fn spawn_session_actor(
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
-    web_search_sampling_config: Option<crate::agent::config::PreparedWebSearchSamplingConfig>,
+    web_search_config: crate::agent::config::PreparedWebSearchConfig,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -515,28 +515,11 @@ pub(crate) async fn spawn_session_actor(
             (0, Vec::new(), Vec::new())
         };
     let primary_model_id = sampling_config.model.clone();
-    let implicit_local_web_search = web_search_sampling_config
-        .as_ref()
-        .is_some_and(|prepared| prepared.is_implicit_default);
+    let implicit_local_web_search = web_search_config.is_implicit_default;
     let web_search_config = if disable_web_search {
         xai_grok_tools::implementations::WebSearchConfig::Disabled
-    } else if let Some(prepared) = web_search_sampling_config {
-        let cfg = prepared.sampler;
-        if let Some(api_key) = cfg.api_key {
-            xai_grok_tools::implementations::WebSearchConfig::Enabled {
-                api_key,
-                base_url: cfg.base_url,
-                model: cfg.model,
-                extra_headers: cfg.extra_headers,
-                alpha_test_key: credentials.alpha_test_key.clone(),
-            }
-        } else {
-            tracing::warn!("web_search disabled: resolved config has no API key");
-            xai_grok_tools::implementations::WebSearchConfig::Disabled
-        }
     } else {
-        tracing::warn!("web_search disabled: configured model could not be resolved");
-        xai_grok_tools::implementations::WebSearchConfig::Disabled
+        web_search_config.config
     };
     // Memory embeddings are an independent xAI helper path. A Codex session
     // must never send its ChatGPT bearer or backend URL to the embeddings API,
@@ -662,6 +645,7 @@ pub(crate) async fn spawn_session_actor(
         pending_inputs: VecDeque::new(),
         pending_notifications: Vec::new(),
         lifecycle_mutation: None,
+        pending_web_search_reload: None,
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,
@@ -1057,8 +1041,12 @@ pub(crate) async fn spawn_session_actor(
             .as_ref()
             .map(|s| s.workspace_memory_file().to_string_lossy().into_owned()),
         memory_backend: memory_backend_for_spec,
-        web_search_config: web_search_config.clone(),
-        implicit_local_web_search,
+        web_search: parking_lot::RwLock::new(
+            crate::session::agent_rebuild::ResolvedWebSearchState {
+                config: web_search_config.clone(),
+                implicit_local_web_search,
+            },
+        ),
         backend_search: backend_tools_enabled,
         web_fetch_config: web_fetch_config.clone(),
         image_gen_config: image_gen_config.clone(),
@@ -1997,7 +1985,7 @@ pub(crate) async fn spawn_session_on_thread(
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
-    web_search_sampling_config: Option<crate::agent::config::PreparedWebSearchSamplingConfig>,
+    web_search_config: crate::agent::config::PreparedWebSearchConfig,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -2163,7 +2151,7 @@ pub(crate) async fn spawn_session_on_thread(
                         session_client_identifier,
                         inference_idle_timeout_secs,
                         max_retries,
-                        web_search_sampling_config,
+                        web_search_config,
                         web_fetch_config,
                         image_gen_config,
                         video_gen_config,

@@ -361,6 +361,7 @@ impl SessionActor {
             tool_mode,
             sampling_config.provider,
             &sampling_config.api_backend,
+            self.rebuild_spec.web_search_state().config.is_perplexity(),
         ) {
             Ok(surface) => surface,
             Err(error) => {
@@ -1502,6 +1503,7 @@ impl SessionActor {
             tool_mode,
             sampling_config.provider,
             &sampling_config.api_backend,
+            self.rebuild_spec.web_search_state().config.is_perplexity(),
         )
         .map_err(|error| acp::Error::internal_error().data(error))?;
         let compaction_tool_tokens = compaction_surface.estimated_definition_tokens();
@@ -2882,6 +2884,7 @@ mod inline_auto_compact_flow_tests {
             pending_inputs: VecDeque::new(),
             pending_notifications: Vec::new(),
             lifecycle_mutation: None,
+            pending_web_search_reload: None,
             notifications_suppressed: false,
             rewindable: false,
             nudges_used_this_session: 0,

@@ -72,6 +72,24 @@ pub(crate) struct ResolvedToolParamsJson {
     /// `[toolset.ask_user_question]` timeout policy for the ask tool.
     pub ask_user_question: Option<serde_json::Map<String, serde_json::Value>>,
 }
+
+#[derive(Clone)]
+pub struct ResolvedWebSearchState {
+    pub config: WebSearchConfig,
+    pub implicit_local_web_search: bool,
+}
+
+impl ResolvedWebSearchState {
+    pub(crate) fn allowed_for_provider(
+        &self,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> bool {
+        if self.config.is_perplexity() {
+            return !provider.profile().has_native_web_search();
+        }
+        provider.profile().allows_xai_services() || !self.implicit_local_web_search
+    }
+}
 /// Cached recipe for building a session-scoped [`Agent`].
 ///
 /// See module docs for the invariant: this is the only construction
@@ -98,10 +116,7 @@ pub(crate) struct AgentRebuildSpec {
     pub memory_global_path: Option<String>,
     pub memory_workspace_path: Option<String>,
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
-    pub web_search_config: WebSearchConfig,
-    /// True when local search came from the compiled xAI helper rather than an
-    /// explicit non-default route. Used to keep Codex sessions provider-local.
-    pub implicit_local_web_search: bool,
+    pub web_search: parking_lot::RwLock<ResolvedWebSearchState>,
     pub backend_search: bool,
     pub web_fetch_config: WebFetchConfig,
     pub image_gen_config: ImageGenConfig,
@@ -143,6 +158,17 @@ pub(crate) struct AgentRebuildSpec {
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
 }
 impl AgentRebuildSpec {
+    pub(crate) fn web_search_state(&self) -> ResolvedWebSearchState {
+        self.web_search.read().clone()
+    }
+
+    pub(crate) fn replace_web_search_state(
+        &self,
+        next: ResolvedWebSearchState,
+    ) -> ResolvedWebSearchState {
+        std::mem::replace(&mut *self.web_search.write(), next)
+    }
+
     /// Build a fresh [`Agent`] from this spec and an [`AgentDefinition`].
     ///
     /// This is the canonical construction path; see module docs for the
@@ -199,8 +225,7 @@ impl AgentRebuildSpec {
             memory_global_path,
             memory_workspace_path,
             memory_backend,
-            web_search_config,
-            implicit_local_web_search: _,
+            web_search,
             backend_search,
             web_fetch_config,
             image_gen_config,
@@ -239,6 +264,7 @@ impl AgentRebuildSpec {
         } = self.as_ref();
         let _ = mcp_state;
         let _ = code_mode_runtime;
+        let web_search_config = web_search.read().config.clone();
         #[allow(unused_variables)]
         let is_cursor_template =
             crate::session::is_cursor_system_template(&definition.system_prompt);
@@ -256,7 +282,7 @@ impl AgentRebuildSpec {
         .with_system_prompt_label(system_prompt_label.clone())
         .with_session_env(session_env.clone())
         .with_state_path(bridge_state_path.clone())
-        .with_web_search_config(web_search_config.clone())
+        .with_web_search_config(web_search_config)
         .with_backend_search(*backend_search)
         .with_image_gen_config(image_gen_config.clone())
         .with_video_gen_config(video_gen_config.clone())
@@ -415,8 +441,10 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_global_path: None,
         memory_workspace_path: None,
         memory_backend: None,
-        web_search_config: WebSearchConfig::default(),
-        implicit_local_web_search: false,
+        web_search: parking_lot::RwLock::new(ResolvedWebSearchState {
+            config: WebSearchConfig::default(),
+            implicit_local_web_search: false,
+        }),
         backend_search: false,
         web_fetch_config: WebFetchConfig::Disabled,
         image_gen_config: ImageGenConfig::default(),
@@ -459,6 +487,34 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perplexity_search_is_kimi_only_while_responses_compatibility_is_preserved() {
+        let perplexity = ResolvedWebSearchState {
+            config: WebSearchConfig::Perplexity {
+                api_key: "secret".to_owned(),
+                base_url: "https://api.perplexity.ai".to_owned(),
+            },
+            implicit_local_web_search: false,
+        };
+        assert!(!perplexity.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Xai));
+        assert!(!perplexity.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Codex));
+        assert!(perplexity.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Kimi));
+
+        let implicit_responses = ResolvedWebSearchState {
+            config: WebSearchConfig::default(),
+            implicit_local_web_search: true,
+        };
+        assert!(
+            implicit_responses.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Xai)
+        );
+        assert!(
+            !implicit_responses.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Codex)
+        );
+        assert!(
+            !implicit_responses.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Kimi)
+        );
+    }
     use crate::agent::config::{EndpointsConfig, ModelEntry};
     fn model_entry(internal_id: &str) -> ModelEntry {
         ModelEntry::fallback(internal_id, &EndpointsConfig::default())

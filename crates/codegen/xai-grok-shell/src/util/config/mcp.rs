@@ -41,10 +41,11 @@ pub struct Config {
     /// `[session]` section — round-tripped through `merge_section` so
     /// pager setters can persist session fields (e.g. auto-compact threshold).
     pub session: crate::agent::config::SessionConfig,
-    /// `[toolset.ask_user_question]` sub-table — the only `[toolset]` piece
-    /// the settings modal writes; the rest of `[toolset]` never round-trips
-    /// (it carries runtime-only structs whose defaults must not hit disk).
+    /// `[toolset.ask_user_question]` sub-table.
     pub ask_user_question: crate::tools::config::AskUserQuestionToolConfig,
+    /// `[toolset.perplexity_web_search]` sub-table. Contains only the opt-in
+    /// boolean; the API key remains isolated in auth.json.
+    pub perplexity_web_search: crate::tools::config::PerplexityWebSearchToolConfig,
 }
 
 pub fn get_mcp_server_config(name: &str) -> Option<McpServerConfig> {

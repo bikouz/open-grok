@@ -10,9 +10,10 @@ without accidentally inheriting xAI or Codex behavior.
    Messages. It owns endpoint selection and the protocol-level conversion to
    and from the shared `ConversationRequest` / `ConversationResponse` model.
 2. `ProviderProfile` selects provider policy. It declares supported backends,
-   an optional Responses wire dialect, an optional hosted-tool schema, private
-   request-metadata policy, built-in session credential source, and whether
-   xAI-only services may receive data from the provider.
+   an optional Responses wire dialect, an optional hosted-tool schema, native
+   web-search capability, private request-metadata policy, built-in session
+   credential source, and whether xAI-only services may receive data from the
+   provider.
 3. `AuthScheme` and `BearerResolver` select request authentication. A model may
    use an explicit API key even when its provider also supports OAuth. A live
    OAuth resolver supplies the bearer and account-scoped headers atomically.
@@ -22,11 +23,11 @@ Codex provider does not override an explicit model API key.
 
 ## Current built-in mapping
 
-| Provider | Backends | Responses dialect | Hosted tools | Private metadata | Session credential | xAI-only exports |
-| --- | --- | --- | --- | --- | --- | --- |
-| xAI | Chat, Responses, Messages | xAI | xAI | `x-grok-*` | xAI session | allowed |
-| OpenAI Codex | Responses | Codex | OpenAI | standard only | Codex OAuth | denied |
-| Kimi | Chat | none | client function tools | standard only | provider API key | denied |
+| Provider | Backends | Responses dialect | Hosted tools | Native web search | Private metadata | Session credential | xAI-only exports |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| xAI | Chat, Responses, Messages | xAI | xAI | yes | `x-grok-*` | xAI session | allowed |
+| OpenAI Codex | Responses | Codex | OpenAI | yes | standard only | Codex OAuth | denied |
+| Kimi | Chat | none | client function tools | no | standard only | provider API key | denied |
 
 The sampler's built-in `ProviderAdapter` registry applies the transport policy
 for each profile. The xAI adapter owns xAI request metadata and doom-loop
@@ -87,5 +88,9 @@ rejected; provider omission remains the legacy xAI default for old catalogs.
   monotonically.
 - Hosted tools and opaque response history are serialized only for their
   declared dialect.
+- Native and fallback web-search declarations are gated from
+  `ProviderProfile`, never model slugs, endpoints, or URL inspection. The
+  opt-in Perplexity fallback is therefore Kimi-only; xAI and Codex retain their
+  native declarations.
 - Unknown future events may be ignored only when the selected adapter opts in;
   malformed known events still fail loudly.

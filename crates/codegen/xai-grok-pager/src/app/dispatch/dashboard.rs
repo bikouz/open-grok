@@ -1374,6 +1374,9 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 recap_model: app.recap_model.clone(),
                 kimi_api_key_status: crate::settings::SecretStatus::Missing,
                 kimi_code_api_key_status: crate::settings::SecretStatus::Missing,
+                perplexity_web_search_enabled: app.perplexity_web_search_enabled,
+                perplexity_api_key_status:
+                    crate::app::dispatch::settings::ui::perplexity_api_key_status(),
                 kimi_api_endpoint: app.kimi_api_endpoint.clone(),
                 memory_model: app.memory_model.clone(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,

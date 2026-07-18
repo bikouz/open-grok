@@ -134,6 +134,58 @@ async fn lifecycle_mutation_gate_blocks_direct_synthetic_turn_start() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn web_search_reload_waits_for_an_active_kimi_turn() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _gateway_rx) = build_actor().await;
+            let mut sampling_config = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor sampling config");
+            sampling_config.provider = xai_grok_sampling_types::ModelProvider::Kimi;
+            actor
+                .chat_state_handle
+                .update_sampling_config(sampling_config);
+            actor
+                .session_turn_active
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            let (responds_to, mut response) = tokio::sync::oneshot::channel();
+            actor
+                .handle_reload_web_search_toolset(
+                    crate::session::agent_rebuild::ResolvedWebSearchState {
+                        config:
+                            xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled,
+                        implicit_local_web_search: false,
+                    },
+                    responds_to,
+                )
+                .await;
+
+            let state = actor.state.lock().await;
+            assert!(state.pending_web_search_reload.is_some());
+            assert!(state.lifecycle_mutation.is_none());
+            drop(state);
+            assert!(matches!(
+                response.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+
+            actor
+                .session_turn_active
+                .store(false, std::sync::atomic::Ordering::Release);
+            actor.maybe_apply_pending_web_search_reload().await;
+            assert!(response.await.expect("reload response channel").is_ok());
+            let state = actor.state.lock().await;
+            assert!(state.pending_web_search_reload.is_none());
+            assert!(state.lifecycle_mutation.is_none());
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn maintenance_mutations_share_the_model_switch_and_rewind_gate() {
     let local = tokio::task::LocalSet::new();
     local

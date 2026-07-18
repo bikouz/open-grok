@@ -2,6 +2,11 @@ use super::persist::update_config;
 use anyhow::Result;
 
 // ---------------------------------------------------------------------------
+
+pub async fn set_perplexity_web_search_enabled(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.perplexity_web_search.enabled = value).await
+}
+
 // Settings helpers — typed disk-write wrappers for each setting.
 // All route through `update_config` → `merge_section` → `save_config`.
 // ---------------------------------------------------------------------------

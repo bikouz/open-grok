@@ -99,15 +99,22 @@ pub(crate) fn hosted_tools_for_code_mode(
 /// Code Mode `exec` tool.
 pub(crate) fn nested_tool_definitions_for_provider(
     definitions: &[GrokToolDefinition],
-    _provider: xai_grok_sampling_types::ModelProvider,
+    provider: xai_grok_sampling_types::ModelProvider,
     hosted_tools: &[xai_grok_sampling_types::HostedTool],
+    perplexity_web_search: bool,
 ) -> Vec<GrokToolDefinition> {
     let has_hosted_web = hosted_tools
         .iter()
         .any(|tool| matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }));
     definitions
         .iter()
-        .filter(|definition| !has_hosted_web || definition.function.name != "web_search")
+        .filter(|definition| {
+            if definition.function.name != "web_search" {
+                return true;
+            }
+            !has_hosted_web
+                && !(perplexity_web_search && provider.profile().has_native_web_search())
+        })
         .cloned()
         .collect()
 }
@@ -1433,6 +1440,7 @@ mod tests {
             &definitions,
             xai_grok_sampling_types::ModelProvider::Codex,
             &effective_hosted,
+            false,
         );
         assert_eq!(
             nested
@@ -1480,6 +1488,7 @@ mod tests {
             &definitions,
             xai_grok_sampling_types::ModelProvider::Xai,
             &effective,
+            false,
         );
         assert_eq!(
             nested
@@ -1487,6 +1496,48 @@ mod tests {
                 .map(|definition| definition.function.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["read_file"]
+        );
+    }
+
+    #[test]
+    fn perplexity_nested_search_is_kimi_only() {
+        let definitions = vec![
+            GrokToolDefinition::function(
+                "web_search",
+                Some("Local search"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "read_file",
+                Some("Read a file"),
+                json!({"type": "object"}),
+            ),
+        ];
+        for provider in [
+            xai_grok_sampling_types::ModelProvider::Xai,
+            xai_grok_sampling_types::ModelProvider::Codex,
+        ] {
+            let nested = nested_tool_definitions_for_provider(&definitions, provider, &[], true);
+            assert_eq!(
+                nested
+                    .iter()
+                    .map(|definition| definition.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["read_file"]
+            );
+        }
+        let nested = nested_tool_definitions_for_provider(
+            &definitions,
+            xai_grok_sampling_types::ModelProvider::Kimi,
+            &[],
+            true,
+        );
+        assert_eq!(
+            nested
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web_search", "read_file"]
         );
     }
 

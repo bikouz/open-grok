@@ -1286,6 +1286,9 @@ auto_update = true                     # check for updates on launch
 default = "grok-build"           # model used for new sessions
 web_search = "grok-4.20-multi-agent"   # model used by the web_search tool
 
+[toolset.perplexity_web_search]
+enabled = false                   # opt-in raw Search API fallback for Kimi
+
 [ui]
 max_thoughts_width = 120               # max column width for reasoning display
 
@@ -1740,6 +1743,17 @@ api_key = "sk-custom"
 3. Hardcoded defaults — lowest priority
 
 **Web search model:** Set `[models] web_search`, `GROK_WEB_SEARCH_MODEL`, or `--web-search-model` to point the `web_search` tool at a different model. The target endpoint must support the Responses API and web search.
+
+**Perplexity fallback for Kimi:** In Settings, enable **Perplexity web search**
+and save a **Perplexity API key**, or set
+`[toolset.perplexity_web_search].enabled = true` and save the key through the
+UI. The key is stored only in owner-protected `$OPENGROK_HOME/auth.json` under
+the isolated `perplexity::api_key` scope. Kimi Platform and Kimi Code receive
+the existing `web_search(query, allowed_domains?)` tool after both the opt-in
+and key are present. xAI and Codex never receive this fallback because their
+provider profiles declare native web search. Changes apply live; enabling
+without a key is allowed but leaves the tool unavailable. `--disable-web-search`
+disables both native search declarations and the fallback.
 
 > **Overriding with a custom model:** Setting `[models] web_search` alone is not
 > enough if the model isn't already in the catalog (built-in defaults or

@@ -42,6 +42,25 @@ fn kimi_secret_state(status: crate::settings::SecretStatus) -> SettingsModalStat
     state
 }
 
+fn perplexity_secret_state(status: crate::settings::SecretStatus) -> SettingsModalState {
+    let mut state = SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        UiConfig::default(),
+        PagerLocalSnapshot {
+            perplexity_api_key_status: status,
+            ..PagerLocalSnapshot::default()
+        },
+    );
+    state.selected = state
+        .rows
+        .iter()
+        .position(
+            |row| matches!(row, RowEntry::Setting { key, .. } if *key == "perplexity_api_key"),
+        )
+        .expect("Perplexity API key setting is registered");
+    state
+}
+
 #[test]
 fn kimi_secret_editor_is_always_empty_and_empty_enter_preserves() {
     for status in [
@@ -109,6 +128,29 @@ fn kimi_secret_paste_is_masked_redacted_and_commits_typed_action() {
         panic!("expected typed Kimi key action");
     };
     assert_eq!(secret_input.expose(), secret);
+}
+
+#[test]
+fn perplexity_secret_paste_is_masked_and_commits_typed_action() {
+    let secret = "pplx-secret-42";
+    let mut state = perplexity_secret_state(crate::settings::SecretStatus::Missing);
+    let _ = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(
+        handle_settings_paste(&mut state, SecretInput::new(secret.to_owned())),
+        SettingsKeyOutcome::Changed
+    ));
+    let outcome = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(!format!("{outcome:?}").contains(secret));
+    let SettingsKeyOutcome::Action(Action::SetPerplexityApiKey { key }) = outcome else {
+        panic!("expected typed Perplexity key action");
+    };
+    assert_eq!(key.expose(), secret);
 }
 
 #[test]
@@ -800,6 +842,8 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "kimi_api_endpoint",
             "kimi_api_key",
             "kimi_code_api_key",
+            "toolset.perplexity_web_search.enabled",
+            "perplexity_api_key",
             // Auxiliary model selectors persist IDs while rendering names.
             "recap_model",
             "memory_model",
