@@ -794,7 +794,10 @@ mod tests {
 
         let err = result.unwrap_err().to_string();
         assert!(err.contains("missing field `action`"), "error: {err}");
-        assert!(err.contains("Partial output before the failure"), "error: {err}");
+        assert!(
+            err.contains("Partial output before the failure"),
+            "error: {err}"
+        );
         assert!(
             err.contains("Traced the failure to client.rs so far."),
             "error: {err}"
