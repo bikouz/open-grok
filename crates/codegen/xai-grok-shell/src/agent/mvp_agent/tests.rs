@@ -3976,20 +3976,55 @@ fn folder_trust_on() -> crate::util::config::RemoteSettings {
         ..Default::default()
     }
 }
+/// Pull the next `x.ai/folder_trust/request` reverse-request off the gateway,
+/// skipping unrelated traffic: the agent legitimately pushes other messages at
+/// any time (e.g. `x.ai/models/update` once a cached catalog loads), so trust
+/// tests must key on the method, not on "any message arrived".
+async fn recv_folder_trust_request(
+    gw_rx: &mut tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
+) -> xai_acp_lib::AcpArgs<acp::ExtRequest> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, gw_rx.recv())
+            .await
+            .expect("trust request must be sent")
+            .expect("gateway channel open");
+        if let xai_acp_lib::AcpClientMessage::ExtMethod(args) = msg
+            && args.request.method.as_ref() == "x.ai/folder_trust/request"
+        {
+            return args;
+        }
+    }
+}
+
+/// Assert no folder-trust request arrives within `window_ms`, ignoring
+/// unrelated gateway traffic (see [`recv_folder_trust_request`]).
+async fn assert_no_folder_trust_request(
+    gw_rx: &mut tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
+    window_ms: u64,
+    context: &str,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(window_ms);
+    loop {
+        match tokio::time::timeout_at(deadline, gw_rx.recv()).await {
+            Err(_) | Ok(None) => return,
+            Ok(Some(xai_acp_lib::AcpClientMessage::ExtMethod(args)))
+                if args.request.method.as_ref() == "x.ai/folder_trust/request" =>
+            {
+                panic!("{context}: unexpected folder-trust request");
+            }
+            Ok(Some(_)) => {}
+        }
+    }
+}
+
 /// Pull the next `x.ai/folder_trust/request` reverse-request off the gateway and
 /// answer it with `outcome`. Returns the request's decoded params.
 async fn answer_folder_trust_request(
     gw_rx: &mut tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
     outcome: &str,
 ) -> serde_json::Value {
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), gw_rx.recv())
-        .await
-        .expect("trust request must be sent")
-        .expect("gateway channel open");
-    let xai_acp_lib::AcpClientMessage::ExtMethod(args) = msg else {
-        panic!("expected an ext_method reverse-request, got a different message");
-    };
-    assert_eq!(args.request.method.as_ref(), "x.ai/folder_trust/request");
+    let args = recv_folder_trust_request(gw_rx).await;
     let params: serde_json::Value = serde_json::from_str(args.request.params.get()).unwrap();
     let resp: acp::ExtResponse = acp::ExtResponse::new(std::sync::Arc::from(
         serde_json::value::to_raw_value(&serde_json::json!({ "outcome" : outcome })).unwrap(),
@@ -4136,12 +4171,12 @@ fn interactive_trust_prompt_dormant_when_feature_off() {
         handle.info.cwd = repo_path.to_string_lossy().to_string();
         agent.sessions.borrow_mut().insert(sid.clone(), handle);
         agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), gw_rx.recv())
-                .await
-                .is_err(),
-            "feature off must emit no trust request (dormant)"
-        );
+        assert_no_folder_trust_request(
+            &mut gw_rx,
+            300,
+            "feature off must emit no trust request (dormant)",
+        )
+        .await;
     });
 }
 #[test]
@@ -4163,12 +4198,12 @@ fn interactive_trust_prompt_no_request_without_capability() {
         handle.info.cwd = repo_path.to_string_lossy().to_string();
         agent.sessions.borrow_mut().insert(sid.clone(), handle);
         agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), gw_rx.recv())
-                .await
-                .is_err(),
-            "a client without the capability must get no trust request"
-        );
+        assert_no_folder_trust_request(
+            &mut gw_rx,
+            300,
+            "a client without the capability must get no trust request",
+        )
+        .await;
     });
 }
 #[test]
@@ -4192,12 +4227,7 @@ fn interactive_trust_prompt_client_error_fails_closed() {
         handle.info.cwd = repo_path.to_string_lossy().to_string();
         agent.sessions.borrow_mut().insert(sid.clone(), handle);
         agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), gw_rx.recv())
-            .await
-            .expect("trust request must be sent")
-            .expect("gateway channel open");
-        assert!(matches!(msg, xai_acp_lib::AcpClientMessage::ExtMethod(_)));
-        drop(msg);
+        drop(recv_folder_trust_request(&mut gw_rx).await);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), cmd_rx.recv())
                 .await
@@ -4233,18 +4263,14 @@ fn interactive_trust_prompt_dedups_same_workspace() {
         handle.info.cwd = repo_path.to_string_lossy().to_string();
         agent.sessions.borrow_mut().insert(sid.clone(), handle);
         agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
-        let first = tokio::time::timeout(std::time::Duration::from_secs(2), gw_rx.recv()).await;
-        assert!(
-            matches!(first, Ok(Some(xai_acp_lib::AcpClientMessage::ExtMethod(_)))),
-            "first prompt for an untrusted workspace must emit a request"
-        );
+        drop(recv_folder_trust_request(&mut gw_rx).await);
         agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), gw_rx.recv())
-                .await
-                .is_err(),
-            "a workspace already prompted this process must not be re-prompted"
-        );
+        assert_no_folder_trust_request(
+            &mut gw_rx,
+            300,
+            "a workspace already prompted this process must not be re-prompted",
+        )
+        .await;
     });
 }
 /// Which reload commands a session received after a grant.
@@ -4373,33 +4399,23 @@ fn interactive_trust_prompt_reprompts_after_untrust() {
         handle.info.cwd = repo_path.to_string_lossy().to_string();
         agent.sessions.borrow_mut().insert(sid.clone(), handle);
         agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
-        assert!(
-            matches!(
-                tokio::time::timeout(std::time::Duration::from_secs(2), gw_rx.recv()).await,
-                Ok(Some(xai_acp_lib::AcpClientMessage::ExtMethod(_)))
-            ),
-            "first prompt must emit a request"
-        );
+        // Drop the request (and its response channel) immediately, matching
+        // the pre-helper behavior of not answering the prompt.
+        drop(recv_folder_trust_request(&mut gw_rx).await);
         agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(200), gw_rx.recv())
-                .await
-                .is_err(),
-            "a prompted workspace must be suppressed before untrust"
-        );
+        assert_no_folder_trust_request(
+            &mut gw_rx,
+            200,
+            "a prompted workspace must be suppressed before untrust",
+        )
+        .await;
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             agent.execute_hooks_action(&sid, HooksAction::Untrust),
         )
         .await;
         agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
-        assert!(
-            matches!(
-                tokio::time::timeout(std::time::Duration::from_secs(2), gw_rx.recv()).await,
-                Ok(Some(xai_acp_lib::AcpClientMessage::ExtMethod(_)))
-            ),
-            "after untrust clears the dedup, the workspace must be promptable again"
-        );
+        let _reprompt = recv_folder_trust_request(&mut gw_rx).await;
     });
 }
 fn ann(id: &str) -> xai_grok_announcements::RemoteAnnouncement {

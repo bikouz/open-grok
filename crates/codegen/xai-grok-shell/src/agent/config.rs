@@ -3065,11 +3065,20 @@ pub(crate) fn read_requirements_toml() -> Option<toml::Value> {
 /// `internal_pipeline_consumed_otel_vars` simultaneously blocks the external
 /// stream — exactly the split this design forbids.
 pub(crate) fn external_otel_master_switch_resolved() -> bool {
-    external_otel_master_switch_from(
-        xai_grok_config::load_merged_requirements().as_ref(),
-        env_bool("GROK_EXTERNAL_OTEL"),
-        crate::config::load_effective_config().ok().as_ref(),
-    )
+    // Memoized for the process lifetime, matching the external stream's
+    // startup-time activation this must stay in lockstep with. Per-call
+    // re-resolution ran a full layered config load (disk I/O + TOML parse)
+    // inside every `Config` deserialize via `EndpointsConfig::default()` —
+    // deep under serde visitors during per-turn auth-fact resolution, where
+    // the nested parse overflowed debug-build stacks.
+    static RESOLVED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        external_otel_master_switch_from(
+            xai_grok_config::load_merged_requirements().as_ref(),
+            env_bool("GROK_EXTERNAL_OTEL"),
+            crate::config::load_effective_config().ok().as_ref(),
+        )
+    })
 }
 /// Testable core of [`external_otel_master_switch_resolved`].
 pub(crate) fn external_otel_master_switch_from(
