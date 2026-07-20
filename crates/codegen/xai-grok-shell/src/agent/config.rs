@@ -12668,7 +12668,7 @@ default = "grok-4.5"
     #[test]
     fn embedded_xai_models_do_not_inherit_codex_reasoning_summary_defaults() {
         let defaults = default_model_entries(&EndpointsConfig::default());
-        let xai = defaults.get("grok-build").expect("embedded xAI model");
+        let xai = defaults.get("grok-4.5").expect("embedded xAI model");
 
         assert_eq!(xai.info.provider, ModelProvider::Xai);
         assert!(!xai.info.supports_reasoning_summary_parameter);
@@ -12754,7 +12754,7 @@ default = "grok-4.5"
         );
 
         let resolved = resolve_model_list_with_codex(&cfg, None, Some(codex), false);
-        assert!(resolved.contains_key("grok-build"));
+        assert!(resolved.contains_key("grok-4.5"));
         assert!(resolved.contains_key("gpt-5.6-sol"));
         assert!(resolved.contains_key("gpt-next"));
     }
