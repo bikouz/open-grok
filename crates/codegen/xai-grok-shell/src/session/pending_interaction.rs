@@ -60,6 +60,17 @@ pub(crate) fn has_parked_plan_approval(pending: &PendingInteractions) -> bool {
         .any(|k| *k == PendingKind::PlanApproval)
 }
 
+/// Whether ANY blocking reverse-request (permission prompt, ask-user question,
+/// or plan approval) is currently parked for this session.
+///
+/// Code Mode consults this before handing a yielded `exec` cell back to the
+/// model: returning "Script running" while the user is still deciding would
+/// give the model turns to burn polling `wait` mid-approval. Poisoned lock →
+/// recover the map (module idiom) and read it.
+pub(crate) fn has_pending_interaction(pending: &PendingInteractions) -> bool {
+    !pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
 /// Fire-and-forget broadcast of a session notification carrying a `sessionId`
 /// (so the routing layer fans it out to every subscriber). Never persisted.
 fn broadcast(gateway: &GatewaySender, session_id: &acp::SessionId, update: XaiSessionUpdate) {

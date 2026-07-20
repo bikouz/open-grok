@@ -56,11 +56,19 @@ pub(crate) fn is_code_mode_transport_meta(meta: Option<&acp::Meta>) -> bool {
 /// JavaScript callback cannot safely own an ACP question whose answer pauses
 /// the model turn. Collaboration lifecycle tools also stay direct, matching
 /// GPT-5.6 Sol's Codex multi-agent-v2 `DirectModelOnly` exposure.
+///
+/// The plan-mode lifecycle tools are on the list for the same reason as
+/// `ask_user_question`: `exit_plan_mode` parks the turn on the user's plan
+/// approval. Nested inside an `exec` cell, that park cannot hold the turn —
+/// the cell's yield timer would hand control back to the model while the
+/// approval prompt is still open, letting it burn turns polling `wait`.
 pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
     matches!(
         name,
         "ask_user_question"
             | "request_user_input"
+            | "enter_plan_mode"
+            | "exit_plan_mode"
             | "task"
             | "spawn_subagent"
             | "get_task_output"
@@ -156,6 +164,12 @@ pub(crate) struct CodeModeRuntime {
     dispatch_rx: Mutex<Option<mpsc::UnboundedReceiver<DispatchMessage>>>,
     dispatch_task: Mutex<Option<tokio::task::AbortHandle>>,
     shutting_down: AtomicBool,
+    /// The owning session's parked-interaction registry, captured at
+    /// [`Self::start_dispatch_loop`]. Only the `Send + Sync` map handle is
+    /// stored — never the `LocalSet`-bound actor itself. `None` until the
+    /// runtime is bound (unit tests, pre-actor construction): then yields are
+    /// returned to the model unconditionally, matching pre-hold behavior.
+    pending_interactions: Mutex<Option<crate::session::pending_interaction::PendingInteractions>>,
 }
 
 /// The V8 session must not strongly retain its owner: `CodeModeRuntime` owns
@@ -175,6 +189,7 @@ impl CodeModeRuntime {
             dispatch_rx: Mutex::new(Some(dispatch_rx)),
             dispatch_task: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
+            pending_interactions: Mutex::new(None),
         })
     }
 
@@ -187,6 +202,14 @@ impl CodeModeRuntime {
         session_actor: Weak<SessionActor>,
         generation: RuntimeGeneration,
     ) -> Result<(), String> {
+        // Capture the session's parked-interaction registry so yielded cells
+        // can hold instead of handing the model a turn mid-approval. Only the
+        // `Send + Sync` Arc map is retained; the actor stays behind the Weak.
+        if let Some(actor) = session_actor.upgrade() {
+            self.pending_interactions
+                .lock()
+                .replace(actor.pending_interactions.clone());
+        }
         let mut receiver = self
             .dispatch_rx
             .lock()
@@ -243,6 +266,7 @@ impl CodeModeRuntime {
                 return Err(error);
             }
         };
+        let response = self.hold_yield_while_interaction_pending(response).await?;
         if is_terminal_runtime_response(&response) {
             self.known_cells.lock().remove(&cell_id);
         }
@@ -269,16 +293,19 @@ impl CodeModeRuntime {
         let started_at = Instant::now();
         let session = self.session().await?;
         let response: RuntimeResponse = if arguments.terminate {
-            session.terminate(cell_id.clone()).await?
+            session.terminate(cell_id.clone()).await?.into()
         } else {
-            session
+            let response = session
                 .wait(WaitRequest {
                     cell_id: cell_id.clone(),
                     yield_time_ms: arguments.yield_time_ms,
                 })
                 .await?
-        }
-        .into();
+                .into();
+            // A terminate request is exempt from the interaction hold: the
+            // model is killing the cell, not asking for more output.
+            self.hold_yield_while_interaction_pending(response).await?
+        };
         if is_terminal_runtime_response(&response) {
             self.known_cells.lock().remove(&cell_id);
         }
@@ -310,6 +337,48 @@ impl CodeModeRuntime {
             task.abort();
         }
         result
+    }
+
+    /// True while a blocking reverse-request (permission prompt, ask-user
+    /// question, or plan approval) raised by this session is unanswered.
+    /// An unbound runtime (no registry captured yet) reports `false`.
+    fn blocking_interaction_pending(&self) -> bool {
+        self.pending_interactions
+            .lock()
+            .as_ref()
+            .is_some_and(crate::session::pending_interaction::has_pending_interaction)
+    }
+
+    /// Keep a yielded cell parked while a blocking user interaction is
+    /// unanswered, instead of returning "Script running" to the model.
+    ///
+    /// A nested tool call inside the cell can park the session on a user
+    /// decision (a permission prompt, or `exit_plan_mode`'s plan approval).
+    /// The cell's yield timer knows nothing about that park: without this
+    /// hold, `exec`/`wait` would hand the turn back to the model, which then
+    /// burns sampler turns polling `wait` while the user is still deciding.
+    /// Holding the yield keeps the turn inside the control call until the
+    /// decision lands; the approval UI is driven by the client and resolves
+    /// independently of this await.
+    async fn hold_yield_while_interaction_pending(
+        self: &Arc<Self>,
+        response: RuntimeResponse,
+    ) -> Result<RuntimeResponse, String> {
+        if !matches!(response, RuntimeResponse::Yielded { .. })
+            || !self.blocking_interaction_pending()
+        {
+            return Ok(response);
+        }
+        let session = self.session().await?;
+        hold_yield_for_pending_interaction(
+            response,
+            || self.blocking_interaction_pending(),
+            |request| {
+                let session = Arc::clone(&session);
+                async move { session.wait(request).await.map(RuntimeResponse::from) }
+            },
+        )
+        .await
     }
 
     async fn session(self: &Arc<Self>) -> Result<Arc<dyn CodeModeSession>, String> {
@@ -913,6 +982,54 @@ fn default_wait_yield_time_ms() -> u64 {
 fn parse_wait_arguments(arguments: &str) -> Result<WaitArguments, String> {
     serde_json::from_str(arguments)
         .map_err(|error| format!("failed to parse function arguments: {error}"))
+}
+
+/// Cadence of the silent re-waits issued while a blocking interaction holds a
+/// yielded cell. Short enough that the model resumes promptly once the user
+/// answers; long enough not to busy-poll the cell actor. Each re-wait returns
+/// early if the cell completes, so this only bounds the post-answer latency.
+const INTERACTION_HOLD_YIELD_TIME_MS: u64 = 500;
+
+/// Drives the interaction hold: while `interaction_pending()` reports a parked
+/// user decision, a `Yielded` response is swallowed and the cell is re-waited
+/// via `wait_again` instead of being returned to the model. Content from every
+/// swallowed yield is retained and prepended to the returned response, so the
+/// model still sees all output in order once the hold releases (on resolution
+/// of the interaction, or on the cell reaching a terminal state).
+async fn hold_yield_for_pending_interaction<W, F>(
+    mut response: RuntimeResponse,
+    interaction_pending: impl Fn() -> bool,
+    mut wait_again: W,
+) -> Result<RuntimeResponse, String>
+where
+    W: FnMut(WaitRequest) -> F,
+    F: std::future::Future<Output = Result<RuntimeResponse, String>>,
+{
+    let mut held_items: Vec<FunctionCallOutputContentItem> = Vec::new();
+    let mut final_response = loop {
+        match response {
+            RuntimeResponse::Yielded {
+                cell_id,
+                content_items,
+            } if interaction_pending() => {
+                held_items.extend(content_items);
+                response = wait_again(WaitRequest {
+                    cell_id,
+                    yield_time_ms: INTERACTION_HOLD_YIELD_TIME_MS,
+                })
+                .await?;
+            }
+            other => break other,
+        }
+    };
+    if !held_items.is_empty() {
+        let (RuntimeResponse::Yielded { content_items, .. }
+        | RuntimeResponse::Terminated { content_items, .. }
+        | RuntimeResponse::Result { content_items, .. }) = &mut final_response;
+        held_items.append(content_items);
+        *content_items = held_items;
+    }
+    Ok(final_response)
 }
 
 fn format_runtime_response(
@@ -1658,5 +1775,174 @@ mod tests {
         let unicode = truncate_middle_with_token_budget("日本語日本", 1);
         assert!(unicode.contains("tokens truncated"));
         assert!(std::str::from_utf8(unicode.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn plan_lifecycle_tools_are_direct_only() {
+        // `exit_plan_mode` parks the turn on the user's plan approval. Nested
+        // inside an exec cell that park cannot hold the turn — the yield timer
+        // would hand control back to the model mid-approval — so both plan
+        // lifecycle tools must stay direct, like `ask_user_question`.
+        assert!(is_code_mode_direct_only_tool("enter_plan_mode"));
+        assert!(is_code_mode_direct_only_tool("exit_plan_mode"));
+        assert!(is_code_mode_direct_only_tool("ask_user_question"));
+        assert!(!is_code_mode_direct_only_tool("bash"));
+    }
+
+    fn text_items(texts: &[&str]) -> Vec<FunctionCallOutputContentItem> {
+        texts
+            .iter()
+            .map(|text| FunctionCallOutputContentItem::InputText {
+                text: (*text).to_string(),
+            })
+            .collect()
+    }
+
+    fn item_texts(items: &[FunctionCallOutputContentItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => text.clone(),
+                FunctionCallOutputContentItem::InputImage { .. } => "<image>".to_string(),
+            })
+            .collect()
+    }
+
+    fn yielded_response(cell: &str, texts: &[&str]) -> RuntimeResponse {
+        RuntimeResponse::Yielded {
+            cell_id: CellId::new(cell.to_string()),
+            content_items: text_items(texts),
+        }
+    }
+
+    fn completed_response(cell: &str, texts: &[&str]) -> RuntimeResponse {
+        RuntimeResponse::Result {
+            cell_id: CellId::new(cell.to_string()),
+            content_items: text_items(texts),
+            error_text: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_passes_yield_through_when_no_interaction_pending() {
+        let response = hold_yield_for_pending_interaction(
+            yielded_response("cell-1", &["chunk 1"]),
+            || false,
+            |_request| async { Err("wait_again must not be called".to_string()) },
+        )
+        .await
+        .expect("passthrough must succeed");
+
+        assert_eq!(response, yielded_response("cell-1", &["chunk 1"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_passes_terminal_response_through_even_with_interaction_pending() {
+        let response = hold_yield_for_pending_interaction(
+            completed_response("cell-1", &["done"]),
+            || true,
+            |_request| async { Err("wait_again must not be called".to_string()) },
+        )
+        .await
+        .expect("terminal passthrough must succeed");
+
+        assert_eq!(response, completed_response("cell-1", &["done"]));
+    }
+
+    /// The incident shape: `exit_plan_mode` parks inside the cell, the cell
+    /// yields, and the model must NOT get the yield back. The hold re-waits
+    /// until the cell finishes (approval resolved → script completed) and the
+    /// model sees every swallowed chunk in order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_swallows_yields_until_cell_completes_and_merges_output() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+
+        let scripted = RefCell::new(VecDeque::from([
+            yielded_response("cell-1", &["chunk 2"]),
+            completed_response("cell-1", &["chunk 3"]),
+        ]));
+        let waits = Cell::new(0usize);
+
+        let response = hold_yield_for_pending_interaction(
+            yielded_response("cell-1", &["chunk 1"]),
+            || true,
+            |request| {
+                waits.set(waits.get() + 1);
+                assert_eq!(request.cell_id.as_str(), "cell-1");
+                assert_eq!(request.yield_time_ms, INTERACTION_HOLD_YIELD_TIME_MS);
+                let next = scripted.borrow_mut().pop_front().expect("scripted wait");
+                async move { Ok(next) }
+            },
+        )
+        .await
+        .expect("held wait must succeed");
+
+        assert_eq!(waits.get(), 2);
+        let RuntimeResponse::Result {
+            cell_id,
+            content_items,
+            error_text: None,
+        } = response
+        else {
+            panic!("expected merged terminal result, got {response:?}");
+        };
+        assert_eq!(cell_id.as_str(), "cell-1");
+        assert_eq!(
+            item_texts(&content_items),
+            ["chunk 1", "chunk 2", "chunk 3"]
+        );
+    }
+
+    /// When the user answers while the cell is still running, the next yield
+    /// is returned to the model (with all held output) instead of re-waiting.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_releases_yield_once_interaction_resolves() {
+        use std::cell::Cell;
+
+        let waits = Cell::new(0usize);
+        let response = hold_yield_for_pending_interaction(
+            yielded_response("cell-1", &["chunk 1"]),
+            // Pending for the initial probe only; resolved by the next one.
+            || waits.get() == 0,
+            |_request| {
+                waits.set(waits.get() + 1);
+                async { Ok(yielded_response("cell-1", &["chunk 2"])) }
+            },
+        )
+        .await
+        .expect("released yield must succeed");
+
+        assert_eq!(waits.get(), 1);
+        let RuntimeResponse::Yielded {
+            cell_id,
+            content_items,
+        } = response
+        else {
+            panic!("expected released yield, got {response:?}");
+        };
+        assert_eq!(cell_id.as_str(), "cell-1");
+        assert_eq!(item_texts(&content_items), ["chunk 1", "chunk 2"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hold_propagates_wait_errors() {
+        let error = hold_yield_for_pending_interaction(
+            yielded_response("cell-1", &["chunk 1"]),
+            || true,
+            |_request| async { Err("session went away".to_string()) },
+        )
+        .await
+        .expect_err("wait errors must propagate");
+
+        assert_eq!(error, "session went away");
+    }
+
+    /// An unbound runtime (no session actor captured) must never hold: the
+    /// probe reports no pending interaction, preserving pre-hold behavior.
+    #[test]
+    fn unbound_runtime_reports_no_blocking_interaction() {
+        let runtime = CodeModeRuntime::new();
+        assert!(!runtime.blocking_interaction_pending());
     }
 }

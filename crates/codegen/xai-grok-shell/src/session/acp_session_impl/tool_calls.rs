@@ -870,6 +870,12 @@ impl SessionActor {
         if matches!(tool_name.as_str(), PUBLIC_TOOL_NAME | WAIT_TOOL_NAME) {
             return Err(format!("`{tool_name}` cannot invoke itself from Code Mode"));
         }
+        if crate::session::code_mode::is_code_mode_direct_only_tool(&tool_name) {
+            return Err(format!(
+                "`{tool_name}` pauses the turn for user interaction and cannot run inside a \
+                 Code Mode cell; call the `{tool_name}` function tool directly instead"
+            ));
+        }
         let arguments = match (invocation.tool_kind, invocation.input) {
             (CodeModeToolKind::Function, None) => "{}".to_string(),
             (CodeModeToolKind::Function, Some(serde_json::Value::Object(map))) => {
