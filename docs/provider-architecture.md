@@ -28,6 +28,7 @@ Codex provider does not override an explicit model API key.
 | xAI | Chat, Responses, Messages | xAI | xAI | yes | `x-grok-*` | xAI session | allowed |
 | OpenAI Codex | Responses | Codex | OpenAI | yes | standard only | Codex OAuth | denied |
 | Kimi | Chat | none | client function tools | no | standard only | provider API key | denied |
+| Fireworks AI | Chat | none | client function tools | no | standard only | provider API key | denied |
 
 The sampler's built-in `ProviderAdapter` registry applies the transport policy
 for each profile. The xAI adapter owns xAI request metadata and doom-loop
@@ -36,7 +37,11 @@ Max/Ultra request mapping, prompt-cache affinity, sticky turn state, and
 forward-compatible Responses event handling. Neither adapter resolves or
 refreshes credentials. The Kimi adapter uses ordinary Chat Completions and
 removes sampling fields owned by Kimi coding models; it does not advertise a
-hosted-tool dialect.
+hosted-tool dialect. The Fireworks AI adapter is a plain Chat Completions
+transport: standard sampling fields pass through unchanged and no hosted-tool
+dialect is advertised. Fireworks exposes a curated model list; its `/models`
+endpoint may enrich curated entries (context window) but can neither add nor
+remove models.
 
 `ConversationRequest` and `ConversationResponse` remain provider neutral.
 Provider-native opaque history is retained with a typed backend item and is

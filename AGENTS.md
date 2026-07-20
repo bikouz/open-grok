@@ -61,7 +61,7 @@ Full crate map: [`docs/agents/architecture.md`](docs/agents/architecture.md).
 
 1. **Do not fall back to `~/.grok`.** Open Grok state is `$OPENGROK_HOME` / `~/.opengrok` / project `.opengrok/`.
 2. **Do not edit root `Cargo.toml`.** Change the relevant crate manifest.
-3. **Keep providers isolated.** xAI, Codex, Kimi Platform, and Kimi Code credentials, catalogs, caches, hosted tools, and opaque history must not cross. See [`docs/provider-architecture.md`](docs/provider-architecture.md).
+3. **Keep providers isolated.** xAI, Codex, Kimi Platform, Kimi Code, and Fireworks AI credentials, catalogs, caches, hosted tools, and opaque history must not cross. See [`docs/provider-architecture.md`](docs/provider-architecture.md).
 4. **Provider identity comes from model metadata**, never from a model slug or URL alone.
 5. **API backend ≠ credentials.** Selecting Responses does not select Codex OAuth; an explicit model API key wins over OAuth.
 6. **Plan mode is not permission YOLO.** Edit gating for plan mode runs in the shell tool path (`plan_mode_edit_gate`), before hooks/permissions. Do not “fix” plan mode only inside the permission manager.
@@ -138,6 +138,7 @@ Three independent axes: **`ApiBackend`** × **`ProviderProfile`** × **`AuthSche
 | Codex | `$OPENGROK_HOME/codex-auth.json` | `login --codex`; separate model cache |
 | Kimi Platform | `auth.json` scope `kimi::api_key` | Isolated from Kimi Code |
 | Kimi Code | `auth.json` scope `kimi_code::api_key` | Isolated from Platform |
+| Fireworks AI | `auth.json` scope `fireworks::api_key` | Curated model list; `/login fireworks` |
 
 After any non-xAI profile that denies xAI services, the session export boundary closes monotonically (compatibility field still named `ever_used_codex`).
 

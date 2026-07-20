@@ -1,6 +1,6 @@
 # Multi-provider architecture
 
-How Open Grok treats **xAI**, **OpenAI Codex**, and **Kimi** (Platform vs Code) without leaking credentials, tools, or opaque history.
+How Open Grok treats **xAI**, **OpenAI Codex**, **Kimi** (Platform vs Code), and **Fireworks AI** without leaking credentials, tools, or opaque history.
 
 **Canonical contracts:**
 
@@ -34,6 +34,7 @@ Adapters (credential-free): `xai-grok-sampler/src/provider.rs`.
 | xAI | Chat, Responses, Messages | xAI | xAI | xAI session | allowed |
 | OpenAI Codex | Responses | Codex | OpenAI | Codex OAuth | **denied** |
 | Kimi | Chat | none | client function tools | API key only | **denied** |
+| Fireworks AI | Chat | none | client function tools | API key only | **denied** |
 
 ## Layer map (paths)
 
@@ -59,6 +60,10 @@ Kimi
   xai-grok-shell/src/kimi_models.rs             # endpoints, discovery, trusted hosts
   auth/storage.rs                               # kimi::api_key vs kimi_code::api_key
 
+Fireworks AI
+  xai-grok-shell/src/fireworks_models.rs        # curated catalog, enrichment query, trusted host
+  auth/storage.rs                               # fireworks::api_key (generic provider scope)
+
 Session routing / tools / compaction
   xai-grok-shell/src/session/
   xai-grok-shell/src/session/compaction.rs
@@ -81,6 +86,7 @@ Home root: `$OPENGROK_HOME` or `~/.opengrok` via `xai_grok_config::grok_home()`.
 | Codex OAuth | `$OPENGROK_HOME/codex-auth.json` | `login --codex` / `logout --codex` |
 | Kimi Platform | `auth.json` scope `kimi::api_key` | Settings / `/login kimi` |
 | Kimi Code | `auth.json` scope `kimi_code::api_key` | Settings / `/login kimi` |
+| Fireworks AI | `auth.json` scope `fireworks::api_key` | Settings / `/login fireworks` |
 | Perplexity Search fallback | `auth.json` scope `perplexity::api_key` | Settings |
 | Both providers | — | `logout --all` |
 
@@ -111,15 +117,15 @@ Also isolated:
 
 ### Adapter differences (summary)
 
-| Behavior | xAI | Codex | Kimi |
-| --- | --- | --- | --- |
-| Private headers | `x-grok-*` | stripped | stripped |
-| Doom-loop opt-in | yes | no | no |
-| Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A |
-| Prompt cache key | no | session id | no |
-| Sticky turn state | no | `x-codex-turn-state` | no |
-| Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A |
-| Chat sanitization | — | — | clears temp/top_p/penalties |
+| Behavior | xAI | Codex | Kimi | Fireworks |
+| --- | --- | --- | --- | --- |
+| Private headers | `x-grok-*` | stripped | stripped | stripped |
+| Doom-loop opt-in | yes | no | no | no |
+| Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A |
+| Prompt cache key | no | session id | no | no |
+| Sticky turn state | no | `x-codex-turn-state` | no | no |
+| Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A | N/A |
+| Chat sanitization | — | — | clears temp/top_p/penalties | — |
 
 ### Compaction
 

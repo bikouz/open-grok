@@ -1,6 +1,6 @@
 ---
 name: change-open-grok-provider
-description: Implement or review Open Grok provider, model, API backend, authentication, auxiliary-model, or live-switch behavior. Use for xAI, Codex, Kimi Platform, Kimi Code, Responses, Chat Completions, Messages, OAuth, API-key, catalog, hosted-tool, compaction, or provider-isolation changes.
+description: Implement or review Open Grok provider, model, API backend, authentication, auxiliary-model, or live-switch behavior. Use for xAI, Codex, Kimi Platform, Kimi Code, Fireworks AI, Responses, Chat Completions, Messages, OAuth, API-key, catalog, hosted-tool, compaction, or provider-isolation changes.
 ---
 
 # Change an Open Grok Provider
@@ -18,7 +18,7 @@ Provider identity must come from model metadata. An endpoint, model slug, or Res
 ## Preserve isolation
 
 - Keep adapters in `xai-grok-sampler` credential-free.
-- Keep xAI, Codex, Kimi Platform, and Kimi Code keys, OAuth refresh, logout, caches, catalogs, trusted hosts, headers, and 401 retries separate.
+- Keep xAI, Codex, Kimi Platform, Kimi Code, and Fireworks AI keys, OAuth refresh, logout, caches, catalogs, trusted hosts, headers, and 401 retries separate.
 - Let an explicit model API key win over built-in OAuth.
 - Scope hosted tools and opaque response history to the declared dialect.
 - Close the monotonic xAI export boundary for every denying profile, including subagent trees.
