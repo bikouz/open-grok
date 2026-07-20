@@ -57,6 +57,8 @@ pub async fn save_config(config: &Config) -> Result<()> {
     merge_section(table, "session", &config.session);
     merge_ask_user_question_section(table, &config.ask_user_question);
     merge_perplexity_web_search_section(table, &config.perplexity_web_search);
+    merge_toolset_subsection(table, "web_search_source", &config.web_search_source);
+    merge_toolset_subsection(table, "x_search", &config.x_search);
 
     if config.skills == SkillsConfig::default() {
         table.remove("skills");
@@ -195,6 +197,16 @@ fn merge_perplexity_web_search_section(
     table: &mut TomlMap<String, TomlValue>,
     perplexity: &crate::tools::config::PerplexityWebSearchToolConfig,
 ) {
+    merge_toolset_subsection(table, "perplexity_web_search", perplexity);
+}
+
+/// Merge a serializable value into `[toolset.<key>]`, recovering from a
+/// non-table `toolset` scalar the same way `merge_section` does.
+fn merge_toolset_subsection<T: serde::Serialize>(
+    table: &mut TomlMap<String, TomlValue>,
+    key: &str,
+    value: &T,
+) {
     let toolset = table
         .entry("toolset".to_string())
         .or_insert_with(|| TomlValue::Table(TomlMap::new()));
@@ -202,7 +214,7 @@ fn merge_perplexity_web_search_section(
         *toolset = TomlValue::Table(TomlMap::new());
     }
     if let TomlValue::Table(toolset_table) = toolset {
-        merge_section(toolset_table, "perplexity_web_search", perplexity);
+        merge_section(toolset_table, key, value);
     }
 }
 
@@ -331,6 +343,46 @@ mod tests {
             Some(false),
             "scalar [toolset] must be replaced so the write lands"
         );
+    }
+
+    #[test]
+    fn web_search_source_and_x_search_round_trip() {
+        let root_val: TomlValue = toml::from_str(
+            "[toolset.web_search_source]\ncodex = \"xai\"\nkimi_code = \"perplexity\"\n",
+        )
+        .unwrap();
+        let config = crate::util::config::load_config_from_toml(&root_val);
+        assert_eq!(
+            config.web_search_source.codex,
+            Some(crate::tools::config::WebSearchSource::Xai)
+        );
+        assert_eq!(
+            config.web_search_source.kimi_code,
+            Some(crate::tools::config::WebSearchSource::Perplexity)
+        );
+        assert_eq!(config.web_search_source.xai, None);
+        assert!(config.x_search.enabled, "x_search defaults on");
+
+        let mut root = root_val.as_table().unwrap().clone();
+        let mut updated = config;
+        updated.web_search_source.set_for(
+            crate::tools::config::WebSearchSourceTarget::Xai,
+            Some(crate::tools::config::WebSearchSource::Perplexity),
+        );
+        updated.x_search.enabled = false;
+        merge_toolset_subsection(&mut root, "web_search_source", &updated.web_search_source);
+        merge_toolset_subsection(&mut root, "x_search", &updated.x_search);
+        let reparsed = crate::util::config::load_config_from_toml(&TomlValue::Table(root));
+        assert_eq!(
+            reparsed.web_search_source.xai,
+            Some(crate::tools::config::WebSearchSource::Perplexity)
+        );
+        assert_eq!(
+            reparsed.web_search_source.codex,
+            Some(crate::tools::config::WebSearchSource::Xai),
+            "existing selections survive a settings write"
+        );
+        assert!(!reparsed.x_search.enabled);
     }
 
     #[test]

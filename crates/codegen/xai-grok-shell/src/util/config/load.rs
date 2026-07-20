@@ -58,6 +58,30 @@ pub async fn load_config() -> Config {
     };
     load_config_from_toml(&root)
 }
+
+/// Synchronously load `[toolset.web_search_source]` from the effective
+/// config. Read fresh at session spawn so Settings changes apply to new
+/// sessions without a process restart.
+pub fn load_web_search_source_sync() -> crate::tools::config::WebSearchSourceConfig {
+    load_toolset_subsection_sync("web_search_source")
+}
+
+/// Synchronously load `[toolset.x_search]` from the effective config.
+pub fn load_x_search_config_sync() -> crate::tools::config::XSearchToolConfig {
+    load_toolset_subsection_sync("x_search")
+}
+
+fn load_toolset_subsection_sync<T: serde::de::DeserializeOwned + Default>(key: &str) -> T {
+    let root: TomlValue = match crate::config::load_effective_config() {
+        Ok(r) => r,
+        Err(_) => return T::default(),
+    };
+    root.as_table()
+        .and_then(|table| table.get("toolset"))
+        .and_then(|toolset| toolset.get(key))
+        .and_then(|value| value.clone().try_into().ok())
+        .unwrap_or_default()
+}
 /// Parse `Config` from a pre-loaded TOML value. Used by both async and sync paths.
 pub fn load_config_from_toml(root: &TomlValue) -> Config {
     let table = match root.as_table() {
@@ -108,6 +132,16 @@ pub fn load_config_from_toml(root: &TomlValue) -> Config {
         perplexity_web_search: table
             .get("toolset")
             .and_then(|t| t.get("perplexity_web_search"))
+            .and_then(|v| v.clone().try_into().ok())
+            .unwrap_or_default(),
+        web_search_source: table
+            .get("toolset")
+            .and_then(|t| t.get("web_search_source"))
+            .and_then(|v| v.clone().try_into().ok())
+            .unwrap_or_default(),
+        x_search: table
+            .get("toolset")
+            .and_then(|t| t.get("x_search"))
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default(),
     }

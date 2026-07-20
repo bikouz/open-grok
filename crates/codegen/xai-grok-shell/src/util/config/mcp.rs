@@ -50,6 +50,11 @@ pub struct Config {
     /// `[toolset.perplexity_web_search]` sub-table. Contains only the opt-in
     /// boolean; the API key remains isolated in auth.json.
     pub perplexity_web_search: crate::tools::config::PerplexityWebSearchToolConfig,
+    /// `[toolset.web_search_source]` sub-table — per-provider web search
+    /// source selection (native / xai / perplexity).
+    pub web_search_source: crate::tools::config::WebSearchSourceConfig,
+    /// `[toolset.x_search]` sub-table — client-executed X search toggle.
+    pub x_search: crate::tools::config::XSearchToolConfig,
 }
 
 pub fn get_mcp_server_config(name: &str) -> Option<McpServerConfig> {

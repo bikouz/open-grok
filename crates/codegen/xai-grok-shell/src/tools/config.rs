@@ -175,6 +175,12 @@ pub struct ShellToolsetConfig {
     /// Opt-in Perplexity fallback for providers without native web search.
     #[serde(default)]
     pub perplexity_web_search: PerplexityWebSearchToolConfig,
+    /// Per-provider web search source selection (`[toolset.web_search_source]`).
+    #[serde(default)]
+    pub web_search_source: WebSearchSourceConfig,
+    /// Client-executed X search toggle (`[toolset.x_search]`).
+    #[serde(default)]
+    pub x_search: XSearchToolConfig,
     /// Web fetch tool parameters (`[toolset.web_fetch]`).
     #[serde(default)]
     pub web_fetch: WebFetchToolConfig,
@@ -260,6 +266,8 @@ impl ShellToolsetConfig {
             bash: BashToolConfig::default(),
             web_search: web_search_sampling_config(default_base),
             perplexity_web_search: PerplexityWebSearchToolConfig::default(),
+            web_search_source: WebSearchSourceConfig::default(),
+            x_search: XSearchToolConfig::default(),
             web_fetch: WebFetchToolConfig::default(),
             ask_user_question: AskUserQuestionToolConfig::default(),
             file_toolset: FileToolset::default(),
@@ -299,6 +307,274 @@ impl ShellToolsetConfig {
 #[serde(default)]
 pub struct PerplexityWebSearchToolConfig {
     pub enabled: bool,
+}
+
+/// Which backend powers the model-visible web search for one provider target.
+///
+/// `Native` means the provider's own server-side search declaration (OpenAI
+/// native web search for Codex; for xAI, "native" and `Xai` are the same
+/// thing). `Xai` is the client-executed `web_search` tool backed by the xAI
+/// Responses API — it is NOT a provider-server tool, so it can be handed to
+/// any model. `Perplexity` is the client tool backed by the Perplexity
+/// Search API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchSource {
+    Native,
+    Xai,
+    Perplexity,
+}
+
+impl WebSearchSource {
+    /// Canonical config string (`native` / `xai` / `perplexity`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Xai => "xai",
+            Self::Perplexity => "perplexity",
+        }
+    }
+
+    /// Parse the canonical config string; `None` for unknown values.
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        match value {
+            "native" => Some(Self::Native),
+            "xai" => Some(Self::Xai),
+            "perplexity" => Some(Self::Perplexity),
+            _ => None,
+        }
+    }
+}
+
+/// A provider, split by Kimi service, as a web-search-source target.
+///
+/// Kimi Platform and Kimi Code are one `ModelProvider` but distinct services
+/// with separate credentials, so they get independent source selections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSearchSourceTarget {
+    Xai,
+    Codex,
+    KimiPlatform,
+    KimiCode,
+}
+
+impl WebSearchSourceTarget {
+    /// Resolve the target for an active provider + Kimi endpoint.
+    pub fn for_provider(
+        provider: xai_grok_sampling_types::ModelProvider,
+        kimi_endpoint: crate::kimi_models::KimiApiEndpoint,
+    ) -> Self {
+        use xai_grok_sampling_types::ModelProvider;
+        match provider {
+            ModelProvider::Xai => Self::Xai,
+            ModelProvider::Codex => Self::Codex,
+            ModelProvider::Kimi => match kimi_endpoint {
+                crate::kimi_models::KimiApiEndpoint::Platform => Self::KimiPlatform,
+                crate::kimi_models::KimiApiEndpoint::Code => Self::KimiCode,
+            },
+        }
+    }
+}
+
+/// Persisted per-provider web search source selection
+/// (`[toolset.web_search_source]`). `None` fields use the per-target
+/// default from [`WebSearchSourceConfig::default_for`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSearchSourceConfig {
+    pub xai: Option<WebSearchSource>,
+    pub codex: Option<WebSearchSource>,
+    pub kimi_platform: Option<WebSearchSource>,
+    pub kimi_code: Option<WebSearchSource>,
+}
+
+impl WebSearchSourceConfig {
+    /// The explicit selection for `target`, if the user has set one.
+    pub fn explicit_for(&self, target: WebSearchSourceTarget) -> Option<WebSearchSource> {
+        match target {
+            WebSearchSourceTarget::Xai => self.xai,
+            WebSearchSourceTarget::Codex => self.codex,
+            WebSearchSourceTarget::KimiPlatform => self.kimi_platform,
+            WebSearchSourceTarget::KimiCode => self.kimi_code,
+        }
+    }
+
+    /// The default source for `target` when nothing is selected: Codex keeps
+    /// its native search, everything else uses xAI web search.
+    pub fn default_for(target: WebSearchSourceTarget) -> WebSearchSource {
+        match target {
+            WebSearchSourceTarget::Codex => WebSearchSource::Native,
+            WebSearchSourceTarget::Xai
+            | WebSearchSourceTarget::KimiPlatform
+            | WebSearchSourceTarget::KimiCode => WebSearchSource::Xai,
+        }
+    }
+
+    /// Effective source for `target` (explicit selection or default).
+    pub fn source_for(&self, target: WebSearchSourceTarget) -> WebSearchSource {
+        self.explicit_for(target)
+            .unwrap_or_else(|| Self::default_for(target))
+    }
+
+    /// Set the selection for `target` (used by the settings writers).
+    pub fn set_for(&mut self, target: WebSearchSourceTarget, source: Option<WebSearchSource>) {
+        match target {
+            WebSearchSourceTarget::Xai => self.xai = source,
+            WebSearchSourceTarget::Codex => self.codex = source,
+            WebSearchSourceTarget::KimiPlatform => self.kimi_platform = source,
+            WebSearchSourceTarget::KimiCode => self.kimi_code = source,
+        }
+    }
+}
+
+/// Persisted configuration for the client-executed X search tool
+/// (`[toolset.x_search]`). Enabled by default; the tool is only registered
+/// when xAI credentials resolve, since it is backed by the xAI API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct XSearchToolConfig {
+    pub enabled: bool,
+}
+
+impl Default for XSearchToolConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Candidate web-search backends plus the selection inputs needed to resolve
+/// the effective backend for any provider.
+///
+/// The xAI-backed client `web_search` tool is not a provider-server tool, so
+/// it can serve any model; which backend a session actually gets is decided
+/// per provider by [`Self::resolved_config_for`] using the persisted
+/// `[toolset.web_search_source]` selection.
+#[derive(Clone)]
+pub struct WebSearchCandidates {
+    /// xAI Responses-backed client config (`Disabled` when no xAI
+    /// credentials resolve).
+    pub xai: xai_grok_tools::implementations::web_search::WebSearchConfig,
+    /// Perplexity-backed client config (`None` when no API key is stored).
+    pub perplexity: Option<xai_grok_tools::implementations::web_search::WebSearchConfig>,
+    /// Persisted per-provider source selection.
+    pub source: WebSearchSourceConfig,
+    /// Legacy `[toolset.perplexity_web_search].enabled` toggle — kept as a
+    /// Kimi-default alias so existing configs behave unchanged.
+    pub legacy_perplexity_enabled: bool,
+    /// Active Kimi service, for target resolution.
+    pub kimi_endpoint: crate::kimi_models::KimiApiEndpoint,
+    /// The xAI candidate came from the implicit default web-search model
+    /// (nothing user-configured). Preserves the legacy rule that the
+    /// implicit xAI declaration does not ride along to Codex unless the
+    /// user opted in.
+    pub implicit_xai_default: bool,
+}
+
+impl WebSearchCandidates {
+    /// All-disabled candidates (master `disable_web_search`, or tests).
+    pub fn disabled() -> Self {
+        Self {
+            xai: xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled,
+            perplexity: None,
+            source: WebSearchSourceConfig::default(),
+            legacy_perplexity_enabled: false,
+            kimi_endpoint: crate::kimi_models::KimiApiEndpoint::default(),
+            implicit_xai_default: false,
+        }
+    }
+
+    /// The effective source for `target`, folding in the legacy Perplexity
+    /// toggle (Kimi default) and the legacy explicit-web-search-model rule
+    /// (an explicitly configured xAI model used to opt Codex in).
+    pub fn effective_source_for(&self, target: WebSearchSourceTarget) -> WebSearchSource {
+        if let Some(explicit) = self.source.explicit_for(target) {
+            return explicit;
+        }
+        match target {
+            WebSearchSourceTarget::KimiPlatform | WebSearchSourceTarget::KimiCode => {
+                if self.legacy_perplexity_enabled && self.perplexity.is_some() {
+                    WebSearchSource::Perplexity
+                } else {
+                    WebSearchSource::Xai
+                }
+            }
+            WebSearchSourceTarget::Codex => {
+                if !self.implicit_xai_default && self.xai_available() {
+                    WebSearchSource::Xai
+                } else {
+                    WebSearchSource::Native
+                }
+            }
+            WebSearchSourceTarget::Xai => WebSearchSource::Xai,
+        }
+    }
+
+    fn xai_available(&self) -> bool {
+        !matches!(
+            self.xai,
+            xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled
+        )
+    }
+
+    /// Resolve the client `web_search` backend a session on `provider`
+    /// should register. `Disabled` means no client search tool (the
+    /// provider's native declaration, if any, still applies).
+    pub fn resolved_config_for(
+        &self,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> xai_grok_tools::implementations::web_search::WebSearchConfig {
+        use xai_grok_sampling_types::ModelProvider;
+        use xai_grok_tools::implementations::web_search::WebSearchConfig;
+        let target = WebSearchSourceTarget::for_provider(provider, self.kimi_endpoint);
+        match self.effective_source_for(target) {
+            WebSearchSource::Native => match provider {
+                // Codex native search is the hosted server-side declaration;
+                // no client tool. Kimi has no native search.
+                ModelProvider::Codex | ModelProvider::Kimi => WebSearchConfig::Disabled,
+                // For xAI, "native" and the xAI client tool are the same
+                // service — keep the client declaration as today.
+                ModelProvider::Xai => self.xai.clone(),
+            },
+            WebSearchSource::Xai => {
+                if self.xai_available() {
+                    self.xai.clone()
+                } else {
+                    WebSearchConfig::Disabled
+                }
+            }
+            WebSearchSource::Perplexity => {
+                self.perplexity.clone().unwrap_or(WebSearchConfig::Disabled)
+            }
+        }
+    }
+
+    /// Whether Codex's native hosted web-search declaration should be
+    /// suppressed: an alternative source was selected AND actually resolved.
+    /// If the chosen source is unavailable (missing credentials), the native
+    /// declaration stays so the model keeps some search capability.
+    pub fn native_hosted_web_search_suppressed(
+        &self,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> bool {
+        provider == xai_grok_sampling_types::ModelProvider::Codex
+            && !matches!(
+                self.resolved_config_for(provider),
+                xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled
+            )
+    }
+}
+
+impl std::fmt::Debug for WebSearchCandidates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSearchCandidates")
+            .field("xai_available", &self.xai_available())
+            .field("perplexity_available", &self.perplexity.is_some())
+            .field("source", &self.source)
+            .field("legacy_perplexity_enabled", &self.legacy_perplexity_enabled)
+            .field("kimi_endpoint", &self.kimi_endpoint)
+            .field("implicit_xai_default", &self.implicit_xai_default)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,19 @@ pub async fn set_perplexity_web_search_enabled(value: bool) -> Result<()> {
     update_config(|cfg| cfg.perplexity_web_search.enabled = value).await
 }
 
+/// Persist `[toolset.web_search_source].<target>` via `update_config`.
+pub async fn set_web_search_source(
+    target: crate::tools::config::WebSearchSourceTarget,
+    source: crate::tools::config::WebSearchSource,
+) -> Result<()> {
+    update_config(move |cfg| cfg.web_search_source.set_for(target, Some(source))).await
+}
+
+/// Persist `[toolset.x_search].enabled` via `update_config`.
+pub async fn set_x_search_enabled(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.x_search.enabled = value).await
+}
+
 // Settings helpers — typed disk-write wrappers for each setting.
 // All route through `update_config` → `merge_section` → `save_config`.
 // ---------------------------------------------------------------------------
