@@ -498,6 +498,29 @@ async fn journal_replay_skips_unchanged_agents() {
     assert!(second.contains("ECHO:cache me"), "{second}");
     assert!(second.contains("cached"), "{second}");
 
+    // Resume chains: the second run re-journals what it replayed, so a third
+    // run resuming from the SECOND run's id must also serve from journal.
+    let second_run_id = second
+        .split("<run_id>")
+        .nth(1)
+        .and_then(|rest| rest.split("</run_id>").next())
+        .expect("second run id")
+        .to_string();
+    let third_backend = StubBackend::echo();
+    let mut input = script_input(&script);
+    input.resume_from_run_id = Some(second_run_id);
+    let third = TestRun::new(third_backend.clone())
+        .with_session_folder(folder.clone())
+        .run(input)
+        .await
+        .expect("third run");
+    assert_eq!(
+        third_backend.spawn_count(),
+        0,
+        "chained resume must replay from the intermediate run's journal"
+    );
+    assert!(third.contains("ECHO:cache me"), "{third}");
+
     let _ = std::fs::remove_dir_all(&folder);
 }
 

@@ -322,6 +322,20 @@ impl ProviderAdapter for FireworksProvider {
     fn provider(&self) -> ModelProvider {
         ModelProvider::Fireworks
     }
+
+    fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
+        // Fireworks validates the chat schema strictly and rejects the whole
+        // request with 400 "Extra inputs are not permitted" when a replayed
+        // assistant message still carries Open Grok's internal per-message
+        // `model_id` attribution (any multi-request turn hits this: the
+        // second request replays the first assistant message). The request-
+        // level `model` field is the real selector, so drop the bookkeeping
+        // field for this provider. `reasoning_content` is left as-is: it is
+        // part of the GLM/OpenAI-compatible reply contract, not our metadata.
+        for message in &mut request.messages {
+            message.model_id = None;
+        }
+    }
 }
 
 /// One entry in the built-in provider registry.
@@ -650,6 +664,36 @@ mod tests {
         provider_adapter(ModelProvider::Fireworks).sanitize_chat_request(&mut request);
         assert_eq!(request.temperature, Some(0.7));
         assert_eq!(request.top_p, Some(0.95));
+    }
+
+    #[test]
+    fn fireworks_strips_internal_model_id_from_replayed_messages() {
+        use xai_grok_sampling_types::types::ChatRequestMessage;
+
+        let assistant = ChatRequestMessage::assistant(
+            "previous turn",
+            "accounts/fireworks/models/glm-5p2",
+            None,
+        );
+        assert!(assistant.model_id.is_some(), "constructor stamps model_id");
+        let mut request = ChatCompletionRequest::new(
+            "accounts/fireworks/models/glm-5p2",
+            vec![
+                ChatRequestMessage::system("s"),
+                ChatRequestMessage::user("u"),
+                assistant,
+                ChatRequestMessage::user("follow-up"),
+            ],
+        );
+
+        provider_adapter(ModelProvider::Fireworks).sanitize_chat_request(&mut request);
+
+        assert!(request.messages.iter().all(|m| m.model_id.is_none()));
+        let wire = serde_json::to_string(&request).expect("serializes");
+        assert!(
+            !wire.contains("model_id"),
+            "Fireworks rejects extra per-message fields with 400: {wire}"
+        );
     }
 
     #[test]

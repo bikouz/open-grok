@@ -363,6 +363,14 @@ impl WorkflowHost {
                 },
                 format!("↺ {label} (replayed from journal)"),
             );
+            // Re-journal the replayed result under this run so resume chains:
+            // resuming from THIS run must replay everything it served, not
+            // only the calls that ran fresh here.
+            self.journal_entry(&JournalEntry {
+                index: call.index,
+                key,
+                ..entry.clone()
+            });
             return Ok(json!({
                 "ok": true,
                 "value": entry.value,
@@ -517,9 +525,11 @@ impl WorkflowHost {
                 Ok(())
             }
             SubagentValidateTypeOutcome::Unknown { available } => {
-                let suffix = (!available.is_empty())
-                    .then(|| format!(". Available types: {}", available.join(", ")))
-                    .unwrap_or_default();
+                let suffix = if available.is_empty() {
+                    String::new()
+                } else {
+                    format!(". Available types: {}", available.join(", "))
+                };
                 Err(format!(
                     "agent(): unknown agentType `{subagent_type}`{suffix}"
                 ))
