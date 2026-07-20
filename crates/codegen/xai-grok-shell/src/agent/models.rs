@@ -79,8 +79,10 @@ pub(crate) fn task_model_error_for_catalog_with_provider_auth(
                 .info
                 .visible_for_provider_auth(has_xai_session, has_codex_session)
     };
-    if config::find_model_by_id(available, requested).is_some_and(&is_available) {
-        return None;
+    if let Some(entry) = config::find_model_by_id(available, requested)
+        && is_available(entry)
+    {
+        return task_model_credential_error(requested, entry);
     }
 
     let mut slugs = available
@@ -99,6 +101,39 @@ pub(crate) fn task_model_error_for_catalog_with_provider_auth(
         )
     };
     Some(format!("Unknown Task.model slug '{requested}'. {guidance}"))
+}
+
+/// Credential gate for spawning a child on an API-key-only provider.
+///
+/// A Kimi / Fireworks AI child without a usable key is doomed: it dies during
+/// spawn setup in `refresh_kimi_sampling_config_for_spawn`, AFTER a
+/// `background: true` task tool has already answered "Subagent started in
+/// background" — so the caller sees a silent 0-turn failure and tends to fall
+/// back to another model without telling the user. Rejecting the slug here
+/// makes the task tool fail the call eagerly with an actionable message
+/// instead. Mirrors the key-emptiness test in
+/// `refresh_kimi_sampling_config_for_spawn`; that later check remains as
+/// defense-in-depth against settings changing mid-spawn.
+fn task_model_credential_error(requested: &str, entry: &ModelEntry) -> Option<String> {
+    use xai_grok_sampling_types::ModelProvider;
+    let provider = entry.info.provider;
+    if !matches!(provider, ModelProvider::Kimi | ModelProvider::Fireworks) {
+        return None;
+    }
+    let credentials = config::resolve_credentials(entry, None);
+    if credentials
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        return None;
+    }
+    Some(format!(
+        "Model '{requested}' needs a {} API key, and none is configured. \
+         Ask the user to add one in settings, or omit `model` to inherit the \
+         parent model.",
+        provider.name()
+    ))
 }
 
 /// Thread-safe model manager.
@@ -2553,6 +2588,45 @@ pub(crate) async fn fetch_models_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fireworks_task_entry(model_id: &str, api_key: Option<&str>) -> ModelEntry {
+        let mut entry =
+            ModelEntry::fallback(model_id, &crate::agent::config::EndpointsConfig::default());
+        entry.info.model = model_id.to_owned();
+        // An untrusted host keeps `resolve_credentials` off the developer's
+        // real auth.json, so key presence is fully controlled by `api_key`.
+        entry.info.base_url = "https://fireworks.invalid/v1".to_owned();
+        entry.info.provider = xai_grok_sampling_types::ModelProvider::Fireworks;
+        entry.info.user_selectable = true;
+        entry.api_key = api_key.map(str::to_owned);
+        entry.env_key = None;
+        entry
+    }
+
+    #[test]
+    fn task_model_gate_rejects_fireworks_model_without_credentials() {
+        let catalog = IndexMap::from([(
+            "glm-test".to_string(),
+            fireworks_task_entry("glm-test", None),
+        )]);
+        let error =
+            task_model_error_for_catalog_with_provider_auth("glm-test", &catalog, true, false)
+                .expect("keyless Fireworks model must be rejected eagerly");
+        assert!(error.contains("Fireworks AI API key"), "got: {error}");
+        assert!(error.contains("glm-test"), "got: {error}");
+    }
+
+    #[test]
+    fn task_model_gate_allows_fireworks_model_with_own_credential() {
+        let catalog = IndexMap::from([(
+            "glm-test".to_string(),
+            fireworks_task_entry("glm-test", Some("fw-key")),
+        )]);
+        assert_eq!(
+            task_model_error_for_catalog_with_provider_auth("glm-test", &catalog, true, false),
+            None
+        );
+    }
 
     fn test_manager() -> ModelsManager {
         let _ = tracing_subscriber::fmt()

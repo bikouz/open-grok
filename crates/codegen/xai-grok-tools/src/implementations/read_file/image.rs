@@ -75,6 +75,21 @@ pub async fn image_read_output(
     use crate::types::output::{ImageContent, ReadFileOutput};
     use base64::Engine as _;
 
+    // HEIC/HEIF (Apple camera format) cannot be decoded by the `image`
+    // crate; transcode to JPEG first so the normal compress path applies.
+    let (file_bytes, mime_type) = if crate::util::heic::is_heic_mime(&mime_type) {
+        match crate::util::heic::convert_heic_to_jpeg(file_bytes).await {
+            Ok(jpeg) => (jpeg, "image/jpeg".to_owned()),
+            Err(e) => {
+                return ReadFileOutput::ImageSizeError(format!(
+                    "Could not embed HEIC image in conversation: {e}"
+                ));
+            }
+        }
+    } else {
+        (file_bytes, mime_type)
+    };
+
     let (encoded_bytes, mime) = match tokio::task::spawn_blocking(move || {
         compress_image_for_conversation(file_bytes, mime_type)
     })

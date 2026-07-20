@@ -674,6 +674,16 @@ impl ToolOutput {
     pub fn code_mode_result(&self) -> Result<serde_json::Value, serde_json::Error> {
         match self {
             ToolOutput::ApplyPatch(_) => Ok(serde_json::json!({})),
+            // Shape image reads for the code-mode `image()` helper, which
+            // accepts `{image_url, detail?}`: `image(result)` attaches the
+            // picture to the cell output as vision input. The raw
+            // `{data, mime_type}` serde shape would force the model to
+            // reassemble the data URI (or worse, print the base64).
+            ToolOutput::ReadFile(ReadFileOutput::ImageContent(image)) => Ok(serde_json::json!({
+                "image_url": format!("data:{};base64,{}", image.mime_type, image.data),
+                "mime_type": image.mime_type,
+                "note": "Pass this result to the global image(...) helper to view it.",
+            })),
             ToolOutput::Dynamic(output) => Ok(output.value.clone()),
             ToolOutput::Text(output) => Ok(serde_json::Value::String(output.text.clone())),
             ToolOutput::Bash(output) => Ok(serde_json::json!({

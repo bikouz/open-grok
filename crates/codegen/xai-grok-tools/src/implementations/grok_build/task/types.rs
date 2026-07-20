@@ -571,6 +571,13 @@ pub struct SubagentCompletionSummary {
     /// that DO have a polling tool keep the existing metadata-only line +
     /// "Use get_task_output(...)" pointer.
     pub output: Arc<str>,
+    /// Failure reason for unsuccessful completions (from
+    /// `SubagentResult.error`, e.g. a spawn-time credential error). Always
+    /// inlined in the completion notification, even when a polling tool
+    /// exists: a child that failed before running has no output to poll, and
+    /// without the reason the parent tends to silently retry on a different
+    /// model instead of telling the user what is missing.
+    pub error: Option<String>,
 }
 
 /// Multi-wait request: block until one or all of the listed subagents finish.
@@ -1364,6 +1371,7 @@ mod tests {
             tool_calls: 7,
             turns: 3,
             output: std::sync::Arc::from("subagent answer"),
+            error: None,
         }];
         req.respond_to.send(summaries).unwrap();
 

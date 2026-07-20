@@ -18,6 +18,7 @@ fn summary(
         tool_calls: tools,
         turns: 1,
         output: std::sync::Arc::from(format!("the answer for {id}").as_str()),
+        error: None,
     }
 }
 

@@ -269,6 +269,7 @@ fn default_grok_build_toolset() -> ToolServerConfig {
         tools: vec![
             bash_tool_config(),
             (&grok_build::ReadFileTool).into(),
+            (&grok_build::ViewImageTool).into(),
             (&grok_build::SearchReplaceTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
@@ -294,6 +295,7 @@ fn grok_build_concise_toolset() -> ToolServerConfig {
         tools: vec![
             (&grok_build_concise::BashConciseTool).into(),
             (&grok_build_concise::ReadFileConciseTool).into(),
+            (&grok_build::ViewImageTool).into(),
             (&grok_build_concise::SearchReplaceConciseTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
@@ -320,6 +322,7 @@ pub fn grok_build_hashline_toolset(
     let mut tools: Vec<xai_grok_tools::registry::types::ToolConfig> = vec![bash_tool_config()];
     tools.extend(hashline_tools);
     tools.extend([
+        (&grok_build::ViewImageTool).into(),
         (&grok_build::ListDirTool).into(),
         kill_task_tool_config(),
         (&grok_build::TodoWriteTool).into(),
@@ -346,6 +349,7 @@ fn codex_toolset() -> ToolServerConfig {
         tools: vec![
             bash_tool_config(),
             (&codex::CodexReadFileTool).into(),
+            (&grok_build::ViewImageTool).into(),
             (&codex::ApplyPatchTool).into(),
             (&codex::CodexListDirTool).into(),
             (&codex::CodexGrepFilesTool).into(),
@@ -380,6 +384,7 @@ fn explore_toolset() -> ToolServerConfig {
     ToolServerConfig {
         tools: vec![
             (&grok_build::ReadFileTool).into(),
+            (&grok_build::ViewImageTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
         ],
@@ -395,6 +400,7 @@ fn plan_toolset() -> ToolServerConfig {
     ToolServerConfig {
         tools: vec![
             (&grok_build::ReadFileTool).into(),
+            (&grok_build::ViewImageTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
             (&grok_build::TodoWriteTool).into(),
@@ -413,6 +419,7 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
         tools: vec![
             bash_tool_config(),
             (&grok_build::ReadFileTool).into(),
+            (&grok_build::ViewImageTool).into(),
             (&grok_build::SearchReplaceTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
@@ -485,6 +492,7 @@ fn grok_build_plan_no_subagents_toolset() -> ToolServerConfig {
         tools: vec![
             bash_tool_config(),
             (&grok_build::ReadFileTool).into(),
+            (&grok_build::ViewImageTool).into(),
             (&grok_build::SearchReplaceTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
@@ -514,6 +522,7 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
         tools: vec![
             bash_tool_config(),
             (&grok_build::ReadFileTool).into(),
+            (&grok_build::ViewImageTool).into(),
             (&grok_build::SearchReplaceTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),

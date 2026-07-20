@@ -99,11 +99,13 @@ pub struct TaskToolInput {
     /// Optional model slug for this subagent.
     #[schemars(
         description = "Optional model slug for this agent. If provided, it must resolve to one \
-            of the available model slugs. If omitted, the subagent uses the same model as the \
-            parent agent. The selected model may use a different provider than the parent. \
-            Choose an explicit model when it materially fits the delegated task better (for \
-            example, speed, cost, depth, or provider capabilities); otherwise omit it. Do not \
-            pass if resume_from is set (the prior model will be used)."
+            of the available model slugs, and its provider must have usable credentials. If \
+            omitted, the subagent uses the same model as the parent agent. The selected model \
+            may use a different provider than the parent. Choose an explicit model when it \
+            materially fits the delegated task better (for example, speed, cost, depth, or \
+            provider capabilities); otherwise omit it. Do not pass if resume_from is set (the \
+            prior model will be used). If the slug is rejected, surface the error to the user \
+            instead of silently substituting a different model."
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -129,6 +131,18 @@ pub struct AgentSwarmToolInput {
     /// Name of the subagent type to launch.
     #[serde(default = "default_subagent_type")]
     pub subagent_type: String,
+
+    /// Optional model slug applied to every new swarm member.
+    #[schemars(
+        description = "Optional model slug applied to every new swarm member. If provided, it \
+            must resolve to one of the available model slugs, and its provider must have usable \
+            credentials. If omitted, members inherit the parent agent's model. Resumed members \
+            (resume_agent_ids) always keep their prior model. Never silently substitute a \
+            different model: if this slug is rejected, surface the error to the user instead of \
+            re-running the swarm on another model."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 
     /// Template used to construct each item member prompt. It must contain the
     /// literal `{{item}}` placeholder when `items` is supplied.

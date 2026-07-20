@@ -666,6 +666,7 @@ impl ToolRegistryBuilder {
         };
         b.register_with_params::<grok_build::BashTool, grok_build::bash::BashParams>();
         b.register_with_params::<grok_build::ReadFileTool, grok_build::read_file::ReadFileParams>();
+        b.register::<grok_build::ViewImageTool>();
         b.register_with_params::<
                 grok_build::SearchReplaceTool,
                 grok_build::search_replace::SearchReplaceParams,

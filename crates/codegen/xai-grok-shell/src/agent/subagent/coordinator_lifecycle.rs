@@ -302,6 +302,7 @@ impl SubagentCoordinator {
             ..Default::default()
         };
         let summary_output = result.output.clone();
+        let summary_error = result.error.clone();
         self.completed
             .insert(
                 subagent_id.clone(),
@@ -339,6 +340,7 @@ impl SubagentCoordinator {
                     tool_calls: 0,
                     turns: 0,
                     output: summary_output,
+                    error: summary_error,
                 });
         }
         self.completion_notify.notify_waiters();
@@ -444,6 +446,7 @@ impl SubagentCoordinator {
                     tool_calls: completed.result.tool_calls,
                     turns: completed.result.turns,
                     output: completed.result.output.clone(),
+                    error: completed.result.error.clone(),
                 });
         }
         if completed.persisted_output_dir.is_some() {

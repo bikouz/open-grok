@@ -2371,6 +2371,7 @@ fn inject_subagent_completed_prompt(
         tool_calls: result.tool_calls,
         turns: result.turns,
         output: result.output.clone(),
+        error: result.error.clone(),
     };
     let message = xai_grok_tools::reminders::task_completion::format_subagent_completion(
         &summary,

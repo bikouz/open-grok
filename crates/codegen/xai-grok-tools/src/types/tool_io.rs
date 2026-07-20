@@ -27,6 +27,7 @@ use crate::implementations::grok_build::search_replace::SearchReplaceInput;
 use crate::implementations::grok_build::todo::TodoWriteInput;
 use crate::implementations::grok_build::update_goal::UpdateGoalInput;
 use crate::implementations::grok_build::video_gen::{ImageToVideoInput, ReferenceToVideoInput};
+use crate::implementations::grok_build::view_image::ViewImageInput;
 use crate::implementations::grok_build::web_fetch::WebFetchInput;
 use crate::implementations::grok_build::web_search::WebSearchInput;
 use crate::implementations::lsp::LspToolInput;
@@ -60,6 +61,7 @@ pub struct MCPToolInput {
 #[serde(tag = "variant")]
 pub enum ToolInput {
     ReadFile(ReadFileInput),
+    ViewImage(ViewImageInput),
     SearchReplace(SearchReplaceInput),
     Bash(BashToolInput),
     Grep(GrepSearchInput),

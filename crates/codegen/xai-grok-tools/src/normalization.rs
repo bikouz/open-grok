@@ -86,6 +86,7 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
             (field::OFFSET, opt(norm_offset_i64(r.offset))),
             (field::LIMIT, opt(r.limit)),
         ]),
+        ToolInput::ViewImage(v) => obj([(field::PATH, req(&v.path))]),
         ToolInput::Bash(b) => obj([
             (field::COMMAND, req(&b.command)),
             (field::DESCRIPTION, req(&b.description)),

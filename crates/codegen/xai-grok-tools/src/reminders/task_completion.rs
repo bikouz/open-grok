@@ -421,6 +421,15 @@ pub fn format_subagent_completion(
         c.tool_calls,
         c.turns,
     );
+    // A failed child (especially one that died before its first turn) may
+    // have no output to poll; the reason is the actionable part, so it is
+    // always inlined regardless of whether a polling tool exists.
+    if !c.success
+        && let Some(error) = c.error.as_deref().filter(|e| !e.trim().is_empty())
+    {
+        out.push_str("\nFailure reason: ");
+        out.push_str(error);
+    }
     out.push_str(match task_output_name {
         Some(_) => "\n",
         None => "\n\n",
@@ -1440,6 +1449,7 @@ mod tests {
             tool_calls: 3,
             turns: 2,
             output: std::sync::Arc::from(format!("output for {id}")),
+            error: None,
         }
     }
     #[tokio::test]
@@ -1643,6 +1653,28 @@ mod tests {
         let c = make_subagent_completion("sub-fail", false);
         let msg = format_subagent_completion(&c, Some("get_task_output"));
         assert!(msg.contains("with failure"));
+        assert!(
+            !msg.contains("Failure reason:"),
+            "no reason line when no error is recorded: {msg}"
+        );
+    }
+    #[test]
+    fn format_subagent_completion_failure_inlines_reason_even_with_poll_tool() {
+        let mut c = make_subagent_completion("sub-fail", false);
+        c.error = Some("A Fireworks AI API key is required before starting this subagent".into());
+        let msg = format_subagent_completion(&c, Some("get_task_output"));
+        assert!(
+            msg.contains("Failure reason: A Fireworks AI API key is required"),
+            "failure reason must be inline: {msg}"
+        );
+        assert!(msg.contains(r#"get_task_output("sub-fail")"#));
+    }
+    #[test]
+    fn format_subagent_completion_success_ignores_stale_error() {
+        let mut c = make_subagent_completion("sub-ok", true);
+        c.error = Some("stale".into());
+        let msg = format_subagent_completion(&c, Some("get_task_output"));
+        assert!(!msg.contains("Failure reason:"), "got: {msg}");
     }
     #[test]
     fn format_subagent_completion_inlines_output_when_no_poll_tool() {

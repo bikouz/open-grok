@@ -19,7 +19,8 @@ use crate::{
             CurrentPromptIdResource, ModelOverrideProvenance, SWARM_RATE_LIMIT_RETRY_BASE_MS,
             SessionIdResource, SubagentDepthCounter, SubagentRateLimitDecision, SubagentRequest,
             SubagentResult, SubagentRuntimeOverrides, SubagentStatusEvent,
-            SubagentValidateTypeOutcome, SwarmMemberMeta, swarm_rate_limit_backoff,
+            SubagentValidateTypeOutcome, SwarmMemberMeta, TaskModelValidator,
+            swarm_rate_limit_backoff,
         },
     },
     types::{
@@ -238,6 +239,9 @@ impl crate::types::tool_metadata::ToolMetadata for AgentSwarmTool {
             "is fail-fast before any child starts: provide at least 2 items unless ",
             "resume_agent_ids is supplied; items require prompt_template containing literal ",
             "{{item}}; expanded prompts must be distinct; and total members are capped at 128. ",
+            "Pass model to run every new member on a specific available model slug (resumed ",
+            "members keep their prior model); if the slug is rejected, report the error instead ",
+            "of re-running the swarm on a different model. ",
             "Results return together in input slot order as agent_swarm_result XML with resume ",
             "hints for unfinished members. agent_swarm must be the only tool call in the model ",
             "response. Keep the tree flat: swarm members cannot launch further task or ",
@@ -294,7 +298,7 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
         let timeout =
             subagent_timeout_from_env().map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
         let resources = crate::types::tool_metadata::shared_resources(&ctx)?;
-        let (depth, backend, parent_session_id, parent_prompt_id) = {
+        let (depth, backend, model_validator, parent_session_id, parent_prompt_id) = {
             let res = resources.lock().await;
             (
                 res.get::<SubagentDepthCounter>().map(|d| d.0).unwrap_or(0),
@@ -306,6 +310,7 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
                         )
                     })?
                     .clone(),
+                res.get::<TaskModelValidator>().cloned(),
                 res.get::<SessionIdResource>()
                     .map(|s| s.0.clone())
                     .unwrap_or_default(),
@@ -357,6 +362,23 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
             }
         }
 
+        // Same eager gate as the task tool: an unknown slug — or a slug whose
+        // provider has no usable credentials — must reject the whole swarm
+        // here, not spawn members that die at setup and silently inherit the
+        // parent model.
+        let member_model = xai_tool_types::sanitize_optional_arg(input.model);
+        if let Some(ref requested) = member_model {
+            let validator = model_validator.ok_or_else(|| {
+                xai_tool_runtime::ToolError::custom(
+                    "validation_unavailable",
+                    "Cannot validate agent_swarm.model: model catalog validator is unavailable.",
+                )
+            })?;
+            if let Some(error) = validator.error_for(requested) {
+                return Err(xai_tool_runtime::ToolError::invalid_arguments(error));
+            }
+        }
+
         let results = run_scheduler(
             backend.0.clone(),
             members,
@@ -366,6 +388,7 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
                 subagent_type: input.subagent_type,
                 parent_session_id,
                 parent_prompt_id,
+                model: member_model,
             },
             concurrency_cap,
             timeout,
@@ -382,6 +405,9 @@ struct SwarmRequestContext {
     subagent_type: String,
     parent_session_id: String,
     parent_prompt_id: Option<String>,
+    /// Model override applied to every new member; resumed members keep
+    /// their prior model (the resume path pins it).
+    model: Option<String>,
 }
 
 fn validate_and_plan(input: &AgentSwarmToolInput) -> Result<Vec<PlannedMember>, String> {
@@ -676,10 +702,14 @@ fn build_member_request(
             expected_members,
             status_tx,
         }),
-        resume_from: member.resume_from,
-        cwd: None,
+        // Resumed members keep their prior model; the override applies to
+        // new members only (mirrors the task tool's soft-ignore on resume).
         runtime_overrides: SubagentRuntimeOverrides {
-            model: None,
+            model: member
+                .resume_from
+                .is_none()
+                .then(|| context.model.clone())
+                .flatten(),
             model_override_provenance: ModelOverrideProvenance::Tool,
             reasoning_effort: None,
             persona: None,
@@ -687,6 +717,8 @@ fn build_member_request(
             isolation: None,
             harness_agent_type: None,
         },
+        resume_from: member.resume_from,
+        cwd: None,
         run_in_background: false,
         surface_completion: false,
         fork_context: false,
@@ -860,6 +892,7 @@ mod tests {
         AgentSwarmToolInput {
             description: "work".into(),
             subagent_type: "general-purpose".into(),
+            model: None,
             prompt_template: template.map(str::to_string),
             items: items.map(|items| items.into_iter().map(str::to_string).collect()),
             resume_agent_ids: resumes.map(|entries| {
@@ -878,6 +911,7 @@ mod tests {
             subagent_type: "general-purpose".to_string(),
             parent_session_id: "parent".to_string(),
             parent_prompt_id: Some("turn".to_string()),
+            model: None,
         }
     }
 
@@ -1011,6 +1045,49 @@ mod tests {
         assert_eq!(request.resume_from.as_deref(), Some("resume"));
         assert!(!request.run_in_background);
         assert!(!request.surface_completion);
+    }
+
+    #[test]
+    fn model_override_applies_to_new_members_only() {
+        let ctx_with_model = SwarmRequestContext {
+            model: Some("glm-5.2-fast".to_string()),
+            ..context()
+        };
+        let new_member = build_member_request(
+            PlannedMember {
+                index: 0,
+                item: Some("item".to_string()),
+                prompt: "prompt".to_string(),
+                resume_from: None,
+                mode: MemberMode::New,
+            },
+            ctx_with_model.clone(),
+            2,
+            "child-new".to_string(),
+            None,
+        );
+        assert_eq!(
+            new_member.runtime_overrides.model.as_deref(),
+            Some("glm-5.2-fast")
+        );
+
+        let resumed_member = build_member_request(
+            PlannedMember {
+                index: 1,
+                item: None,
+                prompt: "continue".to_string(),
+                resume_from: Some("resume".to_string()),
+                mode: MemberMode::Resume,
+            },
+            ctx_with_model,
+            2,
+            "child-resume".to_string(),
+            None,
+        );
+        assert!(
+            resumed_member.runtime_overrides.model.is_none(),
+            "resumed members keep their prior model"
+        );
     }
 
     #[test]

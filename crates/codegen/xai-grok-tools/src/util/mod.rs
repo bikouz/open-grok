@@ -6,6 +6,7 @@ pub mod fs;
 pub mod git_detect;
 pub mod grok_home;
 pub mod hash;
+pub mod heic;
 pub mod image_compress;
 pub mod image_validate;
 pub mod mcp_truncate;

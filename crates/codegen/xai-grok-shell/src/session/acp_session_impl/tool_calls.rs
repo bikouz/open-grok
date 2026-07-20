@@ -2017,6 +2017,12 @@ impl SessionActor {
                 ],
                 Vec::new(),
             ),
+            ToolInput::ViewImage(view_image) => (
+                format!("View image `{}`", view_image.path.clone()),
+                acp::ToolKind::Read,
+                vec![acp::ToolCallLocation::new(view_image.path)],
+                Vec::new(),
+            ),
             ToolInput::CodexReadFile(read_file) => (
                 format!("Read `{}`", read_file.file_path),
                 acp::ToolKind::Read,

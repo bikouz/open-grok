@@ -97,6 +97,7 @@ impl ImageViewerState {
     /// [`open_from_path_deferred`] from input handlers to avoid blocking.
     pub fn open_from_path(path: &std::path::Path) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
+        let bytes = transcode_heic_bytes(bytes, path)?;
 
         let (w, h) = decode_image_dimensions(&bytes)?;
         let display_bytes = crate::terminal::image::prepare_overlay_image_bytes(&bytes)
@@ -204,6 +205,9 @@ pub fn load_image_data(path: &std::path::Path) -> ImageLoadResult {
             tracing::warn!("image viewer: failed to read {}: {e}", path.display());
             return ImageLoadResult::Failed;
         }
+    };
+    let Some(bytes) = transcode_heic_bytes(bytes, path) else {
+        return ImageLoadResult::Failed;
     };
     let (w, h) = match decode_image_dimensions(&bytes) {
         Some(dims) => dims,
@@ -851,11 +855,40 @@ pub fn cleanup_temp_file(img: &PastedImage) {
 
 /// Image file extensions recognized when a pasted path is checked.
 ///
-/// Formats omitted on purpose: HEIC/HEIF/AVIF/ICO/SVG. The inline
-/// image overlay doesn't decode or render them today, so promoting
-/// them to chips would falsely promise rendering. Drops of these
-/// extensions fall through to NonImage path text instead.
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif"];
+/// HEIC/HEIF are accepted and transcoded to JPEG at ingestion (see
+/// [`transcode_heic_bytes`]) so every downstream consumer — preview,
+/// session persistence, vision upload — only ever handles JPEG.
+///
+/// Formats omitted on purpose: AVIF/ICO/SVG. The inline image overlay
+/// doesn't decode or render them today, so promoting them to chips
+/// would falsely promise rendering. Drops of these extensions fall
+/// through to NonImage path text instead.
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "heif",
+];
+
+/// If `bytes` sniff as HEIC/HEIF, transcode them to JPEG (blocking —
+/// callers are drop handlers or background loader threads, where a
+/// few hundred ms of converter latency is acceptable). Non-HEIC bytes
+/// pass through untouched. `None` means the bytes were HEIC but no
+/// converter succeeded; callers fall back to their not-an-image path.
+fn transcode_heic_bytes(bytes: Vec<u8>, origin: &std::path::Path) -> Option<Vec<u8>> {
+    if !xai_grok_tools::util::heic::is_heic_bytes(&bytes) {
+        return Some(bytes);
+    }
+    match xai_grok_tools::util::heic::convert_heic_to_jpeg_blocking(&bytes) {
+        Ok(jpeg) => Some(jpeg),
+        Err(error) => {
+            tracing::warn!(
+                target: PROMPT_IMAGES_TRACING_TARGET,
+                path = %origin.display(),
+                %error,
+                "HEIC transcode failed; treating as non-image"
+            );
+            None
+        }
+    }
+}
 
 /// Normalize a media path by dropping the Windows `\\?\` verbatim prefix
 /// (`\\?\C:\x` → `C:\x`, `\\?\UNC\srv\s` → `\\srv\s`). Applied once when a
@@ -961,6 +994,7 @@ fn read_image_at_path(path: &std::path::Path) -> Option<PastedImage> {
     if data.is_empty() {
         return None;
     }
+    let data = transcode_heic_bytes(data, path)?;
 
     let mime_type = xai_grok_shared::clipboard::mime_from_bytes(&data);
     if mime_type == "application/octet-stream" {
@@ -1747,7 +1781,9 @@ impl ScrollbackImageRef {
             return None;
         }
         let bytes = std::fs::read(&path).ok()?;
-        if !is_decodable_image(&bytes) {
+        // HEIC passes on the brand sniff alone: the ref only stores the
+        // path, and the viewer transcodes to JPEG when it loads the file.
+        if !is_decodable_image(&bytes) && !xai_grok_tools::util::heic::is_heic_bytes(&bytes) {
             return None;
         }
         let dimensions = decode_image_dimensions(&bytes);
@@ -3254,12 +3290,13 @@ mod tests {
         );
     }
 
-    /// HEIC/HEIF/AVIF/ICO are intentionally NOT in `IMAGE_EXTENSIONS`
+    /// AVIF/ICO are intentionally NOT in `IMAGE_EXTENSIONS`
     /// — the inline overlay doesn't render them, so we fall through
     /// to NonImage path text instead of falsely promoting a chip.
+    /// (HEIC/HEIF are accepted and transcoded to JPEG at ingestion.)
     #[test]
     fn unsupported_image_extensions_fall_to_non_image() {
-        for ext in ["heic", "heif", "avif", "ico"] {
+        for ext in ["avif", "ico"] {
             assert!(!IMAGE_EXTENSIONS.contains(&ext), "{ext} must be omitted");
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(format!("img.{ext}"));
@@ -3270,6 +3307,64 @@ mod tests {
             assert!(
                 matches!(entries[0], DroppedPath::NonImage(_)),
                 "{ext} must fall through to NonImage, got {:?}",
+                entries[0],
+            );
+        }
+    }
+
+    /// End-to-end on macOS: a genuine HEIC drop (authored with the
+    /// built-in `sips`) is promoted to an image chip whose bytes were
+    /// transcoded to JPEG, so preview/persistence/upload all see JPEG.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_heic_drop_promotes_to_jpeg_image_chip() {
+        let dir = tempfile::tempdir().unwrap();
+        let png_path = dir.path().join("src.png");
+        let heic_path = dir.path().join("photo.heic");
+        let img = image::RgbImage::from_fn(64, 48, |x, y| image::Rgb([x as u8, y as u8, 200]));
+        img.save(&png_path).unwrap();
+        let status = std::process::Command::new("sips")
+            .args(["-s", "format", "heic"])
+            .arg(&png_path)
+            .arg("--out")
+            .arg(&heic_path)
+            .status()
+            .expect("sips is part of macOS");
+        assert!(status.success(), "sips could not author the HEIC fixture");
+
+        let url = format!("file://{}", heic_path.display());
+        let entries = dropped_paths(&url);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        match &entries[0] {
+            DroppedPath::Image(image) => {
+                assert_eq!(image.mime_type, "image/jpeg");
+                assert_eq!(image.dimensions, Some((64, 48)));
+                assert_eq!(
+                    image.source_path.as_deref(),
+                    Some(heic_path.as_path()),
+                    "chip keeps the original .heic path for display"
+                );
+            }
+            other => panic!("HEIC drop must promote to an image chip, got {other:?}"),
+        }
+    }
+
+    /// HEIC extensions are accepted, but bytes that fail the HEIC brand
+    /// sniff (and every converter) still fall through to NonImage rather
+    /// than promoting a chip that could never render.
+    #[test]
+    fn heic_extension_with_bogus_bytes_falls_to_non_image() {
+        for ext in ["heic", "heif"] {
+            assert!(IMAGE_EXTENSIONS.contains(&ext), "{ext} must be accepted");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("img.{ext}"));
+            std::fs::write(&path, b"not actually heic bytes").unwrap();
+            let url = format!("file://{}", path.display());
+            let entries = dropped_paths(&url);
+            assert_eq!(entries.len(), 1, "{ext}: {entries:?}");
+            assert!(
+                matches!(entries[0], DroppedPath::NonImage(_)),
+                "{ext} with bogus bytes must fall through to NonImage, got {:?}",
                 entries[0],
             );
         }
