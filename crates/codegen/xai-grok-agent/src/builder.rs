@@ -2222,6 +2222,60 @@ mod tests {
             assert!(!names.contains(&excluded.to_string()), "got: {names:?}");
         }
     }
+    /// Regression: an enabled x_search config must produce a BUILDABLE agent.
+    /// v0.1.220-open-grok.16 shipped the builder push without registering
+    /// `XSearchTool` in the tool registry, so every session with xAI signed
+    /// in (x_search defaults on) failed agent construction outright —
+    /// "Requirements unsatisfied: GrokBuild:x_search not found in registry".
+    /// This test finalizes a real toolset with the config enabled, which is
+    /// exactly the path that broke.
+    #[tokio::test]
+    async fn x_search_config_builds_and_registers_tool() {
+        use xai_grok_tools::implementations::web_search::WebSearchConfig as XsWebSearchConfig;
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(xai_grok_tools::computer::local::LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(crate::config::AgentDefinition::default_grok_build())
+        .with_web_search_config(XsWebSearchConfig::Enabled {
+            api_key: "test-key".into(),
+            base_url: "https://api.x.ai/v1".into(),
+            model: "test-web-search-model".into(),
+            extra_headers: Default::default(),
+            alpha_test_key: None,
+        })
+        .with_x_search_config(XsWebSearchConfig::Enabled {
+            api_key: "test-key".into(),
+            base_url: "https://api.x.ai/v1".into(),
+            model: "test-web-search-model".into(),
+            extra_headers: Default::default(),
+            alpha_test_key: None,
+        })
+        .build()
+        .await
+        .expect("agent must build with x_search enabled");
+        let names: Vec<String> = agent
+            .tool_definitions()
+            .await
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
+        assert!(names.contains(&"x_search".to_string()), "got: {names:?}");
+        assert!(names.contains(&"web_search".to_string()), "got: {names:?}");
+        // x_search shares ToolKind::WebSearch; the template kind→name map is
+        // first-registration-wins, so `${{ tools.by_kind.web_search }}` must
+        // keep resolving to web_search.
+        assert_eq!(
+            agent
+                .tool_bridge()
+                .toolset()
+                .tool_name_for_kind(xai_grok_tools::types::tool::ToolKind::WebSearch)
+                .as_deref(),
+            Some("web_search")
+        );
+    }
+
     /// grok-build toolsets have no Skill tool — skills are read from
     /// `SKILL.md` via `read_file` — so a compat `Skill` allowlist entry grants
     /// toolset.

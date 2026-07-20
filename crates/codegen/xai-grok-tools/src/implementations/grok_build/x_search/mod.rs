@@ -24,6 +24,21 @@ pub struct XSearchInput {
     pub query: String,
 }
 
+/// The shell's `ToolInput` inspection layer (access kinds, plan-mode gates,
+/// hook payloads) treats x_search exactly like the read-only web search, so
+/// the input folds into the `WebSearch` variant. Execution is unaffected:
+/// dispatch routes by tool name and parses `XSearchInput` directly.
+impl From<XSearchInput> for crate::types::tool_io::ToolInput {
+    fn from(input: XSearchInput) -> Self {
+        Self::WebSearch(
+            crate::implementations::grok_build::web_search::WebSearchInput {
+                query: input.query,
+                allowed_domains: None,
+            },
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct XSearchTool;
 
