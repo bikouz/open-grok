@@ -14259,6 +14259,8 @@ dependencies = [
  "xai-computer-hub-core",
  "xai-computer-hub-sdk",
  "xai-file-utils",
+ "xai-grok-code-mode",
+ "xai-grok-code-mode-protocol",
  "xai-grok-config",
  "xai-grok-env",
  "xai-grok-sandbox",

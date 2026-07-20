@@ -355,6 +355,22 @@ pub struct MonitorEvent {
     pub owner_session_id: Option<String>,
 }
 
+/// Progress snapshot streamed by the `workflow` tool while its orchestration
+/// script runs. Carries the rendered progress tail (phase, agent counts, and
+/// recent log lines) for the tool card.
+#[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WorkflowProgress {
+    /// Tool call this progress belongs to.
+    pub tool_call_id: String,
+    /// Workflow run ID (also the swarm cohort ID for its subagents).
+    pub run_id: String,
+    /// `meta.name` of the running workflow script.
+    pub workflow_name: String,
+    /// Rendered progress text (summary line + recent log tail).
+    pub text: String,
+}
+
 /// A notification emitted by a tool during or after execution.
 /// These are sent to external consumers (TUI, logging, etc.) to provide
 /// real-time visibility into tool execution.
@@ -418,6 +434,9 @@ pub enum ToolNotification {
 
     /// A streaming event from a monitor background process.
     MonitorEvent(MonitorEvent),
+
+    /// A progress snapshot from a running `workflow` orchestration script.
+    WorkflowProgress(WorkflowProgress),
 }
 
 /// Single source of truth for the `(variant tag => payload type)` mapping of
@@ -479,6 +498,7 @@ notification_variants! {
     ScheduledTaskRemoved => ScheduledTaskRemoved,
     ScheduledTaskCreated => ScheduledTaskCreated,
     MonitorEvent => MonitorEvent,
+    WorkflowProgress => WorkflowProgress,
 }
 
 #[cfg(test)]

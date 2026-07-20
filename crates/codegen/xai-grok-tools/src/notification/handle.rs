@@ -5,7 +5,7 @@ use super::types::{
     BashOutputChunk, FileWritten, LspServerCrashed, LspServerFailed, LspServerReady,
     LspServerRetrying, LspServerStarting, MonitorEvent, PlanModeEntered, PlanModeExited,
     ScheduledTaskCreated, ScheduledTaskFired, ScheduledTaskRemoved, ToolNotification,
-    UserQuestionAsked,
+    UserQuestionAsked, WorkflowProgress,
 };
 use crate::types::TaskSnapshot;
 
@@ -252,6 +252,7 @@ impl ToolNotificationHandle {
         send_scheduled_task_removed, ScheduledTaskRemoved, ScheduledTaskRemoved;
         send_scheduled_task_created, ScheduledTaskCreated, ScheduledTaskCreated;
         send_monitor_event, MonitorEvent, MonitorEvent;
+        send_workflow_progress, WorkflowProgress, WorkflowProgress;
     }
 }
 

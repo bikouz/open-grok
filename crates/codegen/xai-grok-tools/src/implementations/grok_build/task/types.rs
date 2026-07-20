@@ -261,6 +261,24 @@ pub fn strip_plan_mode_tools(config: &mut crate::registry::types::ToolServerConf
         .retain(|tc| !matches!(tc.kind, Some(ToolKind::EnterPlan | ToolKind::ExitPlan)));
 }
 
+/// Remove every tool that can spawn nested agents (`task`, `agent_swarm`,
+/// `workflow`) from a child toolset at max subagent depth, then prune the
+/// background-task lifecycle tools that only exist to manage spawned work.
+///
+/// This is the single strip point keeping the subagent tree flat: children
+/// must never see a spawn surface, no matter which orchestrator launched them.
+pub fn strip_nested_spawn_tools(config: &mut crate::registry::types::ToolServerConfig) {
+    use crate::types::tool::ToolKind;
+
+    config.tools.retain(|tc| {
+        !matches!(
+            tc.kind,
+            Some(ToolKind::Task | ToolKind::AgentSwarm | ToolKind::Workflow)
+        )
+    });
+    prune_orphaned_background_task_tools(config);
+}
+
 fn is_background_capable_bash_tool(tc: &crate::registry::types::ToolConfig) -> bool {
     match tc.id.as_str() {
         "GrokBuild:run_terminal_cmd" | "GrokBuildConcise:run_terminal_cmd" => tc
@@ -1014,6 +1032,69 @@ mod tests {
                 "{mode:?} must not allow plan-mode tools: subagent plan approvals render on the parent view"
             );
         }
+    }
+
+    #[test]
+    fn no_capability_mode_allows_nested_spawn_tools() {
+        for mode in [
+            SubagentCapabilityMode::ReadOnly,
+            SubagentCapabilityMode::ReadWrite,
+            SubagentCapabilityMode::Execute,
+        ] {
+            let allowed = mode.allowed_tool_kinds();
+            assert!(
+                !allowed.contains(&ToolKind::AgentSwarm) && !allowed.contains(&ToolKind::Workflow),
+                "{mode:?} must not re-grant orchestration tools to subagents"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_nested_spawn_tools_removes_every_spawn_surface() {
+        let mut config = ToolServerConfig {
+            tools: vec![
+                tc("GrokBuild:read_file", ToolKind::Read),
+                tc("GrokBuild:task", ToolKind::Task),
+                tc("GrokBuild:agent_swarm", ToolKind::AgentSwarm),
+                tc("GrokBuild:workflow", ToolKind::Workflow),
+                tc("GrokBuild:get_task_output", ToolKind::BackgroundTaskAction),
+                tc("GrokBuild:kill_task", ToolKind::KillTaskAction),
+                ToolConfig::from_id("Mcp:custom_tool"),
+            ],
+            behavior_preset: None,
+        };
+
+        super::strip_nested_spawn_tools(&mut config);
+
+        let ids: Vec<&str> = config.tools.iter().map(|tc| tc.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["GrokBuild:read_file", "Mcp:custom_tool"],
+            "spawn tools must go, and orphaned background-task lifecycle tools with them"
+        );
+    }
+
+    #[test]
+    fn strip_nested_spawn_tools_keeps_background_helpers_for_bg_capable_bash() {
+        let mut bash = ToolConfig::from_id("GrokBuild:run_terminal_cmd");
+        bash.kind = Some(ToolKind::Execute);
+        let mut config = ToolServerConfig {
+            tools: vec![
+                bash,
+                tc("GrokBuild:workflow", ToolKind::Workflow),
+                tc("GrokBuild:get_task_output", ToolKind::BackgroundTaskAction),
+            ],
+            behavior_preset: None,
+        };
+
+        super::strip_nested_spawn_tools(&mut config);
+
+        let ids: Vec<&str> = config.tools.iter().map(|tc| tc.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["GrokBuild:run_terminal_cmd", "GrokBuild:get_task_output"],
+            "background-capable bash keeps its output helper; workflow still goes"
+        );
     }
 
     #[test]

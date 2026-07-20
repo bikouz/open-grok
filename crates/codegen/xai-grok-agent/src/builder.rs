@@ -791,11 +791,16 @@ impl AgentBuilder {
             xai_grok_tools::types::tool::ToolNamespace::GrokBuild,
             "agent_swarm"
         );
+        let workflow_tool_id = format!(
+            "{}:{}",
+            xai_grok_tools::types::tool::ToolNamespace::GrokBuild,
+            "workflow"
+        );
         let mut task_stripped = false;
         if !self.subagents_enabled {
-            tool_config
-                .tools
-                .retain(|tc| tc.id != task_tool_id && tc.id != agent_swarm_tool_id);
+            tool_config.tools.retain(|tc| {
+                tc.id != task_tool_id && tc.id != agent_swarm_tool_id && tc.id != workflow_tool_id
+            });
             task_stripped = true;
         } else {
             let subagents = crate::discovery::all_subagents_with_plugins(
@@ -804,9 +809,11 @@ impl AgentBuilder {
                 self.plugin_registry.as_deref(),
             );
             if subagents.is_empty() {
-                tool_config
-                    .tools
-                    .retain(|tc| tc.id != task_tool_id && tc.id != agent_swarm_tool_id);
+                tool_config.tools.retain(|tc| {
+                    tc.id != task_tool_id
+                        && tc.id != agent_swarm_tool_id
+                        && tc.id != workflow_tool_id
+                });
                 task_stripped = true;
             } else if self.prompt_audience == crate::prompt::context::PromptAudience::Subagent {
                 if let Some(task_tc) = tool_config

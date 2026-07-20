@@ -195,6 +195,43 @@ Swarms use the same flat subagent tree: swarm members cannot spawn `task` or ano
 
 ---
 
+## Workflows
+
+The `workflow` tool lets the agent orchestrate many subagents with a JavaScript script instead of individual tool calls — deterministic control flow (loops, fan-out, verification passes) with real concurrency. Where `agent_swarm` runs one prompt template over a list of items, a workflow script can express multi-stage pipelines, adversarial verification, judge panels, and loop-until-done discovery.
+
+Every script starts with a literal `meta` header and then drives agents with the built-in hooks:
+
+```javascript
+export const meta = {
+  name: 'review-changes',
+  description: 'Review changed files, verify findings',
+  phases: [{ title: 'Review' }, { title: 'Verify' }],
+}
+phase('Review');
+const findings = await parallel(files.map(f => () =>
+  agent('Review ' + f + ' for bugs', { label: 'review:' + f })));
+phase('Verify');
+const verdicts = await pipeline(findings.filter(Boolean),
+  (finding, orig, i) => agent('Adversarially verify: ' + finding, { label: 'verify#' + i }));
+return { verdicts };
+```
+
+Key behaviors:
+
+| Hook | Behavior |
+| --- | --- |
+| `agent(prompt, opts)` | Spawns a foreground subagent and resolves to its final text. `opts`: `label`, `phase`, `schema` (JSON output contract, parsed result), `model`, `effort`, `isolation: 'worktree'`, `agentType`. Failed agents resolve to `null`. |
+| `parallel(thunks)` | Runs tasks concurrently; a thunk that throws yields `null`. |
+| `pipeline(items, ...stages)` | Runs each item through all stages with no barrier between stages. |
+| `phase(title)` / `log(msg)` | Progress grouping and narration on the workflow card. |
+| `args`, `meta`, `budget` | Tool-call input, parsed meta, and `{total, spent(), remaining()}` token tracking. |
+
+Workflow children appear as a grouped cohort card (like a swarm) with live per-agent progress, and the workflow tool card streams phase/log lines while the script runs. Runs are journaled under the session directory; calling `workflow` again with `resume_from_run_id` replays unchanged `agent()` calls instantly and re-runs only what changed. `Date.now()`, `Math.random()`, and argless `new Date()` are unavailable inside scripts so replays stay deterministic — pass timestamps through `args`.
+
+Concurrency is capped automatically (`OPENGROK_WORKFLOW_MAX_CONCURRENCY` overrides; per-agent timeouts honor `OPENGROK_SUBAGENT_TIMEOUT_MS`), a run is limited to 1000 agents, and workflow members follow the same flat tree: they cannot spawn `task`, `agent_swarm`, or another `workflow`.
+
+---
+
 ## Capability Modes
 
 A capability mode is an optional, coarse filter on a subagent's tools:

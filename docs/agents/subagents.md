@@ -28,6 +28,7 @@ SubagentEvent mpsc  ──►  MvpAgent::start_subagent_coordinator (spawn_local
 | --- | --- |
 | `task` tool | `xai-grok-tools/src/implementations/grok_build/task/` |
 | `agent_swarm` tool | `xai-grok-tools/src/implementations/grok_build/agent_swarm/` |
+| `workflow` tool | `xai-grok-tools/src/implementations/grok_build/workflow/` |
 | Input / capability / isolation types | `crates/common/xai-tool-types/src/task.rs` |
 | Backend + events | `…/task/backend.rs`, `…/task/types.rs` |
 | Coordinator + drain | `xai-grok-shell/src/agent/subagent/`, `mvp_agent/subagent_coordinator.rs` |
@@ -175,13 +176,13 @@ Additionally, if effective isolation is still `none` but `AgentDefinition.isolat
 
 ```text
 Parent session depth 0  →  may call task
-Child  session depth 1  →  task + agent_swarm stripped / calls rejected
+Child  session depth 1  →  task + agent_swarm + workflow stripped / calls rejected
 ```
 
 Two complementary guards:
 
 1. **Call-time reject** in `TaskTool::run` when `SubagentDepthCounter >= 1`.
-2. **Toolset strip** in `handle_subagent_request`: if `parent_depth + 1 >= MAX_SUBAGENT_DEPTH`, remove `ToolKind::Task` and `ToolKind::AgentSwarm`, then prune orphaned background task tools so the model never sees a nested spawn surface.
+2. **Toolset strip** in `handle_subagent_request`: if `parent_depth + 1 >= MAX_SUBAGENT_DEPTH`, remove `ToolKind::Task`, `ToolKind::AgentSwarm`, and `ToolKind::Workflow`, then prune orphaned background task tools so the model never sees a nested spawn surface.
 
 Child `tool_context.subagent_depth` and shared `SubagentDepthCounter` are set to `parent_depth + 1` at spawn. Nested depth > 1 is unsupported by design (flat tree).
 

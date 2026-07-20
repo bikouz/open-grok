@@ -371,6 +371,19 @@ impl SessionActor {
             }
             return Ok(ToolLoop::Continue);
         }
+        let workflow_call = tool_calls
+            .iter()
+            .any(|call| call.function.name == "workflow");
+        if workflow_call && tool_calls.len() != 1 {
+            const ERROR: &str = "`workflow` must be the only tool call in its batch. Make one exclusive workflow call; run other tools before or after the workflow.";
+            for call in tool_calls {
+                if records_model_tool_results() {
+                    self.chat_state_handle
+                        .push_tool_result(ConversationItem::tool_result(call.id, ERROR));
+                }
+            }
+            return Ok(ToolLoop::Continue);
+        }
         if swarm_call {
             let inactive = !self.state.lock().await.swarm_mode.enabled();
             if inactive {

@@ -71,6 +71,7 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
             | "exit_plan_mode"
             | "task"
             | "spawn_subagent"
+            | "workflow"
             | "get_task_output"
             | "get_command_or_subagent_output"
             | "wait_tasks"

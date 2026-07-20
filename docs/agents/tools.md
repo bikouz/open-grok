@@ -284,6 +284,7 @@ Paths under `xai-grok-tools/src/implementations/` unless noted.
 - `--disable-web-search` remains the top-level kill switch for both native declarations and this fallback.
 - Settings changes apply live. The pager pauses new Kimi sends and queue draining until persistence and every resident-session rebuild are confirmed; failures restore durable state and reconcile the runtime before releasing the queue.
 | Subagents | `task`, `agent_swarm`, wait/kill helpers | `grok_build/task/`, `grok_build/agent_swarm/`, `task_output/`, `kill_task/` | Flat tree; swarm calls are foreground + batch-exclusive |
+| Workflow | `workflow` | `grok_build/workflow/` | JS orchestration over subagents; foreground + batch-exclusive |
 | Background I/O | `get_task_output` / wait / kill | `task_output/`, `kill_task/` | Terminal + subagent tasks |
 | Monitor | `monitor` | `grok_build/monitor/` | Line → notifications; rate limited |
 | Scheduler / loop | `scheduler_*` | `grok_build/scheduler/` | Parent handle shared with subagents when set |
@@ -304,6 +305,14 @@ Paths under `xai-grok-tools/src/implementations/` unless noted.
 - Item mode requires `prompt_template` with literal `{{item}}`; resume mode accepts an ordered `resume_agent_ids` object. Resume slots run before item slots and retain the source child profile.
 - The call validates completely before spawning, caps total members at 128, bursts five immediately, then ramps one launch per 700 ms. Optional concurrency and timeout overrides use `OPENGROK_AGENT_SWARM_MAX_CONCURRENCY` and `OPENGROK_SUBAGENT_TIMEOUT_MS`.
 - The shell enforces hard exclusivity: `agent_swarm` cannot share a model tool-call batch. Child toolsets strip both `task` and `agent_swarm` at depth 1.
+
+### Workflow orchestration (`workflow`)
+
+- `workflow` executes a JavaScript orchestration script inside the code-mode V8 runtime (fresh isolate per run, `xai-grok-code-mode` `InProcessCodeModeSession` with a workflow-specific delegate). The script must begin with `export const meta = { name, description, phases? }` as a pure literal (`workflow/meta.rs` extracts it without executing JS); the body runs in an async context with `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, `args`, `meta`, and `budget` provided by `workflow/prelude.js`.
+- Every `agent(prompt, opts)` call becomes a foreground child through the same `SubagentBackend` as `task`/`agent_swarm`, carrying swarm cohort metadata (`swarm_id` = run id) so children group in the TUI and bypass the foreground await budget. opts map onto `SubagentRuntimeOverrides` (`model`, `effort`, `isolation: "worktree"`, `agentType`); `schema` injects a JSON output contract and applies one corrective resume retry.
+- Host-side invariants (`workflow/host.rs`): concurrency semaphore (`OPENGROK_WORKFLOW_MAX_CONCURRENCY`, default `clamp(cores-2, 2, 16)`), per-agent timeout (`OPENGROK_SUBAGENT_TIMEOUT_MS`, default 2 h), 1000-agent lifetime cap, token accounting against `token_budget`, and a journal at `<session>/workflows/<run_id>/journal.jsonl` that `resume_from_run_id` replays for unchanged `(prompt, opts)` calls. `Date.now()`/`Math.random()`/argless `new Date()` throw in-script to keep replays deterministic.
+- Progress streams as `ToolNotification::WorkflowProgress` → `notification_bridge.rs` → in-progress `ToolCallUpdate`s on the workflow tool card, alongside the free per-child subagent rail.
+- Same shell rules as swarm: batch-exclusive tool call, depth-0 only, and child toolsets strip `task`/`agent_swarm`/`workflow` at depth 1.
 
 ### MCP tools (`search_tool` / `use_tool`)
 

@@ -851,6 +851,32 @@ async fn handle_notification(
                     ));
             }
         }
+
+        ToolNotification::WorkflowProgress(progress) => {
+            // Stream the rendered progress tail into the workflow tool card,
+            // mirroring the bash output-chunk update shape. Persisted so the
+            // latest progress survives replay while the run is live.
+            let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new(progress.tool_call_id.clone()),
+                acp::ToolCallUpdateFields::new()
+                    .status(Some(acp::ToolCallStatus::InProgress))
+                    .content(Some(vec![acp::ToolCallContent::from(
+                        acp::ContentBlock::Text(acp::TextContent::new(progress.text.clone())),
+                    )]))
+                    .raw_output(serde_json::to_value(&progress).ok()),
+            ));
+            let mut notification = acp::SessionNotification::new(config.session_id.clone(), update);
+            stamp_event_id(config, &mut notification.meta);
+            let _ = config.persistence_tx.send(PersistenceMsg::Update(
+                crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
+            ));
+            if config
+                .gateway_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let _ = config.gateway.session_notification(notification).await;
+            }
+        }
     }
 }
 

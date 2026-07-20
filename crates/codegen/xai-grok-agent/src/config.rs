@@ -158,6 +158,10 @@ fn task_tool_config() -> ToolConfig {
 fn agent_swarm_tool_config() -> ToolConfig {
     ToolConfig::from(&grok_build::AgentSwarmTool).with_name("agent_swarm")
 }
+/// Script-driven deterministic multi-subagent orchestration.
+fn workflow_tool_config() -> ToolConfig {
+    ToolConfig::from(&grok_build::WorkflowTool).with_name("workflow")
+}
 /// Task output tool renamed for clarity:
 /// `get_task_output` → `get_command_or_subagent_output`.
 fn task_output_tool_config() -> ToolConfig {
@@ -279,6 +283,7 @@ fn default_grok_build_toolset() -> ToolServerConfig {
             wait_tasks_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
+            workflow_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -330,6 +335,7 @@ pub fn grok_build_hashline_toolset(
         wait_tasks_tool_config(),
         task_tool_config(),
         agent_swarm_tool_config(),
+        workflow_tool_config(),
         (&grok_build::WebSearchTool).into(),
         (&grok_build::SchedulerCreateTool).into(),
         (&grok_build::SchedulerDeleteTool).into(),
@@ -359,6 +365,7 @@ fn codex_toolset() -> ToolServerConfig {
             wait_tasks_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
+            workflow_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -428,6 +435,7 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
             task_output_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
+            workflow_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -457,6 +465,7 @@ fn orchestrator_toolset() -> ToolServerConfig {
             (&grok_build::GrepTool).into(),
             task_tool_config(),
             agent_swarm_tool_config(),
+            workflow_tool_config(),
             task_output_tool_config(),
             wait_tasks_tool_config(),
             kill_task_tool_config(),
@@ -532,6 +541,7 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
             wait_tasks_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
+            workflow_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),

@@ -15,6 +15,8 @@ fs2 = { workspace = true }
 educe = { workspace = true, features = ["Debug"] }
 async-openai = { workspace = true }
 xai-tty-utils = { workspace = true }
+xai-grok-code-mode = { path = "../xai-grok-code-mode" }
+xai-grok-code-mode-protocol = { path = "../xai-grok-code-mode-protocol" }
 xai-grok-config = { path = "../xai-grok-config" }
 xai-grok-tools-api = { path = "../xai-grok-tools-api" }
 xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }

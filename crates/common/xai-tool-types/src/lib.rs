@@ -17,11 +17,11 @@ pub use task::{
     PLAN_SUBAGENT, SubagentCapabilityMode, SubagentCompletedOutput, SubagentDescriptor,
     SubagentIsolationMode, SubagentToolNaming, TaskOutputOutput, TaskOutputResult,
     TaskOutputToolInput, TaskOutputToolNaming, TaskToolInput, TaskToolNaming, WaitMode,
-    WaitTasksToolInput, WaitTasksToolNaming, build_kill_task_description, build_task_description,
-    build_task_output_description, build_wait_tasks_description, builtin_subagent_by_name,
-    default_subagent_type, format_resume_footer, format_subagent_completed,
-    format_subagent_started_background, is_not_sentinel, resolve_task_ids, sanitize_optional_arg,
-    task_output_waits, task_output_waits_from_json,
+    WaitTasksToolInput, WaitTasksToolNaming, WorkflowToolInput, build_kill_task_description,
+    build_task_description, build_task_output_description, build_wait_tasks_description,
+    builtin_subagent_by_name, default_subagent_type, format_resume_footer,
+    format_subagent_completed, format_subagent_started_background, is_not_sentinel,
+    resolve_task_ids, sanitize_optional_arg, task_output_waits, task_output_waits_from_json,
 };
 pub use types::{
     ArgumentType, SchemaType, ToolArgument, ToolDescription, ValidationError, ValidationErrors,

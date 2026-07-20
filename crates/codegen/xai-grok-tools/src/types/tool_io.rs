@@ -42,6 +42,7 @@ use xai_tool_types::KillTaskToolInput;
 use xai_tool_types::TaskOutputToolInput;
 use xai_tool_types::TaskToolInput;
 use xai_tool_types::WaitTasksToolInput;
+use xai_tool_types::WorkflowToolInput;
 /// Raw input for an MCP (Model Context Protocol) tool call.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MCPToolInput {
@@ -74,6 +75,7 @@ pub enum ToolInput {
     KillTask(KillTaskToolInput),
     Task(TaskToolInput),
     AgentSwarm(AgentSwarmToolInput),
+    Workflow(WorkflowToolInput),
     WebSearch(WebSearchInput),
     ImageGen(ImageGenInput),
     ImageEdit(ImageEditInput),

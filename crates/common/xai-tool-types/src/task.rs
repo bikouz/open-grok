@@ -162,6 +162,57 @@ pub struct AgentSwarmToolInput {
     pub resume_agent_ids: Option<OrderedResumeAgentMap>,
 }
 
+/// Input for the `workflow` tool — runs a JavaScript orchestration script
+/// that spawns and coordinates subagents deterministically.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowToolInput {
+    /// Inline workflow script source. Exactly one of `script` or
+    /// `script_path` must be provided.
+    #[schemars(
+        description = "Self-contained workflow script. Must begin with `export const meta = { \
+            name, description, phases? }` (a pure literal) followed by the script body using \
+            agent()/parallel()/pipeline()/phase()/log()."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+
+    /// Path to a workflow script file on disk. Takes precedence for reruns:
+    /// every invocation persists its script and reports the path, so edits can
+    /// be re-run without resending the source.
+    #[schemars(
+        description = "Path to a workflow script file on disk. Provide either `script` or \
+            `script_path`, not both."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_path: Option<String>,
+
+    /// Input value exposed to the script as the global `args`, verbatim.
+    #[schemars(
+        description = "Optional input value exposed to the script as the global `args`, \
+            verbatim. Pass arrays/objects as actual JSON values, not as a JSON-encoded string."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
+
+    /// Optional token target for the script's `budget` global.
+    #[schemars(
+        description = "Optional token target for the script's `budget` global. When set, \
+            budget.total/spent()/remaining() reflect it and agent() calls throw once the \
+            spend reaches the target."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+
+    /// Run ID of a prior workflow invocation to resume from.
+    #[schemars(
+        description = "Run ID of a prior workflow invocation to resume from. Completed agent() \
+            calls with unchanged (prompt, opts) return their journaled results instantly; only \
+            edited or new calls re-run. Same-session only."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from_run_id: Option<String>,
+}
+
 /// An insertion-ordered JSON object used for `AgentSwarm.resume_agent_ids`.
 ///
 /// JSON objects are model-facing maps, but swarm launch order is observable;
