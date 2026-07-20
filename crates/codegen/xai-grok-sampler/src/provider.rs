@@ -312,6 +312,18 @@ impl ProviderAdapter for KimiProvider {
     }
 }
 
+/// Fireworks AI is an ordinary OpenAI-compatible Chat Completions provider.
+/// Unlike Kimi's coding lane, Fireworks accepts standard sampling fields, so
+/// the shared defaults are forwarded unchanged.
+#[derive(Debug)]
+pub struct FireworksProvider;
+
+impl ProviderAdapter for FireworksProvider {
+    fn provider(&self) -> ModelProvider {
+        ModelProvider::Fireworks
+    }
+}
+
 /// One entry in the built-in provider registry.
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderRegistration {
@@ -322,9 +334,10 @@ pub struct ProviderRegistration {
 static XAI_PROVIDER: XaiProvider = XaiProvider;
 static CODEX_PROVIDER: CodexProvider = CodexProvider;
 static KIMI_PROVIDER: KimiProvider = KimiProvider;
+static FIREWORKS_PROVIDER: FireworksProvider = FireworksProvider;
 
 /// Complete registry for the built-in providers.
-pub static PROVIDER_REGISTRY: [ProviderRegistration; 3] = [
+pub static PROVIDER_REGISTRY: [ProviderRegistration; 4] = [
     ProviderRegistration {
         provider: ModelProvider::Xai,
         adapter: &XAI_PROVIDER,
@@ -337,6 +350,10 @@ pub static PROVIDER_REGISTRY: [ProviderRegistration; 3] = [
         provider: ModelProvider::Kimi,
         adapter: &KIMI_PROVIDER,
     },
+    ProviderRegistration {
+        provider: ModelProvider::Fireworks,
+        adapter: &FIREWORKS_PROVIDER,
+    },
 ];
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -347,6 +364,7 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
         ModelProvider::Xai => PROVIDER_REGISTRY[0].adapter,
         ModelProvider::Codex => PROVIDER_REGISTRY[1].adapter,
         ModelProvider::Kimi => PROVIDER_REGISTRY[2].adapter,
+        ModelProvider::Fireworks => PROVIDER_REGISTRY[3].adapter,
     }
 }
 
@@ -543,6 +561,7 @@ mod tests {
             ModelProvider::Xai,
             ModelProvider::Codex,
             ModelProvider::Kimi,
+            ModelProvider::Fireworks,
         ];
         assert_eq!(PROVIDER_REGISTRY.len(), expected.len());
         for provider in expected {
@@ -564,6 +583,7 @@ mod tests {
             ModelProvider::Xai,
             ModelProvider::Codex,
             ModelProvider::Kimi,
+            ModelProvider::Fireworks,
         ] {
             let mut request = base_request();
             let original = request.clone();
@@ -592,6 +612,7 @@ mod tests {
         let xai = provider_adapter(ModelProvider::Xai);
         let codex = provider_adapter(ModelProvider::Codex);
         let kimi = provider_adapter(ModelProvider::Kimi);
+        let fireworks = provider_adapter(ModelProvider::Fireworks);
         assert_eq!(xai.prompt_cache_key(Some("session")), None);
         assert_eq!(
             codex.prompt_cache_key(Some("session")),
@@ -607,6 +628,28 @@ mod tests {
         assert!(!kimi.normalizes_response_events());
         assert!(kimi.validate_backend(&ApiBackend::ChatCompletions).is_ok());
         assert!(kimi.validate_backend(&ApiBackend::Responses).is_err());
+        assert_eq!(fireworks.prompt_cache_key(Some("session")), None);
+        assert!(!fireworks.supports_turn_state(&ApiBackend::Responses));
+        assert!(!fireworks.sends_doom_loop_opt_in());
+        assert!(!fireworks.normalizes_response_events());
+        assert!(
+            fireworks
+                .validate_backend(&ApiBackend::ChatCompletions)
+                .is_ok()
+        );
+        assert!(fireworks.validate_backend(&ApiBackend::Responses).is_err());
+        assert!(fireworks.validate_backend(&ApiBackend::Messages).is_err());
+    }
+
+    #[test]
+    fn fireworks_forwards_standard_sampling_parameters_unchanged() {
+        let mut request =
+            ChatCompletionRequest::new("accounts/fireworks/models/glm-5p2", Vec::new());
+        request.temperature = Some(0.7);
+        request.top_p = Some(0.95);
+        provider_adapter(ModelProvider::Fireworks).sanitize_chat_request(&mut request);
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, Some(0.95));
     }
 
     #[test]

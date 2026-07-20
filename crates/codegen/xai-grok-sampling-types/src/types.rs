@@ -1071,6 +1071,8 @@ pub enum ModelProvider {
     Codex,
     #[serde(alias = "moonshot", alias = "moonshot_ai")]
     Kimi,
+    #[serde(alias = "fireworks_ai")]
+    Fireworks,
 }
 
 /// Provider-specific wire contract used by the Responses API.
@@ -1322,6 +1324,25 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
+    /// Fireworks AI's OpenAI-compatible inference API. Like Kimi, Fireworks
+    /// uses ordinary client-side function tools over Chat Completions and has
+    /// no application-managed login; models authenticate with a provider API
+    /// key only.
+    pub const FIREWORKS: Self = Self {
+        provider: ModelProvider::Fireworks,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: None,
+            messages: false,
+        },
+        code_mode_transport: CodeModeTransport::Unsupported,
+        hosted_tool_dialect: None,
+        native_web_search: false,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
     pub const fn id(self) -> &'static str {
         self.provider.as_str()
     }
@@ -1340,6 +1361,10 @@ impl ProviderProfile {
 
     pub const fn is_kimi(self) -> bool {
         self.provider.is_kimi()
+    }
+
+    pub const fn is_fireworks(self) -> bool {
+        self.provider.is_fireworks()
     }
 
     pub const fn allows_xai_services(self) -> bool {
@@ -1366,6 +1391,7 @@ impl ModelProvider {
             Self::Xai => "xai",
             Self::Codex => "codex",
             Self::Kimi => "kimi",
+            Self::Fireworks => "fireworks",
         }
     }
 
@@ -1375,6 +1401,7 @@ impl ModelProvider {
             Self::Xai => "xAI",
             Self::Codex => "OpenAI Codex",
             Self::Kimi => "Kimi",
+            Self::Fireworks => "Fireworks AI",
         }
     }
 
@@ -1390,12 +1417,17 @@ impl ModelProvider {
         matches!(self, Self::Kimi)
     }
 
+    pub const fn is_fireworks(self) -> bool {
+        matches!(self, Self::Fireworks)
+    }
+
     /// Return the built-in provider's complete behavior policy.
     pub const fn profile(self) -> ProviderProfile {
         match self {
             Self::Xai => ProviderProfile::XAI,
             Self::Codex => ProviderProfile::CODEX,
             Self::Kimi => ProviderProfile::KIMI,
+            Self::Fireworks => ProviderProfile::FIREWORKS,
         }
     }
 }
@@ -1685,6 +1717,22 @@ mod tests {
                 session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
                 xai_services: XaiServicePolicy::Denied,
             },
+            Case {
+                provider: ModelProvider::Fireworks,
+                id: "fireworks",
+                name: "Fireworks AI",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: None,
+                    messages: false,
+                },
+                code_mode_transport: CodeModeTransport::Unsupported,
+                hosted_tools: None,
+                native_web_search: false,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
         ];
 
         for case in cases {
@@ -1703,6 +1751,7 @@ mod tests {
             assert_eq!(profile.is_xai(), case.provider.is_xai());
             assert_eq!(profile.is_codex(), case.provider.is_codex());
             assert_eq!(profile.is_kimi(), case.provider.is_kimi());
+            assert_eq!(profile.is_fireworks(), case.provider.is_fireworks());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
             for backend in [
                 ApiBackend::ChatCompletions,
