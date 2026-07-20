@@ -2068,7 +2068,9 @@ impl SessionActor {
             tool_mode,
             model_provider,
             &api_backend,
-            self.rebuild_spec.web_search_state().config.is_perplexity(),
+            self.rebuild_spec
+                .web_search_state()
+                .native_hosted_web_search_suppressed(model_provider),
         )
         .map_err(|error| acp::Error::internal_error().data(error))?;
         if !base_tool_surface.reserved_name_collisions.is_empty() {

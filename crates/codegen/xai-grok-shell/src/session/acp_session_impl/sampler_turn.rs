@@ -339,6 +339,12 @@ impl SessionActor {
         if tool_name == "web_search" {
             return web_search.allowed_for_provider(provider);
         }
+        if tool_name == "x_search" {
+            // The client x_search tool serves non-xAI providers; xAI sessions
+            // keep the provider-hosted X search declaration instead, so the
+            // two never coexist on one request.
+            return !provider.profile().allows_xai_services();
+        }
         if provider.profile().allows_xai_services() {
             return true;
         }

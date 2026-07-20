@@ -517,12 +517,16 @@ pub(crate) async fn spawn_session_actor(
             (0, Vec::new(), Vec::new())
         };
     let primary_model_id = sampling_config.model.clone();
-    let implicit_local_web_search = web_search_config.is_implicit_default;
-    let web_search_config = if disable_web_search {
-        xai_grok_tools::implementations::WebSearchConfig::Disabled
-    } else {
-        web_search_config.config
-    };
+    // Resolve the client web-search backend for the spawn model's provider;
+    // the candidates stay on the state so a model switch can re-resolve.
+    let web_search_state = crate::session::agent_rebuild::ResolvedWebSearchState::resolved_for(
+        if disable_web_search {
+            crate::tools::config::WebSearchCandidates::disabled()
+        } else {
+            web_search_config.candidates
+        },
+        sampling_config.provider,
+    );
     // Memory embeddings are an independent xAI helper path. A Codex session
     // must never send its ChatGPT bearer or backend URL to the embeddings API,
     // but may use xAI credentials when the user has both providers connected.
@@ -1076,12 +1080,8 @@ pub(crate) async fn spawn_session_actor(
             .as_ref()
             .map(|s| s.workspace_memory_file().to_string_lossy().into_owned()),
         memory_backend: memory_backend_for_spec,
-        web_search: parking_lot::RwLock::new(
-            crate::session::agent_rebuild::ResolvedWebSearchState {
-                config: web_search_config.clone(),
-                implicit_local_web_search,
-            },
-        ),
+        web_search: parking_lot::RwLock::new(web_search_state.clone()),
+        x_search_enabled: crate::util::config::load_x_search_config_sync().enabled,
         backend_search: backend_tools_enabled,
         web_fetch_config: web_fetch_config.clone(),
         image_gen_config: image_gen_config.clone(),

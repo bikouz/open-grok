@@ -204,7 +204,7 @@ impl EffectiveToolSurface {
         tool_mode: ToolMode,
         provider: ModelProvider,
         backend: &ApiBackend,
-        perplexity_web_search: bool,
+        suppress_native_web_search: bool,
     ) -> Result<Self, String> {
         let code_mode_transport = resolve_code_mode_transport(tool_mode, provider, backend)?;
         let code_mode_only = tool_mode == ToolMode::CodeModeOnly;
@@ -213,6 +213,14 @@ impl EffectiveToolSurface {
             tool_mode,
             provider,
         );
+        // A non-native web-search source was selected (and resolved) for this
+        // provider: drop the provider's native hosted declaration so the
+        // client `web_search` tool is the one the model sees.
+        if suppress_native_web_search {
+            hosted_tools.retain(|tool| {
+                !matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. })
+            });
+        }
         let mut reserved_name_collisions = Vec::new();
 
         if let Some(transport) = code_mode_transport {
@@ -237,7 +245,6 @@ impl EffectiveToolSurface {
                     nested_definitions,
                     provider,
                     &hosted_tools,
-                    perplexity_web_search,
                 );
             match transport {
                 CodeModeTransport::NativeCustomGrammar => {

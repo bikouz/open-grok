@@ -3554,9 +3554,12 @@ impl acp::Agent for MvpAgent {
                     .perplexity_web_search
                     .enabled = enabled;
                 let prepared = self.prepare_web_search_config();
+                // The active config is provisional here; each session
+                // re-resolves it for its own provider when applying the
+                // reload (`resolve_active` in the session handler).
                 let state = crate::session::agent_rebuild::ResolvedWebSearchState {
-                    config: prepared.config,
-                    implicit_local_web_search: prepared.is_implicit_default,
+                    config: xai_grok_tools::implementations::WebSearchConfig::Disabled,
+                    candidates: prepared.candidates,
                 };
                 let sessions = self
                     .sessions

@@ -75,19 +75,51 @@ pub(crate) struct ResolvedToolParamsJson {
 
 #[derive(Clone)]
 pub struct ResolvedWebSearchState {
+    /// The client `web_search` backend registered for the session's CURRENT
+    /// provider. Re-resolved via [`Self::resolve_active`] at the seams where
+    /// the provider is known: session spawn, model switch, toolset reload.
     pub config: WebSearchConfig,
-    pub implicit_local_web_search: bool,
+    /// Candidate backends plus the persisted per-provider source selection,
+    /// so a provider change can re-resolve locally.
+    pub candidates: crate::tools::config::WebSearchCandidates,
 }
 
 impl ResolvedWebSearchState {
+    /// State whose active config is resolved for `provider`.
+    pub(crate) fn resolved_for(
+        candidates: crate::tools::config::WebSearchCandidates,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> Self {
+        let config = candidates.resolved_config_for(provider);
+        Self { config, candidates }
+    }
+
+    /// Re-resolve the active config for `provider` in place.
+    pub(crate) fn resolve_active(&mut self, provider: xai_grok_sampling_types::ModelProvider) {
+        self.config = self.candidates.resolved_config_for(provider);
+    }
+
+    /// Whether the client `web_search` tool is model-visible for `provider`.
+    /// Resolved from the candidates so a mid-transition stale `config` can
+    /// never leak a backend across a provider boundary.
     pub(crate) fn allowed_for_provider(
         &self,
         provider: xai_grok_sampling_types::ModelProvider,
     ) -> bool {
-        if self.config.is_perplexity() {
-            return !provider.profile().has_native_web_search();
-        }
-        provider.profile().allows_xai_services() || !self.implicit_local_web_search
+        !matches!(
+            self.candidates.resolved_config_for(provider),
+            WebSearchConfig::Disabled
+        )
+    }
+
+    /// Whether the local search replaces the provider's native hosted
+    /// declaration (Codex with a non-native source that resolved).
+    pub(crate) fn native_hosted_web_search_suppressed(
+        &self,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> bool {
+        self.candidates
+            .native_hosted_web_search_suppressed(provider)
     }
 }
 /// Cached recipe for building a session-scoped [`Agent`].
@@ -117,6 +149,11 @@ pub(crate) struct AgentRebuildSpec {
     pub memory_workspace_path: Option<String>,
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
     pub web_search: parking_lot::RwLock<ResolvedWebSearchState>,
+    /// `[toolset.x_search].enabled` at spawn. The client x_search tool is
+    /// registered when this is set AND the xAI candidate resolved (signed
+    /// in); per-turn provider filtering keeps it off xAI requests, which use
+    /// the hosted declaration instead.
+    pub x_search_enabled: bool,
     pub backend_search: bool,
     pub web_fetch_config: WebFetchConfig,
     pub image_gen_config: ImageGenConfig,
@@ -226,6 +263,7 @@ impl AgentRebuildSpec {
             memory_workspace_path,
             memory_backend,
             web_search,
+            x_search_enabled,
             backend_search,
             web_fetch_config,
             image_gen_config,
@@ -283,6 +321,11 @@ impl AgentRebuildSpec {
         .with_session_env(session_env.clone())
         .with_state_path(bridge_state_path.clone())
         .with_web_search_config(web_search_config)
+        .with_x_search_config(if *x_search_enabled {
+            web_search.read().candidates.xai.clone()
+        } else {
+            xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled
+        })
         .with_backend_search(*backend_search)
         .with_image_gen_config(image_gen_config.clone())
         .with_video_gen_config(video_gen_config.clone())
@@ -441,10 +484,11 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_global_path: None,
         memory_workspace_path: None,
         memory_backend: None,
-        web_search: parking_lot::RwLock::new(ResolvedWebSearchState {
-            config: WebSearchConfig::default(),
-            implicit_local_web_search: false,
-        }),
+        web_search: parking_lot::RwLock::new(ResolvedWebSearchState::resolved_for(
+            crate::tools::config::WebSearchCandidates::disabled(),
+            xai_grok_sampling_types::ModelProvider::default(),
+        )),
+        x_search_enabled: false,
         backend_search: false,
         web_fetch_config: WebFetchConfig::Disabled,
         image_gen_config: ImageGenConfig::default(),
@@ -488,32 +532,176 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn perplexity_search_is_kimi_only_while_responses_compatibility_is_preserved() {
-        let perplexity = ResolvedWebSearchState {
-            config: WebSearchConfig::Perplexity {
-                api_key: "secret".to_owned(),
-                base_url: "https://api.perplexity.ai".to_owned(),
-            },
-            implicit_local_web_search: false,
-        };
-        assert!(!perplexity.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Xai));
-        assert!(!perplexity.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Codex));
-        assert!(perplexity.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Kimi));
+    use crate::tools::config::{WebSearchCandidates, WebSearchSource, WebSearchSourceConfig};
+    use xai_grok_sampling_types::ModelProvider;
 
-        let implicit_responses = ResolvedWebSearchState {
-            config: WebSearchConfig::default(),
-            implicit_local_web_search: true,
-        };
-        assert!(
-            implicit_responses.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Xai)
+    fn xai_enabled_config() -> WebSearchConfig {
+        WebSearchConfig::Enabled {
+            api_key: "xai-key".to_owned(),
+            base_url: "https://api.x.ai/v1".to_owned(),
+            model: "grok".to_owned(),
+            extra_headers: Default::default(),
+            alpha_test_key: None,
+        }
+    }
+
+    fn perplexity_config() -> WebSearchConfig {
+        WebSearchConfig::Perplexity {
+            api_key: "secret".to_owned(),
+            base_url: "https://api.perplexity.ai".to_owned(),
+        }
+    }
+
+    fn candidates(
+        xai: WebSearchConfig,
+        perplexity: Option<WebSearchConfig>,
+        source: WebSearchSourceConfig,
+        legacy_perplexity_enabled: bool,
+        implicit_xai_default: bool,
+    ) -> WebSearchCandidates {
+        WebSearchCandidates {
+            xai,
+            perplexity,
+            source,
+            legacy_perplexity_enabled,
+            kimi_endpoint: crate::kimi_models::KimiApiEndpoint::Platform,
+            implicit_xai_default,
+        }
+    }
+
+    fn state(candidates: WebSearchCandidates) -> ResolvedWebSearchState {
+        ResolvedWebSearchState::resolved_for(candidates, ModelProvider::default())
+    }
+
+    /// Defaults with xAI signed in: xAI and Kimi ride the xAI client search,
+    /// Codex keeps its native declaration (no client tool).
+    #[test]
+    fn default_sources_route_xai_search_to_xai_and_kimi_only() {
+        let s = state(candidates(
+            xai_enabled_config(),
+            None,
+            WebSearchSourceConfig::default(),
+            false,
+            true,
+        ));
+        assert!(s.allowed_for_provider(ModelProvider::Xai));
+        assert!(!s.allowed_for_provider(ModelProvider::Codex));
+        assert!(s.allowed_for_provider(ModelProvider::Kimi));
+        assert!(!s.native_hosted_web_search_suppressed(ModelProvider::Codex));
+    }
+
+    /// Neither xAI nor Perplexity available: every provider falls back to
+    /// no client search (Kimi gets "none" per the sign-in fallback).
+    #[test]
+    fn no_credentials_resolves_to_none_everywhere() {
+        let s = state(candidates(
+            WebSearchConfig::Disabled,
+            None,
+            WebSearchSourceConfig::default(),
+            false,
+            true,
+        ));
+        for provider in [
+            ModelProvider::Xai,
+            ModelProvider::Codex,
+            ModelProvider::Kimi,
+        ] {
+            assert!(!s.allowed_for_provider(provider), "{provider:?}");
+        }
+    }
+
+    /// The legacy `[toolset.perplexity_web_search]` toggle keeps acting as
+    /// the Kimi default; xAI stays on its own search.
+    #[test]
+    fn legacy_perplexity_toggle_defaults_kimi_to_perplexity() {
+        let s = state(candidates(
+            xai_enabled_config(),
+            Some(perplexity_config()),
+            WebSearchSourceConfig::default(),
+            true,
+            true,
+        ));
+        assert!(matches!(
+            s.candidates.resolved_config_for(ModelProvider::Kimi),
+            WebSearchConfig::Perplexity { .. }
+        ));
+        assert!(matches!(
+            s.candidates.resolved_config_for(ModelProvider::Xai),
+            WebSearchConfig::Enabled { .. }
+        ));
+        assert!(!s.allowed_for_provider(ModelProvider::Codex));
+    }
+
+    /// Explicit Codex sources: a resolvable non-native source suppresses the
+    /// native hosted declaration; an unresolvable one leaves it in place.
+    #[test]
+    fn explicit_codex_source_controls_native_suppression() {
+        let xai_selected = state(candidates(
+            xai_enabled_config(),
+            None,
+            WebSearchSourceConfig {
+                codex: Some(WebSearchSource::Xai),
+                ..Default::default()
+            },
+            false,
+            true,
+        ));
+        assert!(xai_selected.allowed_for_provider(ModelProvider::Codex));
+        assert!(xai_selected.native_hosted_web_search_suppressed(ModelProvider::Codex));
+
+        let perplexity_without_key = state(candidates(
+            xai_enabled_config(),
+            None,
+            WebSearchSourceConfig {
+                codex: Some(WebSearchSource::Perplexity),
+                ..Default::default()
+            },
+            false,
+            true,
+        ));
+        assert!(!perplexity_without_key.allowed_for_provider(ModelProvider::Codex));
+        assert!(!perplexity_without_key.native_hosted_web_search_suppressed(ModelProvider::Codex));
+    }
+
+    /// Legacy rule preserved: an explicitly configured web-search model
+    /// (non-implicit) opts Codex into the xAI client search by default.
+    #[test]
+    fn explicit_web_search_model_still_reaches_codex_by_default() {
+        let s = state(candidates(
+            xai_enabled_config(),
+            None,
+            WebSearchSourceConfig::default(),
+            false,
+            false,
+        ));
+        assert!(s.allowed_for_provider(ModelProvider::Codex));
+        assert!(s.native_hosted_web_search_suppressed(ModelProvider::Codex));
+    }
+
+    /// Kimi Platform and Kimi Code resolve independently.
+    #[test]
+    fn kimi_endpoints_resolve_independently() {
+        let mut c = candidates(
+            xai_enabled_config(),
+            Some(perplexity_config()),
+            WebSearchSourceConfig {
+                kimi_code: Some(WebSearchSource::Perplexity),
+                ..Default::default()
+            },
+            false,
+            true,
         );
-        assert!(
-            !implicit_responses.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Codex)
-        );
-        assert!(
-            !implicit_responses.allowed_for_provider(xai_grok_sampling_types::ModelProvider::Kimi)
-        );
+        // Platform endpoint: kimi_platform default (xAI).
+        assert!(matches!(
+            c.resolved_config_for(ModelProvider::Kimi),
+            WebSearchConfig::Enabled { .. }
+        ));
+        // Code endpoint: explicit Perplexity selection.
+        c.kimi_endpoint = crate::kimi_models::KimiApiEndpoint::Code;
+        assert!(matches!(
+            c.resolved_config_for(ModelProvider::Kimi),
+            WebSearchConfig::Perplexity { .. }
+        ));
     }
     use crate::agent::config::{EndpointsConfig, ModelEntry};
     fn model_entry(internal_id: &str) -> ModelEntry {

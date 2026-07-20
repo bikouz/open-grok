@@ -361,7 +361,9 @@ impl SessionActor {
             tool_mode,
             sampling_config.provider,
             &sampling_config.api_backend,
-            self.rebuild_spec.web_search_state().config.is_perplexity(),
+            self.rebuild_spec
+                .web_search_state()
+                .native_hosted_web_search_suppressed(sampling_config.provider),
         ) {
             Ok(surface) => surface,
             Err(error) => {
@@ -1504,7 +1506,9 @@ impl SessionActor {
             tool_mode,
             sampling_config.provider,
             &sampling_config.api_backend,
-            self.rebuild_spec.web_search_state().config.is_perplexity(),
+            self.rebuild_spec
+                .web_search_state()
+                .native_hosted_web_search_suppressed(sampling_config.provider),
         )
         .map_err(|error| acp::Error::internal_error().data(error))?;
         let compaction_tool_tokens = compaction_surface.estimated_definition_tokens();

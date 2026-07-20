@@ -88,10 +88,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         )),
         session_env: Arc::new(HashMap::new()),
         memory_config: None,
-        web_search_config: crate::agent::config::PreparedWebSearchConfig {
-            config: Default::default(),
-            is_implicit_default: false,
-        },
+        web_search_config: crate::agent::config::PreparedWebSearchConfig::disabled(),
         web_fetch_config: Default::default(),
         image_gen_config: Default::default(),
         video_gen_config: Default::default(),

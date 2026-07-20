@@ -1351,36 +1351,31 @@ impl MvpAgent {
         }
     }
     pub(super) fn prepare_web_search_config(&self) -> config::PreparedWebSearchConfig {
-        let cfg = self.cfg.borrow();
-        if cfg.disable_web_search {
-            return config::PreparedWebSearchConfig {
-                config: xai_grok_tools::implementations::WebSearchConfig::Disabled,
-                is_implicit_default: false,
-            };
+        if self.cfg.borrow().disable_web_search {
+            return config::PreparedWebSearchConfig::disabled();
         }
-        if cfg.toolset.perplexity_web_search.enabled {
-            let grok_home = xai_grok_tools::util::grok_home::grok_home();
-            if let Some(api_key) = crate::auth::read_perplexity_api_key(&grok_home) {
-                return config::PreparedWebSearchConfig {
-                    config: xai_grok_tools::implementations::WebSearchConfig::Perplexity {
-                        api_key,
-                        base_url: xai_grok_tools::implementations::web_search::PERPLEXITY_SEARCH_API_BASE_URL
-                            .to_owned(),
-                    },
-                    is_implicit_default: false,
-                };
+        let legacy_perplexity_enabled = self.cfg.borrow().toolset.perplexity_web_search.enabled;
+
+        // Perplexity candidate: available whenever the key is stored — the
+        // per-provider source selection decides whether it is used.
+        let grok_home = xai_grok_tools::util::grok_home::grok_home();
+        let perplexity = crate::auth::read_perplexity_api_key(&grok_home).map(|api_key| {
+            xai_grok_tools::implementations::WebSearchConfig::Perplexity {
+                api_key,
+                base_url:
+                    xai_grok_tools::implementations::web_search::PERPLEXITY_SEARCH_API_BASE_URL
+                        .to_owned(),
             }
-            return config::PreparedWebSearchConfig {
-                config: xai_grok_tools::implementations::WebSearchConfig::Disabled,
-                is_implicit_default: false,
-            };
-        }
+        });
+
+        // xAI candidate: the Responses-backed client tool. Not a provider
+        // server tool, so it can be handed to any model when selected.
         let model_id = self.cfg.borrow().web_search_model.clone();
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
         let alpha_test_key = self.cfg.borrow().endpoints.alpha_test_key.clone();
         let client_version = self.cfg.borrow().client_version.clone();
-        let Some(mut resolved) = config::resolve_web_search_sampling_config(
+        let xai = config::resolve_web_search_sampling_config(
             &model_id,
             &models,
             session.as_ref().map(|a| a.key.as_str()),
@@ -1388,31 +1383,37 @@ impl MvpAgent {
             alpha_test_key.clone(),
             client_version,
             &self.cfg.borrow().endpoints,
-        ) else {
-            return config::PreparedWebSearchConfig {
-                config: xai_grok_tools::implementations::WebSearchConfig::Disabled,
-                is_implicit_default: false,
-            };
-        };
-        inject_proxy_headers(
-            &mut resolved.extra_headers,
-            resolved.client_version.as_deref(),
-            alpha_test_key.as_deref(),
-            &resolved.base_url,
-        );
-        let config = match resolved.api_key {
-            Some(api_key) => xai_grok_tools::implementations::WebSearchConfig::Enabled {
-                api_key,
-                base_url: resolved.base_url,
-                model: resolved.model,
-                extra_headers: resolved.extra_headers,
-                alpha_test_key: alpha_test_key.clone(),
-            },
-            None => xai_grok_tools::implementations::WebSearchConfig::Disabled,
-        };
+        )
+        .and_then(|mut resolved| {
+            inject_proxy_headers(
+                &mut resolved.extra_headers,
+                resolved.client_version.as_deref(),
+                alpha_test_key.as_deref(),
+                &resolved.base_url,
+            );
+            resolved.api_key.map(|api_key| {
+                xai_grok_tools::implementations::WebSearchConfig::Enabled {
+                    api_key,
+                    base_url: resolved.base_url,
+                    model: resolved.model,
+                    extra_headers: resolved.extra_headers,
+                    alpha_test_key: alpha_test_key.clone(),
+                }
+            })
+        })
+        .unwrap_or(xai_grok_tools::implementations::WebSearchConfig::Disabled);
+
         config::PreparedWebSearchConfig {
-            config,
-            is_implicit_default: model_id == crate::models::default_web_search_model(),
+            candidates: crate::tools::config::WebSearchCandidates {
+                xai,
+                perplexity,
+                // Read fresh from disk so Settings changes reach new sessions
+                // without a process restart.
+                source: crate::util::config::load_web_search_source_sync(),
+                legacy_perplexity_enabled,
+                kimi_endpoint: self.models_manager.effective_kimi_endpoint(),
+                implicit_xai_default: model_id == crate::models::default_web_search_model(),
+            },
         }
     }
     /// Returns `Err` with a user-facing message on invalid config; the caller at

@@ -24,21 +24,22 @@ fn code_mode_runtime_reset_required(
 }
 
 impl SessionActor {
-    async fn current_provider_has_native_web_search(&self) -> bool {
+    async fn current_provider(&self) -> xai_grok_sampling_types::ModelProvider {
         self.chat_state_handle
             .get_sampling_config()
             .await
-            .is_some_and(|config| config.provider.profile().has_native_web_search())
+            .map(|config| config.provider)
+            .unwrap_or_default()
     }
 
     async fn apply_web_search_toolset_state(
         &self,
-        state: crate::session::agent_rebuild::ResolvedWebSearchState,
+        mut state: crate::session::agent_rebuild::ResolvedWebSearchState,
     ) -> Result<(), acp::Error> {
+        // The reload broadcast carries provider-agnostic candidates; the
+        // active backend is this session's per-provider resolution.
+        state.resolve_active(self.current_provider().await);
         let previous = self.rebuild_spec.replace_web_search_state(state);
-        if self.current_provider_has_native_web_search().await {
-            return Ok(());
-        }
         let definition = self.agent.borrow().definition().clone();
         let tool_mode = self.agent.borrow().tool_mode();
         match self.build_agent_for_definition(definition, tool_mode).await {
@@ -70,12 +71,8 @@ impl SessionActor {
         state: crate::session::agent_rebuild::ResolvedWebSearchState,
         responds_to: tokio::sync::oneshot::Sender<Result<(), acp::Error>>,
     ) {
-        if self.current_provider_has_native_web_search().await {
-            self.rebuild_spec.replace_web_search_state(state);
-            let _ = responds_to.send(Ok(()));
-            return;
-        }
-
+        // Every provider is source-selectable now, so every reload goes
+        // through the rebuild path (no native-search fast path).
         let request = crate::session::PendingWebSearchReload { state, responds_to };
         let request = {
             let mut actor_state = self.state.lock().await;
@@ -222,16 +219,35 @@ impl SessionActor {
             )
             .map_err(|error| acp::Error::invalid_request().data(error))?;
         let effective_tool_mode = resolved_tool_policy.resolved.mode;
+        // Re-resolve the client web-search backend for the incoming provider
+        // so a staged agent registers the source selected for it in
+        // `[toolset.web_search_source]` (e.g. Kimi→Codex must not carry a
+        // Perplexity backend across the boundary). Swapped back if the staged
+        // build below fails and the session stays on the previous provider.
+        let web_search_previous = (previous_provider != sampling_config.provider).then(|| {
+            let mut state = self.rebuild_spec.web_search_state();
+            state.resolve_active(sampling_config.provider);
+            self.rebuild_spec.replace_web_search_state(state)
+        });
         // Build a replacement harness to completion before invalidating the
         // live JavaScript timeline. Agent construction is the fallible part of
         // a harness switch; staging it here keeps a failed model switch from
         // resetting an otherwise unchanged Code Mode session.
         let prepared_agent_rebuild = match agent_rebuild {
-            Some((definition, preserve_history)) => Some((
-                self.build_agent_for_definition(*definition, effective_tool_mode)
-                    .await?,
-                preserve_history,
-            )),
+            Some((definition, preserve_history)) => {
+                match self
+                    .build_agent_for_definition(*definition, effective_tool_mode)
+                    .await
+                {
+                    Ok(agent) => Some((agent, preserve_history)),
+                    Err(error) => {
+                        if let Some(previous) = web_search_previous {
+                            self.rebuild_spec.replace_web_search_state(previous);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
             None => None,
         };
 

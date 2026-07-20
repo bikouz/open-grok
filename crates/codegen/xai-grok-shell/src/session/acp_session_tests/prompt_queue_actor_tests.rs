@@ -156,11 +156,10 @@ async fn web_search_reload_waits_for_an_active_kimi_turn() {
             let (responds_to, mut response) = tokio::sync::oneshot::channel();
             actor
                 .handle_reload_web_search_toolset(
-                    crate::session::agent_rebuild::ResolvedWebSearchState {
-                        config:
-                            xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled,
-                        implicit_local_web_search: false,
-                    },
+                    crate::session::agent_rebuild::ResolvedWebSearchState::resolved_for(
+                        crate::tools::config::WebSearchCandidates::disabled(),
+                        xai_grok_sampling_types::ModelProvider::default(),
+                    ),
                     responds_to,
                 )
                 .await;

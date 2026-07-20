@@ -104,25 +104,21 @@ pub(crate) fn hosted_tools_for_code_mode(
 }
 
 /// Avoid advertising a provider-hosted web search a second time inside the
-/// Code Mode `exec` tool.
+/// Code Mode `exec` tool. When the hosted declaration was suppressed in
+/// favour of a client source (`[toolset.web_search_source]`), the hosted
+/// list has no web search and the nested client tool is kept.
 pub(crate) fn nested_tool_definitions_for_provider(
     definitions: &[GrokToolDefinition],
     provider: xai_grok_sampling_types::ModelProvider,
     hosted_tools: &[xai_grok_sampling_types::HostedTool],
-    perplexity_web_search: bool,
 ) -> Vec<GrokToolDefinition> {
+    let _ = provider;
     let has_hosted_web = hosted_tools
         .iter()
         .any(|tool| matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }));
     definitions
         .iter()
-        .filter(|definition| {
-            if definition.function.name != "web_search" {
-                return true;
-            }
-            !has_hosted_web
-                && !(perplexity_web_search && provider.profile().has_native_web_search())
-        })
+        .filter(|definition| definition.function.name != "web_search" || !has_hosted_web)
         .cloned()
         .collect()
 }
@@ -858,6 +854,24 @@ pub(crate) fn to_code_mode_tool_definition(
     }
 }
 
+/// Nested tools omitted from the `exec` description but still bound on the
+/// JS `tools` object (the protocol's deferred-nested-tools slot). `x_search`
+/// is deferred: a niche capability that should not bloat every cell prompt,
+/// while staying one `ALL_TOOLS` lookup away.
+pub(crate) fn is_code_mode_deferred_tool(name: &str) -> bool {
+    name == "x_search"
+}
+
+/// Split collected nested definitions into (described, deferred) for the
+/// exec description builder. The runtime binding list is the full set.
+fn split_deferred_code_mode_tools(
+    definitions: Vec<CodeModeToolDefinition>,
+) -> (Vec<CodeModeToolDefinition>, Vec<CodeModeToolDefinition>) {
+    definitions
+        .into_iter()
+        .partition(|definition| !is_code_mode_deferred_tool(&definition.tool_name.name))
+}
+
 pub(crate) fn collect_code_mode_tool_definitions(
     definitions: &[GrokToolDefinition],
 ) -> Vec<CodeModeToolDefinition> {
@@ -879,12 +893,13 @@ pub(crate) fn create_exec_tool(
     enabled_tools: &[GrokToolDefinition],
     code_mode_only: bool,
 ) -> ClientTool {
-    let enabled_tools = collect_code_mode_tool_definitions(enabled_tools);
+    let (described_tools, deferred_tools) =
+        split_deferred_code_mode_tools(collect_code_mode_tool_definitions(enabled_tools));
     ClientTool::Custom {
         name: xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME.to_string(),
         description: Some(xai_grok_code_mode_protocol::build_exec_tool_description(
-            &enabled_tools,
-            &[],
+            &described_tools,
+            &deferred_tools,
             &BTreeMap::new(),
             code_mode_only,
         )),
@@ -902,10 +917,11 @@ pub(crate) fn create_exec_function_tool(
     enabled_tools: &[GrokToolDefinition],
     code_mode_only: bool,
 ) -> ToolSpec {
-    let enabled_tools = collect_code_mode_tool_definitions(enabled_tools);
+    let (described_tools, deferred_tools) =
+        split_deferred_code_mode_tools(collect_code_mode_tool_definitions(enabled_tools));
     let native_description = xai_grok_code_mode_protocol::build_exec_tool_description(
-        &enabled_tools,
-        &[],
+        &described_tools,
+        &deferred_tools,
         &BTreeMap::new(),
         code_mode_only,
     );
@@ -1557,7 +1573,6 @@ mod tests {
             &definitions,
             xai_grok_sampling_types::ModelProvider::Codex,
             &effective_hosted,
-            false,
         );
         assert_eq!(
             nested
@@ -1566,6 +1581,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["read_file"]
         );
+    }
+
+    /// `x_search` is a deferred nested tool: bound on the JS `tools` object
+    /// (part of the collected definitions handed to the runtime) but omitted
+    /// from the exec description, which instead carries the deferred-tools
+    /// guidance line. Without `x_search` present, no guidance is emitted.
+    #[test]
+    fn x_search_is_deferred_in_exec_description() {
+        let definitions = vec![
+            GrokToolDefinition::function(
+                "x_search",
+                Some("Search X posts"),
+                json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+            ),
+            GrokToolDefinition::function(
+                "read_file",
+                Some("Read a file"),
+                json!({"type": "object"}),
+            ),
+        ];
+        assert!(is_code_mode_deferred_tool("x_search"));
+        assert!(!is_code_mode_deferred_tool("web_search"));
+
+        let ClientTool::Custom {
+            description: Some(description),
+            ..
+        } = create_exec_tool(&definitions, true)
+        else {
+            panic!("exec must be a custom tool with a description");
+        };
+        assert!(
+            description.contains("deferred nested tools"),
+            "deferred guidance must be present: {description:.300}"
+        );
+        assert!(
+            !description.contains("Search X posts"),
+            "deferred tool must not be described inline"
+        );
+        assert!(description.contains("Read a file"));
+
+        // The runtime binding list keeps the deferred tool callable.
+        let bound = collect_code_mode_tool_definitions(&definitions);
+        assert!(bound.iter().any(|d| d.tool_name.name == "x_search"));
+
+        let without_deferred = vec![GrokToolDefinition::function(
+            "read_file",
+            Some("Read a file"),
+            json!({"type": "object"}),
+        )];
+        let ClientTool::Custom {
+            description: Some(description),
+            ..
+        } = create_exec_tool(&without_deferred, true)
+        else {
+            panic!("exec must be a custom tool with a description");
+        };
+        assert!(!description.contains("deferred nested tools"));
     }
 
     #[test]
@@ -1605,7 +1677,6 @@ mod tests {
             &definitions,
             xai_grok_sampling_types::ModelProvider::Xai,
             &effective,
-            false,
         );
         assert_eq!(
             nested
@@ -1616,8 +1687,14 @@ mod tests {
         );
     }
 
+    /// The nested `web_search` definition dedups against a hosted web-search
+    /// declaration only. With no hosted declaration (backend search off, or
+    /// the native declaration suppressed by `[toolset.web_search_source]`),
+    /// the registered client tool is advertised for every provider — which
+    /// tools are registered at all is decided upstream by the per-provider
+    /// source resolution.
     #[test]
-    fn perplexity_nested_search_is_kimi_only() {
+    fn nested_web_search_dedups_against_hosted_only() {
         let definitions = vec![
             GrokToolDefinition::function(
                 "web_search",
@@ -1633,29 +1710,31 @@ mod tests {
         for provider in [
             xai_grok_sampling_types::ModelProvider::Xai,
             xai_grok_sampling_types::ModelProvider::Codex,
+            xai_grok_sampling_types::ModelProvider::Kimi,
         ] {
-            let nested = nested_tool_definitions_for_provider(&definitions, provider, &[], true);
+            let nested = nested_tool_definitions_for_provider(&definitions, provider, &[]);
             assert_eq!(
                 nested
                     .iter()
                     .map(|definition| definition.function.name.as_str())
                     .collect::<Vec<_>>(),
-                vec!["read_file"]
+                vec!["web_search", "read_file"],
+                "{provider:?} without hosted web search keeps the client tool"
+            );
+            let nested = nested_tool_definitions_for_provider(
+                &definitions,
+                provider,
+                &[xai_grok_sampling_types::HostedTool::web_search(None)],
+            );
+            assert_eq!(
+                nested
+                    .iter()
+                    .map(|definition| definition.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["read_file"],
+                "{provider:?} with hosted web search drops the duplicate"
             );
         }
-        let nested = nested_tool_definitions_for_provider(
-            &definitions,
-            xai_grok_sampling_types::ModelProvider::Kimi,
-            &[],
-            true,
-        );
-        assert_eq!(
-            nested
-                .iter()
-                .map(|definition| definition.function.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["web_search", "read_file"]
-        );
     }
 
     #[test]

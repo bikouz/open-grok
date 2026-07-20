@@ -5689,12 +5689,21 @@ pub fn resolve_web_search_sampling_config(
     resolved.map(crate::tools::config::web_search_sampling_config)
 }
 
-/// A resolved local web-search backend plus the provenance needed to enforce
-/// provider boundaries after an in-place model switch.
-#[derive(Clone)]
+/// The candidate local web-search backends plus the persisted per-provider
+/// source selection. Each session resolves the effective backend for its own
+/// provider via [`crate::tools::config::WebSearchCandidates::resolved_config_for`].
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedWebSearchConfig {
-    pub config: xai_grok_tools::implementations::web_search::WebSearchConfig,
-    pub is_implicit_default: bool,
+    pub candidates: crate::tools::config::WebSearchCandidates,
+}
+
+impl PreparedWebSearchConfig {
+    /// All-disabled preparation (master kill-switch and error paths).
+    pub(crate) fn disabled() -> Self {
+        Self {
+            candidates: crate::tools::config::WebSearchCandidates::disabled(),
+        }
+    }
 }
 
 pub fn to_acp_model_info(
