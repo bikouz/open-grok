@@ -6,7 +6,7 @@ use xai_grok_pager::acp::model_state::ModelState;
 use xai_grok_pager::slash::{SlashController, SlashState};
 
 #[test]
-fn login_argument_completion_lists_xai_codex_and_kimi() {
+fn login_argument_completion_lists_all_providers() {
     let mut controller = SlashController::with_builtins(PathBuf::from("."));
     let state = SlashState::default();
     let models = ModelState::default();
@@ -29,9 +29,11 @@ fn login_argument_completion_lists_xai_codex_and_kimi() {
             ("xAI Grok", "xai"),
             ("ChatGPT Codex", "codex"),
             ("Kimi", "kimi"),
+            ("Fireworks AI", "fireworks"),
         ]
     );
     assert!(snapshot.matches[2].description.contains("API key"));
+    assert!(snapshot.matches[3].description.contains("API key"));
 }
 
 #[test]

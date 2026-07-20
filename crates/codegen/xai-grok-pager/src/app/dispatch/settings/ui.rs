@@ -33,6 +33,19 @@ pub(in crate::app::dispatch) fn kimi_code_api_key_status() -> crate::settings::S
     kimi_api_key_status_for(xai_grok_shell::kimi_models::KimiApiEndpoint::Code)
 }
 
+pub(in crate::app::dispatch) fn fireworks_api_key_status() -> crate::settings::SecretStatus {
+    if xai_grok_shell::fireworks_models::environment_api_key_is_configured() {
+        crate::settings::SecretStatus::EnvironmentOverride
+    } else if xai_grok_shell::auth::provider_api_key_is_configured(
+        &xai_grok_tools::util::grok_home::grok_home(),
+        xai_grok_shell::sampling::types::ModelProvider::Fireworks,
+    ) {
+        crate::settings::SecretStatus::Stored
+    } else {
+        crate::settings::SecretStatus::Missing
+    }
+}
+
 pub(in crate::app::dispatch) fn perplexity_api_key_status() -> crate::settings::SecretStatus {
     if xai_grok_shell::auth::perplexity_api_key_is_configured(
         &xai_grok_tools::util::grok_home::grok_home(),
@@ -98,6 +111,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let memory_model_from_app = app.memory_model.clone();
     let kimi_api_key_status = kimi_api_key_status();
     let kimi_code_api_key_status = kimi_code_api_key_status();
+    let fireworks_api_key_status = fireworks_api_key_status();
     let perplexity_api_key_status = perplexity_api_key_status();
     let kimi_api_endpoint = app.kimi_api_endpoint.clone();
     let perplexity_web_search_enabled = app.perplexity_web_search_enabled;
@@ -133,6 +147,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 memory_model: memory_model_from_app.clone(),
                 kimi_api_key_status,
                 kimi_code_api_key_status,
+                fireworks_api_key_status,
                 perplexity_web_search_enabled,
                 web_search_source,
                 x_search_enabled,
@@ -233,6 +248,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
     let memory_model_from_app = app.memory_model.clone();
     let kimi_api_key_status = kimi_api_key_status();
     let kimi_code_api_key_status = kimi_code_api_key_status();
+    let fireworks_api_key_status = fireworks_api_key_status();
     let kimi_api_endpoint = app.kimi_api_endpoint.clone();
 
     let Some(agent) = app.agents.get_mut(&id) else {
@@ -270,6 +286,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
         memory_model: memory_model_from_app,
         kimi_api_key_status,
         kimi_code_api_key_status,
+        fireworks_api_key_status,
         perplexity_web_search_enabled: app.perplexity_web_search_enabled,
         web_search_source: xai_grok_shell::util::config::load_web_search_source_sync(),
         x_search_enabled: xai_grok_shell::util::config::load_x_search_config_sync().enabled,
@@ -315,6 +332,39 @@ pub(in crate::app::dispatch) fn dispatch_open_kimi_api_key_editor(
         tracing::error!(
             target: "settings",
             "Kimi endpoint or API-key settings are missing from the registry",
+        );
+        return vec![];
+    }
+    if let Some(agent) = get_visible_agent_mut(app) {
+        agent.active_modal = Some(ActiveModal::Settings {
+            state: Box::new(state),
+        });
+    } else if matches!(app.active_view, ActiveView::AgentDashboard)
+        && let Some(dashboard) = app.dashboard.as_mut()
+    {
+        dashboard.settings_modal = Some(Box::new(state));
+    }
+    vec![]
+}
+
+/// Open the zeroizing Fireworks AI credential editor as one focused login
+/// task. Agent views host it in `ActiveModal::Settings`; the session-less
+/// dashboard hosts the same state.
+pub(in crate::app::dispatch) fn dispatch_open_fireworks_api_key_editor(
+    app: &mut AppView,
+) -> Vec<Effect> {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalState;
+
+    let registry = app.settings_registry.clone();
+    let ui_snapshot = app.current_ui.clone();
+    let pager_snapshot = build_pager_snapshot(app);
+
+    let mut state = SettingsModalState::new(registry, ui_snapshot, pager_snapshot);
+    if !state.try_open_fireworks_provider_login() {
+        tracing::error!(
+            target: "settings",
+            "Fireworks API-key setting is missing from the registry",
         );
         return vec![];
     }
@@ -809,6 +859,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         memory_model: app.memory_model.clone(),
         kimi_api_key_status: kimi_api_key_status(),
         kimi_code_api_key_status: kimi_code_api_key_status(),
+        fireworks_api_key_status: fireworks_api_key_status(),
         perplexity_web_search_enabled: app.perplexity_web_search_enabled,
         web_search_source: xai_grok_shell::util::config::load_web_search_source_sync(),
         x_search_enabled: xai_grok_shell::util::config::load_x_search_config_sync().enabled,
@@ -842,7 +893,8 @@ pub(in crate::app::dispatch) fn action_for_reset(
             "toolset.web_search_source.xai"
             | "toolset.web_search_source.codex"
             | "toolset.web_search_source.kimi_platform"
-            | "toolset.web_search_source.kimi_code",
+            | "toolset.web_search_source.kimi_code"
+            | "toolset.web_search_source.fireworks",
             SettingValue::Enum(choice),
         ) => Some(Action::SetWebSearchSource { key, choice }),
         ("toolset.x_search.enabled", SettingValue::Bool(b)) => Some(Action::SetXSearchEnabled(*b)),
@@ -1062,6 +1114,10 @@ pub(in crate::app::dispatch) fn action_for_reset(
             endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
         }),
         (
+            "fireworks_api_key",
+            SettingValue::SecretStatus(crate::settings::SecretStatus::Missing),
+        ) => Some(Action::ClearFireworksApiKey),
+        (
             "perplexity_api_key",
             SettingValue::SecretStatus(crate::settings::SecretStatus::Missing),
         ) => Some(Action::ClearPerplexityApiKey),
@@ -1097,7 +1153,8 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
             "toolset.web_search_source.xai"
             | "toolset.web_search_source.codex"
             | "toolset.web_search_source.kimi_platform"
-            | "toolset.web_search_source.kimi_code",
+            | "toolset.web_search_source.kimi_code"
+            | "toolset.web_search_source.fireworks",
             SettingValue::Enum(_),
         )
         | ("toolset.x_search.enabled", SettingValue::Bool(_)) => {}

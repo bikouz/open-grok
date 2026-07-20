@@ -50,6 +50,13 @@ static LATEST_KIMI_ENDPOINT_SELECTION: AtomicU64 = AtomicU64::new(0);
 static LATEST_KIMI_ACTIVE_APPLY: AtomicU64 = AtomicU64::new(0);
 static LATEST_KIMI_PLATFORM_KEY: AtomicU64 = AtomicU64::new(0);
 static LATEST_KIMI_CODE_KEY: AtomicU64 = AtomicU64::new(0);
+/// Fireworks AI credential mutations share one serialized critical section,
+/// independent from the Kimi selector/key transactions.
+static FIREWORKS_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static FIREWORKS_MUTATION_QUEUE: LazyLock<KimiMutationQueue> =
+    LazyLock::new(KimiMutationQueue::new);
+static NEXT_FIREWORKS_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
+static LATEST_FIREWORKS_KEY: AtomicU64 = AtomicU64::new(0);
 
 /// Admission queue for Kimi mutations.
 ///
@@ -377,6 +384,45 @@ async fn apply_kimi_endpoint(
     })
 }
 
+fn next_fireworks_transport_token() -> u64 {
+    NEXT_FIREWORKS_TRANSPORT_TOKEN
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+}
+
+/// Ask the shell to live-apply the Fireworks AI credential change and rebuild
+/// its isolated model partition. Credential material never crosses ACP.
+struct FireworksModelsApply {
+    warning: Option<String>,
+    models: Option<acp::SessionModelState>,
+}
+
+async fn apply_fireworks_models(tx: &AcpAgentTx) -> Result<FireworksModelsApply, String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/fireworks/models/apply",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize Fireworks models apply params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("Fireworks models apply returned invalid JSON: {error}"))?;
+    let result = envelope.get("result").unwrap_or(&envelope);
+    let warning = result
+        .get("warning")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_user_error);
+    let models = result
+        .get("models")
+        .cloned()
+        .map(serde_json::from_value::<acp::SessionModelState>)
+        .transpose()
+        .map_err(|error| format!("Fireworks models apply returned an invalid catalog: {error}"))?;
+    Ok(FireworksModelsApply { warning, models })
+}
+
 fn persisted_perplexity_web_search_enabled(fallback: bool) -> bool {
     xai_grok_shell::config::load_from_disk()
         .ok()
@@ -422,6 +468,79 @@ pub(crate) fn execute(
     let mut meta = EffectMeta::default();
     let effect_is_send_now = matches!(effect, Effect::SendPromptNow { .. });
     match effect {
+        Effect::UpdateFireworksApiKey { generation, key } => {
+            let transport_token = next_fireworks_transport_token();
+            publish_kimi_transport_token(&LATEST_FIREWORKS_KEY, transport_token);
+            let mut mutation_ticket = FIREWORKS_MUTATION_QUEUE.enqueue();
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                mutation_ticket.wait_turn().await;
+                let configured = key.is_some();
+                let _guard = FIREWORKS_MUTATION_LOCK.lock().await;
+                if !is_latest_kimi_transport_token(&LATEST_FIREWORKS_KEY, transport_token) {
+                    return TaskResult::FireworksApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: true,
+                        warning: None,
+                        error: None,
+                        models: None,
+                    };
+                }
+                let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                let storage_result = match key.as_ref() {
+                    Some(secret) => xai_grok_shell::auth::store_provider_api_key(
+                        &grok_home,
+                        xai_grok_shell::sampling::types::ModelProvider::Fireworks,
+                        secret.expose(),
+                    ),
+                    None => xai_grok_shell::auth::clear_provider_api_key(
+                        &grok_home,
+                        xai_grok_shell::sampling::types::ModelProvider::Fireworks,
+                    ),
+                };
+                if let Err(error) = storage_result {
+                    return TaskResult::FireworksApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_FIREWORKS_KEY,
+                            transport_token,
+                        ),
+                        warning: None,
+                        error: Some(sanitize_user_error(&error.to_string())),
+                        models: None,
+                    };
+                }
+                // Credential persistence has begun; finish the live apply even
+                // if a newer token was published meanwhile. Its queued
+                // transaction will run next under the same lock.
+                match apply_fireworks_models(&tx).await {
+                    Ok(applied) => TaskResult::FireworksApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_FIREWORKS_KEY,
+                            transport_token,
+                        ),
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
+                    },
+                    Err(warning) => TaskResult::FireworksApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_FIREWORKS_KEY,
+                            transport_token,
+                        ),
+                        warning: Some(warning),
+                        error: None,
+                        models: None,
+                    },
+                }
+            });
+        }
         Effect::UpdatePerplexityWebSearch {
             enabled,
             generation,
@@ -2680,6 +2799,58 @@ pub(crate) fn execute(
                     effort,
                     generation,
                     effective_endpoint,
+                    result,
+                }
+            });
+        }
+        Effect::RebindFireworksModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let meta = effort
+                    .map(|eff| {
+                        use xai_grok_shell::sampling::types::{
+                            REASONING_EFFORT_META_KEY, reasoning_effort_meta_value,
+                        };
+                        let mut m = acp::Meta::new();
+                        m.insert(
+                            REASONING_EFFORT_META_KEY.to_string(),
+                            reasoning_effort_meta_value(eff),
+                        );
+                        m
+                    });
+                let req = acp::SetSessionModelRequest::new(
+                        session_id.clone(),
+                        model_id.clone(),
+                    )
+                    .meta(meta);
+                let result = acp_send(req, &tx)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        use xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError;
+                        if let Some(typed) =
+                            ModelSwitchIncompatibleAgentError::from_acp_error(&error)
+                        {
+                            SwitchModelError::IncompatibleAgent {
+                                error: typed,
+                                prev_model_id: None,
+                            }
+                        } else {
+                            SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                        }
+                    });
+                TaskResult::FireworksModelRebindComplete {
+                    agent_id,
+                    session_id,
+                    model_id,
+                    effort,
+                    generation,
                     result,
                 }
             });

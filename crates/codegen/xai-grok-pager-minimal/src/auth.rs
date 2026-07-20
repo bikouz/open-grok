@@ -264,6 +264,7 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
                 PrimaryProvider::Codex => "ChatGPT Codex",
                 PrimaryProvider::Xai => "xAI Grok",
                 PrimaryProvider::Kimi => "Kimi",
+                PrimaryProvider::Fireworks => "Fireworks AI",
             };
             y = put_line(
                 buf,

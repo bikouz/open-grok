@@ -414,6 +414,7 @@ pub enum PrimaryProvider {
     Xai,
     Codex,
     Kimi,
+    Fireworks,
 }
 
 pub const CODEX_STARTUP_MODEL_ID: &str = "gpt-5.6-sol";
@@ -431,6 +432,8 @@ impl PrimaryProvider {
             Some(Self::Xai)
         } else if provider.eq_ignore_ascii_case("kimi") {
             Some(Self::Kimi)
+        } else if provider.eq_ignore_ascii_case("fireworks") {
+            Some(Self::Fireworks)
         } else {
             None
         }
@@ -716,6 +719,17 @@ pub struct AppView {
     /// Loaded Kimi sessions awaiting a sampler rebuild for the selected
     /// service. Targets remain pending while that service has no credential.
     pub(crate) pending_kimi_rebind_agents: std::collections::HashSet<AgentId>,
+    /// Latest Fireworks AI settings/key operation. Async completions carry
+    /// this value so an older credential refresh cannot overwrite newer UI.
+    pub(crate) fireworks_operation_generation: u64,
+    /// A Fireworks credential persistence/catalog transaction has started but
+    /// its current completion has not yet been applied. Newly created
+    /// Fireworks tabs join the provider hold so startup cannot race onto an
+    /// old sampler.
+    pub(crate) fireworks_runtime_update_pending: bool,
+    /// Loaded Fireworks sessions awaiting a sampler rebuild. Targets remain
+    /// pending while the provider has no credential.
+    pub(crate) pending_fireworks_rebind_agents: std::collections::HashSet<AgentId>,
     /// Optimistic mirror of `[toolset.perplexity_web_search].enabled`.
     pub perplexity_web_search_enabled: bool,
     pub(crate) perplexity_web_search_generation: u64,
@@ -1290,6 +1304,17 @@ impl AppView {
         }
     }
 
+    pub(crate) fn cancel_pending_fireworks_rebind(&mut self, agent_id: AgentId) -> bool {
+        let removed = self.pending_fireworks_rebind_agents.remove(&agent_id);
+        if let Some(agent) = self.agents.get_mut(&agent_id) {
+            let was_pending = agent.session.provider_rebind_pending;
+            agent.session.provider_rebind_pending = false;
+            removed || was_pending
+        } else {
+            removed
+        }
+    }
+
     pub fn is_zdr_blocked(&self) -> bool {
         self.is_zdr && !self.zdr_access_enabled
     }
@@ -1308,10 +1333,11 @@ impl AppView {
             return false;
         }
         match provider {
-            PrimaryProvider::Codex | PrimaryProvider::Kimi => {
+            PrimaryProvider::Codex | PrimaryProvider::Kimi | PrimaryProvider::Fireworks => {
                 // Preserve the xAI snapshot only when crossing out of xAI.
-                // A Codex <-> Kimi transition sees already-cleared controls and
-                // must not overwrite the saved xAI state with that projection.
+                // A non-xAI <-> non-xAI transition sees already-cleared
+                // controls and must not overwrite the saved xAI state with
+                // that projection.
                 if self.primary_provider == PrimaryProvider::Xai {
                     self.remember_xai_access_controls();
                 }
@@ -1539,6 +1565,9 @@ impl AppView {
             kimi_active_operation_generation: 0,
             kimi_runtime_update_pending: false,
             pending_kimi_rebind_agents: Default::default(),
+            fireworks_operation_generation: 0,
+            fireworks_runtime_update_pending: false,
+            pending_fireworks_rebind_agents: Default::default(),
             perplexity_web_search_enabled: false,
             perplexity_web_search_generation: 0,
             perplexity_web_search_update_pending: false,
@@ -5781,6 +5810,9 @@ pub(crate) mod tests {
             kimi_active_operation_generation: 0,
             kimi_runtime_update_pending: false,
             pending_kimi_rebind_agents: Default::default(),
+            fireworks_operation_generation: 0,
+            fireworks_runtime_update_pending: false,
+            pending_fireworks_rebind_agents: Default::default(),
             perplexity_web_search_enabled: false,
             perplexity_web_search_generation: 0,
             perplexity_web_search_update_pending: false,

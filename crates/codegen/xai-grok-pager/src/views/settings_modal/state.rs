@@ -543,6 +543,12 @@ impl SettingsModalState {
         self.try_enter_picking_enum()
     }
 
+    /// Start the Fireworks AI provider-login flow directly at its zeroizing
+    /// secret editor (single service — no selector step).
+    pub fn try_open_fireworks_provider_login(&mut self) -> bool {
+        self.try_open_provider_login_secret("fireworks_api_key")
+    }
+
     /// Advance a focused Kimi login from its service selector to the matching
     /// credential editor while keeping the provider-login close semantics.
     pub(crate) fn advance_kimi_provider_login_to_secret(&mut self, endpoint: &'static str) -> bool {
@@ -1071,7 +1077,8 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         "toolset.web_search_source.xai"
         | "toolset.web_search_source.codex"
         | "toolset.web_search_source.kimi_platform"
-        | "toolset.web_search_source.kimi_code" => Some(Action::SetWebSearchSource { key, choice }),
+        | "toolset.web_search_source.kimi_code"
+        | "toolset.web_search_source.fireworks" => Some(Action::SetWebSearchSource { key, choice }),
         "voice_capture_mode" => Some(Action::SetVoiceCaptureMode(choice.to_string())),
         "voice_stt_language" => Some(Action::SetVoiceSttLanguage(choice.to_string())),
         "render_mermaid" => {

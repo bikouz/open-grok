@@ -492,6 +492,15 @@ fn handle_editing_secret(state: &mut SettingsModalState, key: &KeyEvent) -> Sett
                 state.transition_to_browse();
                 return SettingsKeyOutcome::Action(Action::SetPerplexityApiKey { key: secret });
             }
+            if setting_key == "fireworks_api_key" {
+                let action = Action::SetFireworksApiKey { key: secret };
+                return if state.entry_point == SettingsEntryPoint::ProviderLogin {
+                    SettingsKeyOutcome::ActionAndClose(action)
+                } else {
+                    state.transition_to_browse();
+                    SettingsKeyOutcome::Action(action)
+                };
+            }
             if let Some(endpoint) = endpoint {
                 let action = Action::SetKimiApiKey {
                     endpoint,

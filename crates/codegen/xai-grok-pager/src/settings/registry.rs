@@ -254,7 +254,7 @@ impl SecretStatus {
     pub const fn display(self) -> &'static str {
         match self {
             Self::Missing => "not configured",
-            Self::Stored => "stored in UI",
+            Self::Stored => "saved",
             Self::EnvironmentOverride => "environment override",
         }
     }
@@ -304,6 +304,8 @@ pub struct PagerLocalSnapshot {
     pub kimi_api_key_status: SecretStatus,
     /// Status-only mirror for the Kimi Code API-key source.
     pub kimi_code_api_key_status: SecretStatus,
+    /// Status-only mirror for the Fireworks AI API-key source.
+    pub fireworks_api_key_status: SecretStatus,
     pub perplexity_web_search_enabled: bool,
     /// `[toolset.web_search_source]` selections (effective TOML merge).
     pub web_search_source: xai_grok_shell::tools::config::WebSearchSourceConfig,
@@ -362,6 +364,7 @@ impl Default for PagerLocalSnapshot {
             memory_model: None,
             kimi_api_key_status: SecretStatus::Missing,
             kimi_code_api_key_status: SecretStatus::Missing,
+            fireworks_api_key_status: SecretStatus::Missing,
             perplexity_web_search_enabled: false,
             web_search_source: Default::default(),
             x_search_enabled: true,
@@ -764,18 +767,21 @@ pub fn current_value_for(
         )))),
         "kimi_api_key" => Some(SettingValue::SecretStatus(pager.kimi_api_key_status)),
         "kimi_code_api_key" => Some(SettingValue::SecretStatus(pager.kimi_code_api_key_status)),
+        "fireworks_api_key" => Some(SettingValue::SecretStatus(pager.fireworks_api_key_status)),
         "toolset.perplexity_web_search.enabled" => {
             Some(SettingValue::Bool(pager.perplexity_web_search_enabled))
         }
         "toolset.web_search_source.xai"
         | "toolset.web_search_source.codex"
         | "toolset.web_search_source.kimi_platform"
-        | "toolset.web_search_source.kimi_code" => {
+        | "toolset.web_search_source.kimi_code"
+        | "toolset.web_search_source.fireworks" => {
             use xai_grok_shell::tools::config::WebSearchSourceTarget;
             let target = match key {
                 "toolset.web_search_source.xai" => WebSearchSourceTarget::Xai,
                 "toolset.web_search_source.codex" => WebSearchSourceTarget::Codex,
                 "toolset.web_search_source.kimi_platform" => WebSearchSourceTarget::KimiPlatform,
+                "toolset.web_search_source.fireworks" => WebSearchSourceTarget::Fireworks,
                 _ => WebSearchSourceTarget::KimiCode,
             };
             Some(SettingValue::Enum(
@@ -1069,7 +1075,8 @@ mod tests {
                     );
                 }
                 (
-                    "kimi_api_key" | "kimi_code_api_key" | "perplexity_api_key",
+                    "kimi_api_key" | "kimi_code_api_key" | "fireworks_api_key"
+                    | "perplexity_api_key",
                     SettingKind::Secret,
                 ) => {
                     // Credential presence is pager-local runtime state rather than UiConfig.
@@ -1365,6 +1372,12 @@ mod tests {
                     SettingKind::Enum { default, .. },
                 ) => {
                     assert_eq!(*default, "xai", "Kimi sessions default to xAI search");
+                }
+                ("toolset.web_search_source.fireworks", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(
+                        *default, "xai",
+                        "Fireworks AI sessions default to xAI search"
+                    );
                 }
                 ("toolset.x_search.enabled", SettingKind::Bool { default }) => {
                     assert!(

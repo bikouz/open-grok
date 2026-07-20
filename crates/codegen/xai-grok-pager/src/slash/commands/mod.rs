@@ -503,16 +503,27 @@ mod tests {
         }
     }
     #[test]
-    fn login_provider_picker_lists_xai_codex_and_kimi_with_status() {
-        let items = login::provider_items(Some(crate::settings::SecretStatus::Stored));
+    fn login_fireworks_selects_secure_api_key_editor() {
+        assert!(matches!(
+            run_login(" fireworks "),
+            CommandResult::Action(Action::OpenFireworksApiKeyEditor)
+        ));
+    }
+    #[test]
+    fn login_provider_picker_lists_all_providers_with_status() {
+        let items = login::provider_items(
+            Some(crate::settings::SecretStatus::Stored),
+            Some(crate::settings::SecretStatus::Missing),
+        );
         assert_eq!(
             items
                 .iter()
                 .map(|item| item.insert_text.as_str())
                 .collect::<Vec<_>>(),
-            ["xai", "codex", "kimi"]
+            ["xai", "codex", "kimi", "fireworks"]
         );
-        assert_eq!(items[2].description, "API key · stored in UI");
+        assert_eq!(items[2].description, "API key · saved");
+        assert_eq!(items[3].description, "API key · not configured");
     }
     #[test]
     fn logout_bare_preserves_xai_flow() {

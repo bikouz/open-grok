@@ -586,6 +586,13 @@ pub enum Action {
     ClearKimiApiKey {
         endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
     },
+    /// Save the Fireworks AI API key from the dedicated masked editor.
+    /// `SecretInput` redacts `Debug` and zeroizes its allocation on drop.
+    SetFireworksApiKey {
+        key: crate::settings::SecretInput,
+    },
+    /// Remove the UI-stored Fireworks AI credential.
+    ClearFireworksApiKey,
     SetPerplexityWebSearch(bool),
     SetPerplexityApiKey {
         key: crate::settings::SecretInput,
@@ -673,6 +680,8 @@ pub enum Action {
     OpenLoginProviderPicker,
     /// Open Settings directly in the secure Kimi API-key editor.
     OpenKimiApiKeyEditor,
+    /// Open Settings directly in the secure Fireworks AI API-key editor.
+    OpenFireworksApiKeyEditor,
     /// Start the concrete xAI login flow (welcome screen, picker, or re-auth).
     Login,
     /// Connect the independent OpenAI Codex OAuth account in the browser.
@@ -1453,6 +1462,12 @@ pub enum Effect {
         generation: u64,
         key: Option<crate::settings::SecretInput>,
     },
+    /// Update the Fireworks AI credential, then refresh (or clear) the
+    /// Fireworks model-catalog partition.
+    UpdateFireworksApiKey {
+        generation: u64,
+        key: Option<crate::settings::SecretInput>,
+    },
     UpdatePerplexityWebSearch {
         enabled: Option<bool>,
         generation: u64,
@@ -1468,6 +1483,15 @@ pub enum Effect {
         effort: Option<ReasoningEffort>,
         generation: u64,
         effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+    },
+    /// Rebind one loaded Fireworks session to the live credential without
+    /// changing the user's preferred model setting.
+    RebindFireworksModel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
     },
     /// Change the process working directory (project-picker selection).
     SetWorkingDir { path: std::path::PathBuf },
@@ -2286,6 +2310,25 @@ pub enum TaskResult {
         effort: Option<ReasoningEffort>,
         generation: u64,
         effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        result: Result<(), SwitchModelError>,
+    },
+    /// Completion of a Fireworks AI credential update, including persistence
+    /// and the provider catalog refresh. Contains no credential material.
+    FireworksApiKeyUpdated {
+        configured: bool,
+        generation: u64,
+        stale: bool,
+        warning: Option<String>,
+        error: Option<String>,
+        models: Option<acp::SessionModelState>,
+    },
+    /// Completion of an automatic Fireworks sampler/model rebind.
+    FireworksModelRebindComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
         result: Result<(), SwitchModelError>,
     },
     /// Session was created successfully.

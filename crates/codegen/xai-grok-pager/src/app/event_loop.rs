@@ -119,7 +119,7 @@ fn startup_codex_freshness_required(
         None => match selected_provider {
             PrimaryProvider::Codex => true,
             PrimaryProvider::Xai => xai_needs_login,
-            PrimaryProvider::Kimi => false,
+            PrimaryProvider::Kimi | PrimaryProvider::Fireworks => false,
         },
     }
 }
@@ -140,14 +140,16 @@ fn plan_startup_auth(
             PrimaryProvider::Codex => StartupAuthPlan::RequireCodexLogin,
             PrimaryProvider::Xai if xai_needs_login => StartupAuthPlan::RequireXaiLogin,
             PrimaryProvider::Xai => StartupAuthPlan::Ready,
-            PrimaryProvider::Kimi => StartupAuthPlan::Ready,
+            PrimaryProvider::Kimi | PrimaryProvider::Fireworks => StartupAuthPlan::Ready,
         };
     }
     match selected_provider {
         PrimaryProvider::Codex if codex_credentials_ready => StartupAuthPlan::ReadyWithCodex,
         PrimaryProvider::Codex => StartupAuthPlan::ChooseProvider,
         PrimaryProvider::Xai if xai_needs_login => StartupAuthPlan::ChooseProvider,
-        PrimaryProvider::Xai | PrimaryProvider::Kimi => StartupAuthPlan::Ready,
+        PrimaryProvider::Xai | PrimaryProvider::Kimi | PrimaryProvider::Fireworks => {
+            StartupAuthPlan::Ready
+        }
     }
 }
 

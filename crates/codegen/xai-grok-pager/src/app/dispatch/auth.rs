@@ -25,7 +25,9 @@ use crate::scrollback::blocks::SessionEvent;
 /// an agent exists.
 pub(super) fn dispatch_open_login_provider_picker(app: &mut AppView) -> Vec<Effect> {
     let kimi_status = super::settings::ui::kimi_api_key_status();
-    let items = crate::slash::commands::login::provider_items(Some(kimi_status));
+    let fireworks_status = super::settings::ui::fireworks_api_key_status();
+    let items =
+        crate::slash::commands::login::provider_items(Some(kimi_status), Some(fireworks_status));
     if let Some(agent) = get_visible_agent_mut(app) {
         agent.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
             command: "login".to_owned(),
@@ -139,6 +141,7 @@ fn select_startup_model(
             PrimaryProvider::Codex => "ChatGPT Codex",
             PrimaryProvider::Xai => "xAI Grok",
             PrimaryProvider::Kimi => "Kimi",
+            PrimaryProvider::Fireworks => "Fireworks AI",
         };
         return Err(if allow_provider_fallback {
             format!("No visible {provider_name} model is available. Check model filters and retry.")

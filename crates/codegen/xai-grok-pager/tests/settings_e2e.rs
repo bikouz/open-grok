@@ -50,8 +50,15 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "kimi_api_endpoint",
     "kimi_api_key",
     "kimi_code_api_key",
+    "fireworks_api_key",
     "toolset.perplexity_web_search.enabled",
     "perplexity_api_key",
+    "toolset.web_search_source.xai",
+    "toolset.web_search_source.codex",
+    "toolset.web_search_source.kimi_platform",
+    "toolset.web_search_source.kimi_code",
+    "toolset.web_search_source.fireworks",
+    "toolset.x_search.enabled",
     "recap_model",
     "memory_model",
     "max_thoughts_width",
@@ -2114,6 +2121,7 @@ fn registry_kind_membership_through_pr_14() {
             "remember_tool_approvals",
             "toolset.ask_user_question.timeout_enabled",
             "toolset.perplexity_web_search.enabled",
+            "toolset.x_search.enabled",
             "auto_update",
             "show_tips",
             // Per-tip contextual-hint children (hidden from the top-level list,
@@ -2151,6 +2159,11 @@ fn registry_kind_membership_through_pr_14() {
             "screen_mode",
             "scroll_mode",
             "theme",
+            "toolset.web_search_source.codex",
+            "toolset.web_search_source.fireworks",
+            "toolset.web_search_source.kimi_code",
+            "toolset.web_search_source.kimi_platform",
+            "toolset.web_search_source.xai",
             "voice_capture_mode",
             "voice_stt_language",
         ],
@@ -2195,7 +2208,12 @@ fn registry_kind_membership_through_pr_14() {
     let secret_keys = by_kind.remove("Secret").unwrap_or_default();
     assert_eq!(
         secret_keys,
-        vec!["kimi_api_key", "kimi_code_api_key", "perplexity_api_key"],
+        vec![
+            "fireworks_api_key",
+            "kimi_api_key",
+            "kimi_code_api_key",
+            "perplexity_api_key"
+        ],
         "Secret kind membership drift",
     );
 
@@ -2234,6 +2252,11 @@ fn enum_settings_membership_through_pr_14() {
             "screen_mode",
             "scroll_mode",
             "theme",
+            "toolset.web_search_source.codex",
+            "toolset.web_search_source.fireworks",
+            "toolset.web_search_source.kimi_code",
+            "toolset.web_search_source.kimi_platform",
+            "toolset.web_search_source.xai",
             "voice_capture_mode",
             "voice_stt_language",
         ],
@@ -2294,7 +2317,16 @@ fn defaults_round_trip_through_registry() {
             "kimi_code_api_key" => {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
+            "fireworks_api_key" => {
+                SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
+            }
             "toolset.perplexity_web_search.enabled" => SettingValue::Bool(false),
+            "toolset.web_search_source.xai" => SettingValue::Enum("xai"),
+            "toolset.web_search_source.codex" => SettingValue::Enum("native"),
+            "toolset.web_search_source.kimi_platform" => SettingValue::Enum("xai"),
+            "toolset.web_search_source.kimi_code" => SettingValue::Enum("xai"),
+            "toolset.web_search_source.fireworks" => SettingValue::Enum("xai"),
+            "toolset.x_search.enabled" => SettingValue::Bool(true),
             "perplexity_api_key" => {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
@@ -2401,7 +2433,8 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetGroupToolVerbs(_))
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
-            | SettingsKeyOutcome::Action(Action::SetDisplayRefreshAutoCadence(_)) => {}
+            | SettingsKeyOutcome::Action(Action::SetDisplayRefreshAutoCadence(_))
+            | SettingsKeyOutcome::Action(Action::SetXSearchEnabled(_)) => {}
             other => panic!(
                 "expected a typed bool setter for `{}`, got {:?}",
                 meta.key, other

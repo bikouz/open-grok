@@ -1669,7 +1669,8 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "toolset.web_search_source.xai"
         | "toolset.web_search_source.codex"
         | "toolset.web_search_source.kimi_platform"
-        | "toolset.web_search_source.kimi_code" => {
+        | "toolset.web_search_source.kimi_code"
+        | "toolset.web_search_source.fireworks" => {
             // "perplexity" is a valid non-default choice for every target.
             let _ = dispatch(
                 Action::SetWebSearchSource {
@@ -1678,6 +1679,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
                         "toolset.web_search_source.codex" => "toolset.web_search_source.codex",
                         "toolset.web_search_source.kimi_platform" => {
                             "toolset.web_search_source.kimi_platform"
+                        }
+                        "toolset.web_search_source.fireworks" => {
+                            "toolset.web_search_source.fireworks"
                         }
                         _ => "toolset.web_search_source.kimi_code",
                     },

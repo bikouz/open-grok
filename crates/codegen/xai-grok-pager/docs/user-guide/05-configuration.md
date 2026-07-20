@@ -361,6 +361,23 @@ env_key = "MOONSHOT_API_KEY"
 context_window = 1048576
 ```
 
+Fireworks AI models are also API-key-only. Open Grok ships a curated Fireworks
+catalog (GLM 5.2, GLM 5.2 Fast, DeepSeek V4 Pro, and Kimi K2.7 Code); saving a
+key through Settings or `/login fireworks` refreshes those entries' metadata
+from the Fireworks models API without adding models. For an
+environment/config-only setup, use the explicit Fireworks provider:
+
+```toml
+[model.glm-5-2]
+model = "accounts/fireworks/models/glm-5p2"
+name = "GLM 5.2"
+provider = "fireworks"
+base_url = "https://api.fireworks.ai/inference/v1"
+api_backend = "chat_completions"
+env_key = "FIREWORKS_API_KEY"
+context_window = 200000
+```
+
 API-key-only custom providers require an explicit `base_url`; they never
 inherit the xAI endpoint or credentials.
 

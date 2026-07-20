@@ -6,13 +6,19 @@ use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, Slas
 pub struct LoginCommand;
 
 /// Provider choices shared by slash completion and the modal opened by a bare
-/// `/login`. The modal can include the live Kimi credential source while the
-/// inline completion path uses the provider-neutral description.
-pub(crate) fn provider_items(kimi_status: Option<crate::settings::SecretStatus>) -> Vec<ArgItem> {
-    let kimi_description = match kimi_status {
+/// `/login`. The modal can include the live Kimi and Fireworks credential
+/// sources while the inline completion path uses the provider-neutral
+/// description.
+pub(crate) fn provider_items(
+    kimi_status: Option<crate::settings::SecretStatus>,
+    fireworks_status: Option<crate::settings::SecretStatus>,
+) -> Vec<ArgItem> {
+    let api_key_description = |status: Option<crate::settings::SecretStatus>| match status {
         Some(status) => format!("API key · {}", status.display()),
         None => "Configure an API key and query models".to_owned(),
     };
+    let kimi_description = api_key_description(kimi_status);
+    let fireworks_description = api_key_description(fireworks_status);
     vec![
         ArgItem {
             display: "xAI Grok".to_owned(),
@@ -32,6 +38,12 @@ pub(crate) fn provider_items(kimi_status: Option<crate::settings::SecretStatus>)
             insert_text: "kimi".to_owned(),
             description: kimi_description,
         },
+        ArgItem {
+            display: "Fireworks AI".to_owned(),
+            match_text: "fireworks ai api key glm deepseek".to_owned(),
+            insert_text: "fireworks".to_owned(),
+            description: fireworks_description,
+        },
     ]
 }
 
@@ -44,8 +56,9 @@ pub(crate) fn provider_action(args: &str) -> Result<Action, String> {
         "xai" | "grok" => Ok(Action::Login),
         "codex" | "openai" | "chatgpt" => Ok(Action::LoginCodex),
         "kimi" | "moonshot" => Ok(Action::OpenKimiApiKeyEditor),
+        "fireworks" => Ok(Action::OpenFireworksApiKeyEditor),
         _ => Err(format!(
-            "Unknown provider: {}. Use /login xai, /login codex, or /login kimi",
+            "Unknown provider: {}. Use /login xai, /login codex, /login kimi, or /login fireworks",
             args.trim()
         )),
     }
@@ -57,11 +70,11 @@ impl SlashCommand for LoginCommand {
     }
 
     fn description(&self) -> &str {
-        "Connect xAI, OpenAI Codex, or Kimi"
+        "Connect xAI, OpenAI Codex, Kimi, or Fireworks AI"
     }
 
     fn usage(&self) -> &str {
-        "/login [xai|codex|kimi]"
+        "/login [xai|codex|kimi|fireworks]"
     }
 
     fn takes_args(&self) -> bool {
@@ -73,7 +86,7 @@ impl SlashCommand for LoginCommand {
     }
 
     fn suggest_args(&self, _ctx: &AppCtx, _args_query: &str) -> Option<Vec<ArgItem>> {
-        Some(provider_items(None))
+        Some(provider_items(None, None))
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
