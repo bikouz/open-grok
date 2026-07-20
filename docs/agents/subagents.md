@@ -152,12 +152,14 @@ Applied in `handle_subagent_request` via `filter_tool_config` on the agent’s `
 
 | Mode | Keeps (roughly) | Drops |
 | --- | --- | --- |
-| `read-only` | Read / search / list / LSP / web / plan enter-exit / task+wait-kill / ask | Edit / write / execute |
+| `read-only` | Read / search / list / LSP / web / task+wait-kill / ask | Edit / write / execute |
 | `read-write` | Read + edit/write (+ non-execute set) | Execute (bash) |
 | `execute` | Read + execute | Edit/write |
 | `all` | No filter | — |
 
 `ToolKind::None` / untyped tools are retained. After filter, orphaned background-task-only tools may be pruned.
+
+**Plan-mode tools are stripped from every child, regardless of capability mode** (`strip_plan_mode_tools`): a child's `exit_plan_mode` approval reverse-request renders on the parent agent's view, indistinguishable from the parent presenting its plan. Defense in depth for children that still reach the tool (verbatim-mirror forks, resumed pre-fix sessions): the shell executes a subagent's `exit_plan_mode` without the client round-trip, and the pager auto-approves any child-session `x.ai/exit_plan_mode` instead of parking an overlay on the parent.
 
 ### Isolation default (separate axis)
 

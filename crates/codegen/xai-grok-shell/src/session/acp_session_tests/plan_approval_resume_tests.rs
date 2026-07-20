@@ -44,6 +44,54 @@ fn last_persisted_awaiting(
     last
 }
 
+/// Like [`actor_with_channels`] but flagged as a subagent session.
+async fn subagent_actor_with_channels() -> (
+    std::sync::Arc<SessionActor>,
+    tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
+    tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>,
+) {
+    let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mut actor, _ev) = create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+    actor.startup_hints.is_subagent = true;
+    (std::sync::Arc::new(actor), gateway_rx, persistence_rx)
+}
+
+/// A subagent session resumed with a stale persisted `awaiting_plan_approval`
+/// must NOT re-issue the reverse-request — it would render on the PARENT
+/// agent's view as the parent's plan approval. The flag is cleared instead.
+#[tokio::test(flavor = "current_thread")]
+async fn resume_plan_approval_subagent_clears_stale_flag_without_reverse_request() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, mut gateway_rx, mut persistence_rx) = subagent_actor_with_channels().await;
+            {
+                let mut plan_mode = actor.plan_mode.lock();
+                plan_mode.activate_from_tool();
+                plan_mode.set_awaiting_plan_approval(true);
+            }
+
+            let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
+            actor.clone().resume_plan_approval(completion_tx).await;
+
+            assert!(
+                !actor.plan_mode.lock().is_awaiting_plan_approval(),
+                "stale awaiting flag must be cleared on subagent resume"
+            );
+            assert_eq!(
+                last_persisted_awaiting(&mut persistence_rx),
+                Some(false),
+                "the cleared flag must be persisted"
+            );
+            assert!(
+                gateway_rx.try_recv().is_err(),
+                "no exit_plan_mode reverse-request may be issued for a subagent session"
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn request_plan_approval_issues_reverse_request_and_clears_flag() {
     let local = tokio::task::LocalSet::new();

@@ -304,6 +304,57 @@
         assert!(rx.try_recv().is_err(), "response must NOT be sent yet");
     }
 
+    /// Regression: a subagent (child session) calling `exit_plan_mode` must
+    /// NOT park a plan-approval overlay on the parent agent's view — the
+    /// dialog is indistinguishable from the parent presenting its plan.
+    /// The pager auto-approves instead so the child exits its self-imposed
+    /// plan mode and finishes its turn.
+    #[test]
+    fn exit_plan_mode_from_subagent_session_auto_approves_without_ui() {
+        let mut app = make_app_with_agent("sess-A");
+        let child_sid = "sess-A-child";
+        {
+            let parent = app.agents.get_mut(&AgentId(0)).unwrap();
+            parent
+                .subagent_sessions
+                .insert(child_sid.into(), make_subagent_info(child_sid));
+            parent
+                .subagent_views
+                .insert(child_sid.into(), Box::new(make_agent(Some(child_sid))));
+        }
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let ext_req = crate::views::plan_approval_view::ExitPlanModeExtRequest {
+            session_id: child_sid.into(),
+            tool_call_id: "tc-child-plan".into(),
+            plan_content: None,
+        };
+        let raw = serde_json::value::to_raw_value(&ext_req).unwrap();
+        let msg = AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+            request: acp::ExtRequest::new("x.ai/exit_plan_mode", raw.into()),
+            response_tx: tx,
+        });
+
+        let affected = handle(msg, &mut app);
+
+        assert!(!affected, "auto-approval must not redraw the active view");
+        assert!(
+            app.agents
+                .get(&AgentId(0))
+                .unwrap()
+                .plan_approval_view
+                .is_none(),
+            "a child's plan approval must NOT land on the parent view"
+        );
+        let resp = rx
+            .try_recv()
+            .expect("child exit_plan_mode must be answered immediately")
+            .expect("response must be Ok");
+        let parsed: serde_json::Value =
+            serde_json::from_str(resp.0.get()).expect("should be valid JSON");
+        assert_eq!(parsed["outcome"], "approved");
+    }
+
     /// Regression: tool-call titles containing `"enter_plan_mode"` must not
     /// flip plan mode (the substring matcher used to brick sessions on any
     /// tool mentioning the phrase, e.g. a Grep with that pattern).

@@ -1609,12 +1609,24 @@ impl SessionActor {
             PlanFileRead::Present(s) => Some(s.clone()),
             PlanFileRead::Absent | PlanFileRead::Unreadable => None,
         };
-        if should_intercept_exit_plan_approval(
+        let wants_plan_approval = should_intercept_exit_plan_approval(
             is_exit_plan_mode,
             is_cursor_switch_to_agent,
             is_cursor_create_plan,
             &plan_read,
-        ) {
+        );
+        // Child sessions have no approval surface of their own: their
+        // exit_plan_mode reverse-request renders on the PARENT agent's view,
+        // indistinguishable from the parent presenting its plan. Skip the
+        // client round-trip and execute the exit directly (same effect as an
+        // approved exit).
+        if wants_plan_approval && self.startup_hints.is_subagent {
+            tracing::info!(
+                tool_call_id = % tool_call_id,
+                "[exit_plan_mode] subagent session — executing without client plan approval"
+            );
+        }
+        if wants_plan_approval && !self.startup_hints.is_subagent {
             tracing::info!(
                 tool_call_id = % tool_call_id, cursor_create_plan =
                 is_cursor_create_plan, cursor_switch_to_agent =
@@ -1831,6 +1843,21 @@ impl SessionActor {
         self: Arc<Self>,
         completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
     ) {
+        if self.startup_hints.is_subagent {
+            // Children never park plan approvals (see the subagent skip in
+            // `prepare_tool_call`); clear any stale persisted flag instead of
+            // re-raising approval chrome on the parent's view.
+            let was_awaiting = {
+                let mut plan_mode = self.plan_mode.lock();
+                let was = plan_mode.is_awaiting_plan_approval();
+                plan_mode.set_awaiting_plan_approval(false);
+                was
+            };
+            if was_awaiting {
+                self.persist_plan_mode_state();
+            }
+            return;
+        }
         if !self.plan_mode.lock().is_awaiting_plan_approval() {
             return;
         }

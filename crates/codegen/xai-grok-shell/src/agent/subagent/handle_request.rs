@@ -447,6 +447,19 @@ pub(crate) async fn handle_subagent_request(
         );
     }
     {
+        // Regardless of capability mode: children must never drive the
+        // plan-mode lifecycle — their exit_plan_mode approval renders on the
+        // parent agent's view as if the parent presented a plan.
+        let before = definition.tool_config.tools.len();
+        strip_plan_mode_tools(&mut definition.tool_config);
+        if definition.tool_config.tools.len() < before {
+            tracing::info!(
+                subagent_id = % request.id,
+                "Stripped plan-mode tools from subagent tool config"
+            );
+        }
+    }
+    {
         use xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH;
         use xai_grok_tools::types::tool::ToolKind;
         let child_depth = ctx.parent_depth + 1;

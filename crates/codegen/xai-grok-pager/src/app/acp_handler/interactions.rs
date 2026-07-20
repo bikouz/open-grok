@@ -151,16 +151,38 @@ pub(super) fn handle_exit_plan_mode(
     // 2. Route by the request's session id (like `session/update`), so a
     // plan-approval raised by a BACKGROUND session lands on its own view even
     // when the user isn't currently focused on it — rather than failing.
-    let Some(id) = interaction_target_agent(app, &params.session_id) else {
-        // No local view for this session. Do NOT error (that fails the tool):
-        // leave the reverse-request unanswered and rely on the leader's
-        // replay-on-attach.
-        tracing::info!(
-            session_id = %params.session_id,
-            "exit_plan_mode for a session with no local view; parked for leader replay-on-attach"
-        );
-        drop(ext.response_tx);
-        return false;
+    let sid = acp::SessionId::new(params.session_id.to_owned());
+    let id = match find_session_match(app, &sid) {
+        Some(SessionMatch::Root(id)) => id,
+        Some(SessionMatch::Child(_)) => {
+            // A subagent's exit_plan_mode must NOT render as its parent's plan
+            // approval — the overlay would be indistinguishable from the
+            // parent presenting a plan. Auto-approve so the child leaves its
+            // self-imposed plan mode and finishes its turn. (The shell also
+            // skips the reverse-request for subagent sessions; this covers
+            // older shells and leader replays.)
+            tracing::warn!(
+                session_id = %params.session_id,
+                "exit_plan_mode from a subagent session; auto-approving without UI"
+            );
+            crate::views::plan_approval_view::send_exit_plan_response(
+                ext.response_tx,
+                "approved",
+                None,
+            );
+            return false;
+        }
+        None => {
+            // No local view for this session. Do NOT error (that fails the tool):
+            // leave the reverse-request unanswered and rely on the leader's
+            // replay-on-attach.
+            tracing::info!(
+                session_id = %params.session_id,
+                "exit_plan_mode for a session with no local view; parked for leader replay-on-attach"
+            );
+            drop(ext.response_tx);
+            return false;
+        }
     };
     let is_active = is_matched_agent_active(app, id);
     let Some(agent) = app.agents.get_mut(&id) else {

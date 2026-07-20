@@ -169,13 +169,15 @@ pub(super) fn is_matched_agent_active(app: &AppView, matched_agent: AgentId) -> 
 }
 
 /// Resolve the `AgentId` that should own an interactive modal
-/// (`ask_user_question` / `exit_plan_mode`) for `session_id`.
+/// (`ask_user_question`) for `session_id`.
 ///
 /// Routes by the request's session id via [`find_session_match`] — exactly like
 /// `session/update` notifications — so a modal raised by a **background**
 /// session lands on its own view even when the user is on the dashboard or a
 /// different session, instead of being gated on `app.active_view`. A child
 /// (subagent) match resolves to its parent agent, which owns the overlay.
+/// (`exit_plan_mode` routes with [`find_session_match`] directly instead:
+/// a child match must auto-approve, never park on the parent's view.)
 ///
 /// Returns `None` when no local view exists for that session; the caller must
 /// then leave the reverse-request unanswered (drop, do NOT error) and rely on

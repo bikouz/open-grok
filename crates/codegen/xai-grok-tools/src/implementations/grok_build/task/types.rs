@@ -245,6 +245,22 @@ pub fn prune_orphaned_background_task_tools(config: &mut crate::registry::types:
     });
 }
 
+/// Remove the plan-mode tools (`enter_plan_mode` / `exit_plan_mode`) from a
+/// subagent tool config.
+///
+/// Plan mode is a root-session interaction: `exit_plan_mode` raises the
+/// client's plan-approval reverse-request, and the pager renders that approval
+/// on the parent agent's view — a child calling it presents a plan dialog
+/// indistinguishable from the parent's. Children get a fresh Inactive plan
+/// tracker and must never drive the plan-mode lifecycle themselves.
+pub fn strip_plan_mode_tools(config: &mut crate::registry::types::ToolServerConfig) {
+    use crate::types::tool::ToolKind;
+
+    config
+        .tools
+        .retain(|tc| !matches!(tc.kind, Some(ToolKind::EnterPlan | ToolKind::ExitPlan)));
+}
+
 fn is_background_capable_bash_tool(tc: &crate::registry::types::ToolConfig) -> bool {
     match tc.id.as_str() {
         "GrokBuild:run_terminal_cmd" | "GrokBuildConcise:run_terminal_cmd" => tc
@@ -289,8 +305,6 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
-                ToolKind::EnterPlan,
-                ToolKind::ExitPlan,
                 ToolKind::AskUser,
                 ToolKind::Skill,
             ],
@@ -316,8 +330,6 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
-                ToolKind::EnterPlan,
-                ToolKind::ExitPlan,
                 ToolKind::AskUser,
                 ToolKind::Skill,
             ],
@@ -336,8 +348,6 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
-                ToolKind::EnterPlan,
-                ToolKind::ExitPlan,
                 ToolKind::AskUser,
                 ToolKind::Skill,
             ],
@@ -364,8 +374,6 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
-                ToolKind::EnterPlan,
-                ToolKind::ExitPlan,
                 ToolKind::AskUser,
                 ToolKind::Skill,
             ],
@@ -976,12 +984,51 @@ mod tests {
     use super::SubagentCapabilityMode;
     use super::SubagentCapabilityModeExt;
     use super::is_valid_resume_id;
+    use super::strip_plan_mode_tools;
 
     /// Create a `ToolConfig` with the given id and kind set.
     fn tc(id: &str, kind: ToolKind) -> ToolConfig {
         let mut c = ToolConfig::from_id(id);
         c.kind = Some(kind);
         c
+    }
+
+    #[test]
+    fn no_capability_mode_allows_plan_mode_tools() {
+        for mode in [
+            SubagentCapabilityMode::ReadOnly,
+            SubagentCapabilityMode::ReadWrite,
+            SubagentCapabilityMode::Execute,
+            SubagentCapabilityMode::All,
+        ] {
+            let allowed = mode.allowed_tool_kinds();
+            assert!(
+                !allowed.contains(&ToolKind::EnterPlan) && !allowed.contains(&ToolKind::ExitPlan),
+                "{mode:?} must not allow plan-mode tools: subagent plan approvals render on the parent view"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_plan_mode_tools_removes_only_plan_mode_tools() {
+        let mut config = ToolServerConfig {
+            tools: vec![
+                tc("GrokBuild:read_file", ToolKind::Read),
+                tc("GrokBuild:enter_plan_mode", ToolKind::EnterPlan),
+                tc("GrokBuild:exit_plan_mode", ToolKind::ExitPlan),
+                tc("GrokBuild:grep", ToolKind::Search),
+                ToolConfig::from_id("Mcp:custom_tool"),
+            ],
+            behavior_preset: None,
+        };
+
+        strip_plan_mode_tools(&mut config);
+
+        let ids: Vec<&str> = config.tools.iter().map(|tc| tc.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["GrokBuild:read_file", "GrokBuild:grep", "Mcp:custom_tool"]
+        );
     }
 
     #[test]
