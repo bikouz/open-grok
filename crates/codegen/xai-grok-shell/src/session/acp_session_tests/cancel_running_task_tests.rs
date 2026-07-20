@@ -12,11 +12,13 @@ impl AsyncTerminalRunner for DummyTerminal {
         Err(TerminalError::Other("dummy terminal".into()))
     }
 }
-#[tokio::test(flavor = "current_thread")]
-async fn persist_ack_waits_for_disk_flush_before_success() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn persist_ack_waits_for_disk_flush_before_success() {
+    // This test polls a real `handle_prompt` turn; a debug-build actor future
+    // is too deep for libtest's default test-thread stack (the overflow
+    // aborts the whole test binary), so it runs on a session-sized stack.
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
             let tmp = tempfile::TempDir::new().unwrap();
             let session_dir = tmp.path().join("session");
             let cwd = AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
@@ -335,7 +337,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
             );
             let _ = prompt_task.await.expect("prompt task should complete");
         })
-        .await;
+    });
 }
 #[tokio::test(flavor = "current_thread")]
 async fn first_turn_memory_injection_persists_to_chat_history() {

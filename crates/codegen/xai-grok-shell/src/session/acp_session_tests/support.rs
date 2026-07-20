@@ -1,5 +1,39 @@
 use super::*;
 
+/// Run a session-actor test future on a dedicated thread whose stack matches
+/// what production gives session threads (`SESSION_THREAD_STACK_SIZE` in
+/// `acp_session_impl/spawn.rs` is 8 MiB), doubled because unoptimized debug
+/// futures are several times larger than their release counterparts.
+///
+/// libtest's default test-thread stack is too small to poll a full
+/// `handle_prompt` turn in a debug build — the async call chain through the
+/// actor overflows it and aborts the whole test binary. The thread body
+/// mirrors the production spawn: current-thread runtime driving a `LocalSet`,
+/// so `tokio::task::spawn_local` works exactly as in the ordinary
+/// `#[tokio::test] + LocalSet::run_until` pattern. Panics (failed asserts)
+/// propagate through the join, failing the test normally.
+pub(crate) fn run_on_session_sized_stack(
+    test: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> + Send + 'static,
+) {
+    const TEST_SESSION_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+    let outcome = std::thread::Builder::new()
+        .name("test-session".to_string())
+        .stack_size(TEST_SESSION_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test session runtime");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, test());
+        })
+        .expect("test session thread should spawn")
+        .join();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// Drain persistence traffic for tests that exercise a synchronous flush
 /// barrier without running the full persistence actor.
 pub(crate) fn spawn_persistence_ack_drainer(
