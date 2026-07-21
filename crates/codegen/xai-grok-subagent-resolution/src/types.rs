@@ -90,6 +90,10 @@ pub struct ResumeSourceData {
     /// shell to locate the source's session directory for raw transcript
     /// copying (`copy_session_data_sync`).
     pub child_session_id: String,
+    /// Antigravity CLI conversation id backing the source subagent, set only
+    /// when it ran on an `antigravity:*` model. Consumed by the shell to
+    /// continue the CLI conversation (`agy --conversation`) on resume.
+    pub antigravity_conversation_id: Option<String>,
 }
 
 /// Errors that can occur during subagent resolution.

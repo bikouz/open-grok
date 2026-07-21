@@ -1370,6 +1370,10 @@ pub struct Config {
     /// `[auto_mode]` section: Auto permission-mode configuration. See [`AutoModeConfig`].
     #[serde(default)]
     pub auto_mode: AutoModeConfig,
+    /// `[antigravity]` section: Antigravity CLI subagent integration. See
+    /// [`AntigravityConfig`].
+    #[serde(default)]
+    pub antigravity: AntigravityConfig,
     /// `[model.*]` overrides from config.toml. Resolve via `resolve_model_list()`.
     #[serde(skip)]
     pub config_models: IndexMap<String, ConfigModelOverride>,
@@ -1801,6 +1805,7 @@ impl Default for Config {
             goal: GoalConfig::default(),
             doom_loop_recovery: crate::util::config::DoomLoopRecoverySettings::default(),
             auto_mode: AutoModeConfig::default(),
+            antigravity: AntigravityConfig::default(),
             config_models: IndexMap::new(),
             model_override_warnings: Vec::new(),
             grok_com_config: GrokComConfig::default(),
@@ -4657,6 +4662,25 @@ pub struct GoalConfig {
     )]
     pub skeptic_models: Vec<crate::util::config::GoalRoleModel>,
 }
+/// `[antigravity]` section: Antigravity CLI (`agy`) subagent integration.
+/// The user-facing on/off switch lives at `[ui].antigravity_subagents`
+/// (settings modal, hidden when the CLI is not installed); this table holds
+/// the operator knobs that rarely change.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AntigravityConfig {
+    /// Binary name or absolute path of the Antigravity CLI. `None` ⇒ `agy`
+    /// resolved on `PATH`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    /// Pass the CLI's auto-approve flag so antigravity subagents may edit
+    /// files and run commands in the workspace. Off (`None`/`false`), headless
+    /// `agy` auto-denies mutating tools, making subagents read-only
+    /// researchers — safe, and the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_permissions: Option<bool>,
+}
+
 /// `[auto_mode]` section: server-side configuration for Auto permission mode.
 /// ONE struct serves both the local `[auto_mode]` TOML table and the remote
 /// remote settings `auto_mode` JSON object (coerced via `serde_json::from_value`), so

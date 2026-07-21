@@ -726,6 +726,30 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
+        // Row is hidden entirely when the Antigravity CLI is not installed
+        // (see `setting_row_visible`); the gate is seeded once at startup.
+        SettingMeta {
+            key: "antigravity_subagents",
+            category: SettingCategory::Agent,
+            owner: SettingOwner::Shell,
+            label: "Antigravity subagents",
+            description: "Let Antigravity CLI (agy) models serve as subagents for task, swarm, and workflow tools. Requires being signed in to agy; subagents run read-only unless [antigravity].skip_permissions is set. Restart required.",
+            keywords: &[
+                "antigravity",
+                "agy",
+                "gemini",
+                "subagent",
+                "delegate",
+                "cli",
+                "swarm",
+                "workflow",
+            ],
+            kind: SettingKind::Bool {
+                default: ui_default.antigravity_subagents.unwrap_or(false),
+            },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned, persisted to `[ui].vim_mode` in config.toml.
         // Defaults to the same value main's `appearance::persist::VIM_MODE_DEFAULT`
         // shipped with. Bundled next to `simple_mode` because they pair up:

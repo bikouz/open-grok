@@ -332,9 +332,21 @@ fn setting_row_visible_gates_voice_capture_on_key_releases() {
     let voice = meta_for(&reg, "voice_capture_mode");
     let vim = meta_for(&reg, "vim_mode");
     // voice_mode = true; kitty_releases varies.
-    assert!(!setting_row_visible(voice, false, false, true));
-    assert!(setting_row_visible(voice, true, false, true));
-    assert!(setting_row_visible(vim, false, false, true));
+    assert!(!setting_row_visible(voice, false, false, true, true));
+    assert!(setting_row_visible(voice, true, false, true, true));
+    assert!(setting_row_visible(vim, false, false, true, true));
+}
+
+/// The `antigravity_subagents` row is hidden without the CLI installed and
+/// shown with it. Other settings are unaffected by the gate.
+#[test]
+fn setting_row_visible_gates_antigravity_on_cli_presence() {
+    let reg = SettingsRegistry::defaults();
+    let antigravity = meta_for(&reg, "antigravity_subagents");
+    let vim = meta_for(&reg, "vim_mode");
+    assert!(!setting_row_visible(antigravity, true, false, true, false));
+    assert!(setting_row_visible(antigravity, true, false, true, true));
+    assert!(setting_row_visible(vim, true, false, true, false));
 }
 
 #[test]
@@ -344,13 +356,43 @@ fn setting_row_visible_hides_voice_rows_when_voice_mode_off() {
     let language = meta_for(&reg, "voice_stt_language");
     let vim = meta_for(&reg, "vim_mode");
     // Gate off: both voice rows gone even with kitty releases + full TUI.
-    assert!(!setting_row_visible(capture, true, false, false));
-    assert!(!setting_row_visible(language, true, false, false));
+    assert!(!setting_row_visible(capture, true, false, false, true));
+    assert!(!setting_row_visible(language, true, false, false, true));
     // Non-voice rows unaffected.
-    assert!(setting_row_visible(vim, true, false, false));
+    assert!(setting_row_visible(vim, true, false, false, true));
     // Gate on: both visible (kitty releases for capture).
-    assert!(setting_row_visible(capture, true, false, true));
-    assert!(setting_row_visible(language, true, false, true));
+    assert!(setting_row_visible(capture, true, false, true, true));
+    assert!(setting_row_visible(language, true, false, true, true));
+}
+
+#[test]
+fn rebuild_rows_drops_antigravity_row_when_cli_absent() {
+    let prev = crate::app::antigravity_cli_present();
+    crate::app::set_antigravity_cli_present_for_test(true);
+    let mut state = make_state();
+    let has_antigravity = |s: &SettingsModalState| {
+        s.rows.iter().any(|r| {
+            matches!(
+                r,
+                RowEntry::Setting {
+                    key: "antigravity_subagents",
+                    ..
+                }
+            )
+        })
+    };
+    assert!(
+        has_antigravity(&state),
+        "antigravity_subagents should be listed with the CLI present"
+    );
+
+    crate::app::set_antigravity_cli_present_for_test(false);
+    state.rebuild_rows();
+    assert!(
+        !has_antigravity(&state),
+        "rebuild after CLI-absent must hide antigravity_subagents"
+    );
+    crate::app::set_antigravity_cli_present_for_test(prev);
 }
 
 #[test]
@@ -395,16 +437,17 @@ fn setting_row_visible_hides_theme_rows_in_minimal() {
         let meta = meta_for(&reg, key);
         assert!(meta.hidden_in_minimal, "{key} must declare the flag");
         assert!(
-            !setting_row_visible(meta, true, true, true),
+            !setting_row_visible(meta, true, true, true, true),
             "{key} in minimal"
         );
         assert!(
-            setting_row_visible(meta, true, false, true),
+            setting_row_visible(meta, true, false, true, true),
             "{key} in full TUI"
         );
     }
     assert!(setting_row_visible(
         meta_for(&reg, "vim_mode"),
+        true,
         true,
         true,
         true

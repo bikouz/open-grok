@@ -154,6 +154,21 @@ pub(crate) static MOUSE_REPORTING_TOGGLE_ENABLED: AtomicBool = AtomicBool::new(f
 pub(crate) fn mouse_reporting_toggle_enabled() -> bool {
     MOUSE_REPORTING_TOGGLE_ENABLED.load(Ordering::Acquire)
 }
+/// Whether the Antigravity CLI (`agy`, or `[antigravity].binary`) was found
+/// at startup. Gates the "Antigravity subagents" settings row — the toggle is
+/// meaningless without the binary, so the row is hidden entirely. Seeded once
+/// in the event loop's startup sequence.
+pub(crate) static ANTIGRAVITY_CLI_PRESENT: AtomicBool = AtomicBool::new(false);
+/// Read the cached Antigravity CLI presence gate (see
+/// [`ANTIGRAVITY_CLI_PRESENT`]).
+pub(crate) fn antigravity_cli_present() -> bool {
+    ANTIGRAVITY_CLI_PRESENT.load(Ordering::Acquire)
+}
+/// Test helper for the process-global Antigravity CLI gate (plain `pub` so
+/// integration tests can flip it, mirroring `set_voice_mode_enabled_for_test`).
+pub fn set_antigravity_cli_present_for_test(on: bool) {
+    ANTIGRAVITY_CLI_PRESENT.store(on, Ordering::Release);
+}
 /// Whether voice mode is available (GA default on; remote/`GROK_VOICE_MODE` can
 /// kill or force). Mirrored from
 /// [`crate::app::app_view::AppView::apply_voice_mode_enabled`] so view-layer

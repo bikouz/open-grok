@@ -1603,6 +1603,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "display_refresh_auto_cadence" => {
             let _ = dispatch(Action::SetDisplayRefreshAutoCadence(true), app);
         }
+        "antigravity_subagents" => {
+            let _ = dispatch(Action::SetAntigravitySubagents(true), app);
+        }
         "scroll_lines" => {
             let _ = dispatch(Action::SetScrollLines(5), app);
         }

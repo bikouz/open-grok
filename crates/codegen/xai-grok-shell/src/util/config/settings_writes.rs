@@ -57,6 +57,12 @@ pub async fn set_swarm_mode(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.swarm_mode = Some(value)).await
 }
 
+/// Persist `[ui].antigravity_subagents` via `update_config`. Same `Option<bool>`
+/// shape as `swarm_mode` (`None` = default off).
+pub async fn set_antigravity_subagents(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.antigravity_subagents = Some(value)).await
+}
+
 /// Persist `[ui.contextual_hints].undo` via `update_config`. The nested struct
 /// stays out of `config.toml` until a tip is toggled (`skip_serializing_if`).
 pub async fn set_contextual_hint_undo(value: bool) -> Result<()> {

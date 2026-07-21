@@ -117,6 +117,7 @@ pub fn load_config_from_toml(root: &TomlValue) -> Config {
         cli: section(table, "cli"),
         models: section(table, "models"),
         ui: section(table, "ui"),
+        antigravity: section(table, "antigravity"),
         harness: section(table, "harness"),
         skills: section(table, "skills"),
         compat: section(table, "compat"),

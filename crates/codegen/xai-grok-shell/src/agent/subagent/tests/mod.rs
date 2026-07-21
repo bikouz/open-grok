@@ -964,6 +964,7 @@ fn completed_with_output(
     persisted_output_dir: Option<PathBuf>,
 ) -> CompletedSubagent {
     CompletedSubagent {
+        antigravity_conversation_id: None,
         subagent_id: id.into(),
         parent_session_id: String::new(),
         parent_prompt_id: None,

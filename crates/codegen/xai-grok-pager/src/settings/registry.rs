@@ -594,6 +594,9 @@ pub fn current_value_for(
         )),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         "swarm_mode" => Some(SettingValue::Bool(ui.swarm_mode.unwrap_or(false))),
+        "antigravity_subagents" => Some(SettingValue::Bool(
+            ui.antigravity_subagents.unwrap_or(false),
+        )),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
         "contextual_hints.undo" => {
             Some(SettingValue::Bool(ui.contextual_hints.undo.unwrap_or(true)))
@@ -1200,6 +1203,15 @@ mod tests {
                         ui.prompt_suggestions.unwrap_or(true),
                         "prompt_suggestions default drifts from UiConfig::default()"
                     );
+                }
+                // antigravity_subagents: Option<bool>; None → false (opt-in).
+                ("antigravity_subagents", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.antigravity_subagents.unwrap_or(false),
+                        "antigravity_subagents default drifts from UiConfig::default()"
+                    );
+                    assert!(!*default, "antigravity_subagents must default OFF");
                 }
                 ("keep_text_selection", SettingKind::Enum { default, .. }) => {
                     let expected = if ui.keep_text_selection_enabled() {

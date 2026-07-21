@@ -335,13 +335,20 @@ impl AgentRebuildSpec {
         .with_fs(fs_backend.clone())
         .with_subagents_enabled(*subagents_enabled)
         .with_subagent_toggle(subagent_toggle.clone())
-        .with_task_model_slugs(
-            models_manager
+        .with_task_model_slugs({
+            let mut slugs = models_manager
                 .available()
                 .keys()
                 .map(|model_id| model_id.0.to_string())
-                .collect::<Vec<_>>(),
-        )
+                .collect::<Vec<_>>();
+            // `antigravity:*` slugs advertise the Antigravity CLI roster when
+            // the feature is enabled + signed in. Cache-backed and
+            // non-blocking: the first rebuild after startup may miss them
+            // while the probe runs, but spawn-side validation is independent
+            // of this advertisement.
+            slugs.extend(crate::agent::antigravity::advertised_slugs_nonblocking());
+            slugs
+        })
         .with_ask_user_question_enabled(*ask_user_question_enabled)
         .with_persona_summaries(persona_summaries.clone())
         .with_prompt_audience(*prompt_audience)
@@ -404,6 +411,11 @@ impl AgentRebuildSpec {
         agent
             .tool_bridge()
             .update_resource(TaskModelValidator::new(move |requested| {
+                if crate::agent::antigravity::is_antigravity_slug(requested) {
+                    // Cheap cache-backed gate; the coordinator re-checks
+                    // authoritatively (async) at spawn time.
+                    return crate::agent::antigravity::task_slug_error_nonblocking(requested);
+                }
                 model_validator.task_model_error(requested)
             }))
             .await;

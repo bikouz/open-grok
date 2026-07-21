@@ -38,6 +38,7 @@ use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 use xai_grok_tools::implementations::grok_build::task::types::*;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
+mod antigravity_runner;
 mod coordinator_lifecycle;
 mod coordinator_query;
 mod handle_request;
@@ -521,6 +522,9 @@ pub(crate) struct CompletedSubagent {
     /// Process-scoped and local-only: resume survives a restart via
     /// `meta.json`, and trace upload carries the text to GCS.
     pub persisted_output_dir: Option<PathBuf>,
+    /// Antigravity CLI conversation id (only for `antigravity:*` models);
+    /// threaded into `ResumeSourceData` so resume continues the conversation.
+    pub antigravity_conversation_id: Option<String>,
 }
 /// Lightweight entry for subagents that have been requested but are still
 /// initializing (creating worktree, resolving config, spawning session).
@@ -2872,6 +2876,10 @@ pub(crate) struct SubagentMeta {
     /// resume can retain provider identity even when slugs overlap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_route: Option<xai_grok_subagent_resolution::SubagentModelRoute>,
+    /// Antigravity CLI conversation id (only for `antigravity:*` models).
+    /// Persisted so `resume_from` can continue the CLI conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_conversation_id: Option<String>,
 }
 /// Canonical subagent metadata for GCS persistence (`subagent.json`).
 ///

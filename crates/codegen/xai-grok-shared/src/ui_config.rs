@@ -84,6 +84,11 @@ pub struct UiConfig {
     /// Whether swarm orchestration is the persistent default. `None`/`false` is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swarm_mode: Option<bool>,
+    /// Whether Antigravity CLI (`agy`) models may serve as subagents for the
+    /// task/swarm/workflow tools. `None`/`false` is off. Only meaningful when
+    /// the CLI is installed; the settings row is hidden otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_subagents: Option<bool>,
     /// Read by `load_permission_mode()`. Declared for `serde_ignored`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
@@ -312,6 +317,7 @@ impl Default for UiConfig {
             compact_mode: false,
             simple_mode: None,
             swarm_mode: None,
+            antigravity_subagents: None,
             permission_mode: None,
             approval_mode: None,
             default_selected_permission: None,

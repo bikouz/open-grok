@@ -908,6 +908,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
             trigger: "manual",
             persist: true,
         }),
+        ("antigravity_subagents", SettingValue::Bool(b)) => {
+            Some(Action::SetAntigravitySubagents(*b))
+        }
         ("contextual_hints.undo", SettingValue::Bool(b)) => Some(Action::SetContextualHintUndo(*b)),
         ("contextual_hints.plan_mode", SettingValue::Bool(b)) => {
             Some(Action::SetContextualHintPlanMode(*b))
@@ -1334,6 +1337,10 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         // vim_mode: direct inner call.
         ("vim_mode", SettingValue::Bool(b)) => set_vim_mode_inner(app, *b),
         ("swarm_mode", SettingValue::Bool(b)) => app.current_ui.swarm_mode = Some(*b),
+        // Effective default is false → restore None (mirror stays disk-synced).
+        ("antigravity_subagents", SettingValue::Bool(b)) => {
+            app.current_ui.antigravity_subagents = if *b { Some(true) } else { None };
+        }
         ("remember_tool_approvals", SettingValue::Bool(b)) => {
             set_remember_tool_approvals_inner(app, *b)
         }

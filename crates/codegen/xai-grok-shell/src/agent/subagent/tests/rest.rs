@@ -333,6 +333,7 @@ fn resumable_source_returns_info_for_completed_subagent() {
         .insert(
             "sub-resume".to_string(),
             CompletedSubagent {
+                antigravity_conversation_id: None,
                 subagent_id: "sub-resume".into(),
                 parent_session_id: "parent-1".into(),
                 parent_prompt_id: Some("prompt-1".into()),
@@ -397,6 +398,7 @@ fn resumable_source_survives_move_to_completed_with_metadata() {
 #[test]
 fn resumed_from_field_in_meta_roundtrips() {
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-resumed".into(),
         parent_session_id: "parent".into(),
         child_session_id: "child".into(),
@@ -445,6 +447,7 @@ fn resumed_from_field_in_meta_roundtrips() {
 #[test]
 fn resumed_from_none_not_serialized_in_meta() {
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-fresh".into(),
         parent_session_id: "p".into(),
         child_session_id: "c".into(),
@@ -490,6 +493,7 @@ fn backward_compat_meta_without_resumed_from() {
 #[test]
 fn snapshot_ref_field_in_meta_roundtrips() {
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-snap".into(),
         parent_session_id: "parent".into(),
         child_session_id: "child".into(),
@@ -540,6 +544,7 @@ fn backward_compat_meta_without_snapshot_ref() {
 /// Minimal completed-status meta for the snapshot-ref persistence tests.
 fn snapshot_test_meta(id: &str) -> SubagentMeta {
     SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: id.into(),
         parent_session_id: "session-A".into(),
         child_session_id: format!("child-{id}"),
@@ -902,6 +907,7 @@ async fn completion_gate_off_preserves_and_records_no_ref() {
 #[test]
 fn subagent_session_metadata_roundtrip() {
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-1".into(),
         parent_session_id: "parent-1".into(),
         child_session_id: "child-1".into(),
@@ -963,6 +969,7 @@ fn subagent_session_metadata_roundtrip() {
 #[test]
 fn subagent_session_metadata_non_forked() {
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-2".into(),
         parent_session_id: "parent-2".into(),
         child_session_id: "child-2".into(),
@@ -1028,6 +1035,7 @@ fn subagent_session_metadata_backward_compat_deserialization() {
 #[test]
 fn upload_lifecycle_spawn_then_completion_preserves_fields() {
     let spawn_meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-lifecycle".into(),
         parent_session_id: "parent-1".into(),
         child_session_id: "child-1".into(),
@@ -1106,6 +1114,7 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
 #[test]
 fn upload_lifecycle_failure_preserves_error() {
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-fail".into(),
         parent_session_id: "p".into(),
         child_session_id: "c".into(),
@@ -1155,6 +1164,7 @@ fn initial_context_source_resumed_variant() {
 #[test]
 fn session_metadata_session_kind_for_resumed() {
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-resume".into(),
         parent_session_id: "p".into(),
         child_session_id: "c".into(),
@@ -1247,6 +1257,7 @@ fn resume_prefix_len_counts_consecutive_system_head() {
 #[test]
 fn resume_source_worktree_reuse() {
     let source_with_worktree = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "sub-wt".into(),
         child_session_id: "child-wt".into(),
         child_cwd: "/tmp/worktree".into(),
@@ -1266,6 +1277,7 @@ fn resume_source_worktree_reuse() {
         "should reuse source worktree"
     );
     let source_without_worktree = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "sub-no-wt".into(),
         child_session_id: "child-no-wt".into(),
         child_cwd: "/workspace".into(),
@@ -1308,6 +1320,7 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
     let dir = tempfile::TempDir::new().unwrap();
     let existing = dir.path().to_string_lossy().into_owned();
     let present = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "sub-present".into(),
         child_session_id: "child-present".into(),
         child_cwd: existing.clone(),
@@ -1335,6 +1348,7 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
 #[test]
 fn select_override_cwd_resume_never_falls_through_to_request_cwd() {
     let source = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "sub-wt".into(),
         child_session_id: "child-wt".into(),
         child_cwd: "/tmp/whatever".into(),
@@ -1361,6 +1375,7 @@ fn resumable_source_rejects_cross_session_lookup() {
         .insert(
             "sub-other".to_string(),
             CompletedSubagent {
+                antigravity_conversation_id: None,
                 subagent_id: "sub-other".into(),
                 parent_session_id: "session-A".into(),
                 parent_prompt_id: None,
@@ -1458,6 +1473,7 @@ fn durable_fallback_roundtrips_child_cwd_and_worktree() {
         .join(uuid::Uuid::now_v7().to_string());
     let _ = std::fs::create_dir_all(&dir);
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-dur".into(),
         parent_session_id: "parent-dur".into(),
         child_session_id: "child-dur".into(),
@@ -1498,6 +1514,7 @@ fn durable_fallback_rejects_running_status() {
     let parent_dir = dir.join("subagents").join("sa-running");
     let _ = std::fs::create_dir_all(&parent_dir);
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-running".into(),
         parent_session_id: "parent-x".into(),
         child_session_id: "child-running".into(),
@@ -1580,6 +1597,7 @@ fn drain_cancelled_finish_broadcasts(
 /// A `running` meta with no terminal counterpart, as left by a dead process.
 fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
     SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: id.into(),
         parent_session_id: parent_session_id.into(),
         child_session_id: format!("child-{id}"),
@@ -1965,6 +1983,7 @@ fn reconcile_orphan_persists_subagent_finished_via_cmd_tx() {
 #[test]
 fn resume_rejects_conflicting_subagent_type() {
     let source = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "sub-gp".into(),
         child_session_id: "child-gp".into(),
         child_cwd: "/workspace".into(),
@@ -1983,6 +2002,7 @@ fn resume_rejects_conflicting_subagent_type() {
 #[test]
 fn resume_rejects_conflicting_persona() {
     let source = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "sub-impl".into(),
         child_session_id: "child-impl".into(),
         child_cwd: "/workspace".into(),
@@ -2000,6 +2020,7 @@ fn resume_rejects_conflicting_persona() {
 #[test]
 fn resume_allows_matching_identity() {
     let source = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "sub-ok".into(),
         child_session_id: "child-ok".into(),
         child_cwd: "/workspace".into(),
@@ -2017,6 +2038,7 @@ fn resume_allows_matching_identity() {
 #[test]
 fn resume_identity_does_not_gate_on_model() {
     let source = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "sub-model".into(),
         child_session_id: "child-model".into(),
         child_cwd: "/workspace".into(),
@@ -2043,6 +2065,7 @@ fn durable_meta_roundtrips_effective_model_id() {
         .join(uuid::Uuid::now_v7().to_string());
     let _ = std::fs::create_dir_all(&dir);
     let meta = SubagentMeta {
+        antigravity_conversation_id: None,
         subagent_id: "sa-model".into(),
         parent_session_id: "parent".into(),
         child_session_id: "child".into(),
@@ -2109,6 +2132,7 @@ fn resume_route_pins_overlapping_slug_to_its_provider_profile() {
     ]);
 
     let source = ResumeSourceData {
+        antigravity_conversation_id: None,
         subagent_id: "source".into(),
         child_session_id: "child".into(),
         child_cwd: "/workspace".into(),
@@ -2256,6 +2280,7 @@ fn completed_subagent_propagates_resumed_from() {
         .insert(
             "sub-prov".to_string(),
             CompletedSubagent {
+                antigravity_conversation_id: None,
                 subagent_id: "sub-prov".into(),
                 parent_session_id: "parent".into(),
                 parent_prompt_id: Some("prompt-1".into()),

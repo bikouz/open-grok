@@ -2526,6 +2526,42 @@ pub(in crate::app::dispatch) fn set_auto_update(app: &mut AppView, new: bool) ->
 }
 
 // ---------------------------------------------------------------------------
+// antigravity_subagents — SHELL-OWNED `Option<bool>` on
+// `[ui].antigravity_subagents`. Restart-required (the shell resolves the
+// Antigravity roster once at startup). The row itself is hidden when the
+// `agy` binary is absent, so this setter only fires with the CLI installed.
+// ---------------------------------------------------------------------------
+
+/// State-only mutation for `antigravity_subagents`.
+pub(super) fn set_antigravity_subagents_inner(app: &mut AppView, value: bool) {
+    app.current_ui.antigravity_subagents = Some(value);
+}
+
+/// Outer dispatcher for `Action::SetAntigravitySubagents`.
+pub(in crate::app::dispatch) fn set_antigravity_subagents(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev_state = app.current_ui.antigravity_subagents;
+    let prev_effective = prev_state.unwrap_or(false);
+    if prev_effective == new && prev_state.is_some() {
+        return vec![];
+    }
+    set_antigravity_subagents_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "antigravity_subagents", value = new, "setting changed");
+    app.show_toast(&format!(
+        "{} (restart to apply)",
+        save_success_toast("Antigravity subagents", new),
+    ));
+    vec![Effect::PersistSetting {
+        key: "antigravity_subagents",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev_effective),
+    }]
+}
+
+// ---------------------------------------------------------------------------
 // display_refresh_auto_cadence — SHELL-OWNED nested Option on
 // `[ui.display_refresh].auto_cadence_enabled`. Restart-required.
 // ---------------------------------------------------------------------------

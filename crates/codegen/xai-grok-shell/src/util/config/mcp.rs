@@ -32,6 +32,10 @@ pub struct Config {
     pub cli: crate::agent::config::CliConfig,
     pub models: crate::agent::config::ModelsConfig,
     pub ui: crate::agent::config::UiConfig,
+    /// `[antigravity]` section — Antigravity CLI subagent knobs. Read-only
+    /// here (no settings writer); the on-disk table survives saves via
+    /// `merge_section`'s unmodeled-key preservation.
+    pub antigravity: crate::agent::config::AntigravityConfig,
     pub harness: crate::agent::config::HarnessConfig,
     pub skills: SkillsConfig,
     /// `[compat]` vendor-compatibility config, round-tripped so the

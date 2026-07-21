@@ -326,6 +326,7 @@ impl SubagentCoordinator {
                     block_waited: false,
                     explicitly_killed: false,
                     persisted_output_dir: None,
+                    antigravity_conversation_id: None,
                 },
             );
         self.enforce_completed_cap();
@@ -349,6 +350,75 @@ impl SubagentCoordinator {
         self.pending.remove(&tracker.subagent_id);
         self.active.insert(tracker.subagent_id.clone(), tracker);
         self.sync_running_gauge();
+    }
+    /// Move a pending subagent straight to `completed` with a full result.
+    ///
+    /// Used by CLI-backed (antigravity) subagents: they never promote to an
+    /// active `SubagentTracker` because there is no child session to hold a
+    /// handle for — the whole run happens while the entry sits in `pending`
+    /// (whose `cancel_token` keeps kill/cancel flows working). Mirrors
+    /// `move_to_completed`'s summary/eviction/notify behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_pending_with_result(
+        &mut self,
+        id: &str,
+        result: SubagentResult,
+        resumed_from: Option<String>,
+        child_cwd: String,
+        worktree_path: Option<PathBuf>,
+        effective_model_id: String,
+        antigravity_conversation_id: Option<String>,
+        persisted_output_dir: Option<PathBuf>,
+    ) {
+        let Some(pending) = self.pending.remove(id) else {
+            return;
+        };
+        self.sync_running_gauge();
+        let block_waited = self.is_block_waited(id);
+        let explicitly_killed = self.is_explicitly_killed(id);
+        let mut completed = CompletedSubagent {
+            subagent_id: pending.subagent_id,
+            parent_session_id: pending.parent_session_id,
+            parent_prompt_id: pending.parent_prompt_id,
+            child_session_id: result.child_session_id.clone(),
+            description: pending.description,
+            subagent_type: pending.subagent_type,
+            persona: pending.persona,
+            started_at: pending.started_at,
+            completed_at: std::time::Instant::now(),
+            result,
+            resumed_from,
+            child_cwd,
+            worktree_path,
+            snapshot_ref: None,
+            effective_model_id,
+            model_route: None,
+            block_waited,
+            explicitly_killed,
+            persisted_output_dir,
+            antigravity_conversation_id,
+        };
+        let success = completed.result.success && !completed.result.cancelled;
+        if pending.surface_completion {
+            self.pending_completions
+                .push(SubagentCompletionSummary {
+                    subagent_id: id.to_string(),
+                    subagent_type: completed.subagent_type.clone(),
+                    description: completed.description.clone(),
+                    success,
+                    duration_ms: completed.result.duration_ms,
+                    tool_calls: completed.result.tool_calls,
+                    turns: completed.result.turns,
+                    output: completed.result.output.clone(),
+                    error: completed.result.error.clone(),
+                });
+        }
+        if completed.persisted_output_dir.is_some() {
+            completed.result.output = Arc::from("");
+        }
+        self.completed.insert(id.to_string(), completed);
+        self.enforce_completed_cap();
+        self.completion_notify.notify_waiters();
     }
     /// Move a finished subagent from `active` to `completed`.
     /// Returns the tracker if it was active.
@@ -410,6 +480,7 @@ impl SubagentCoordinator {
             block_waited,
             explicitly_killed,
             persisted_output_dir,
+            antigravity_conversation_id: None,
         };
         let success = completed.result.success && !completed.result.cancelled;
         {

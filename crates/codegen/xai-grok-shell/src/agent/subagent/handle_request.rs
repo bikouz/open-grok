@@ -37,6 +37,12 @@ pub(super) fn task_model_override_error(
         return None;
     }
     let requested = requested?;
+    if crate::agent::antigravity::is_antigravity_slug(requested) {
+        // `antigravity:*` slugs bypass the HTTP model catalog; the
+        // antigravity dispatch branch performs the authoritative async
+        // checks (feature toggle, binary, sign-in, roster).
+        return None;
+    }
     crate::agent::models::task_model_error_for_catalog_with_provider_auth(
         requested,
         available,
@@ -473,6 +479,46 @@ pub(crate) async fn handle_subagent_request(
             }
         }
     }
+    // ── Antigravity dispatch ────────────────────────────────────────────
+    // `antigravity:*` models run out-of-process via the Antigravity CLI:
+    // no child session, no SamplingClient. A resumed antigravity source
+    // routes here through its stored model id (overrides are cleared on
+    // resume above, mirroring the HTTP path's model pinning).
+    let antigravity_model = effective_runtime
+        .model
+        .as_deref()
+        .and_then(crate::agent::antigravity::strip_model_prefix)
+        .map(str::to_string)
+        .or_else(|| {
+            resume_source.as_ref().and_then(|source| {
+                source
+                    .model_id
+                    .as_deref()
+                    .and_then(crate::agent::antigravity::strip_model_prefix)
+                    .map(str::to_string)
+            })
+        });
+    if let Some(agy_model) = antigravity_model {
+        super::antigravity_runner::run_antigravity_subagent(
+            super::antigravity_runner::AntigravityLaunch {
+                request,
+                agy_model,
+                effective_runtime: &effective_runtime,
+                resume_source: resume_source.as_ref(),
+                worktree_path,
+                worktree_freshly_created,
+                run_in_background,
+                cancel_token: cancel_token.clone(),
+                start,
+            },
+            &ctx,
+            coordinator,
+            gateway,
+            pending_guard,
+        )
+        .await;
+        return;
+    }
     if request.fork_context {
         effective_runtime.model = Some(ctx.model_id.0.to_string());
     }
@@ -672,6 +718,7 @@ pub(crate) async fn handle_subagent_request(
         snapshot_ref: None,
         effective_model_id: Some(effective_model_id.0.to_string()),
         model_route: meta_model_route,
+        antigravity_conversation_id: None,
     };
     let child_allows_xai_export = effective_sampling_config
         .provider

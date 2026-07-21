@@ -67,6 +67,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "scroll_lines",
     "invert_scroll",
     "display_refresh_auto_cadence",
+    "antigravity_subagents",
     "coding_data_sharing",
     "default_selected_permission",
     "plan_mode",
@@ -129,6 +130,8 @@ fn matrix_is_subset_of_registry() {
 fn make_state() -> SettingsModalState {
     // Voice rows are hidden when the process gate is off (default until startup).
     xai_grok_pager::app::set_voice_mode_enabled_for_test(true);
+    // Same for the antigravity row (hidden unless the CLI presence gate is on).
+    xai_grok_pager::app::set_antigravity_cli_present_for_test(true);
     SettingsModalState::new(
         Arc::new(SettingsRegistry::defaults()),
         UiConfig::default(),
@@ -309,6 +312,12 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
             assert_eq!(
                 b, expected,
                 "SetDisplayRefreshAutoCadence value differs from expected"
+            )
+        }
+        ("antigravity_subagents", Action::SetAntigravitySubagents(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetAntigravitySubagents value differs from expected"
             )
         }
         (key, action) => panic!(
@@ -2117,6 +2126,7 @@ fn registry_kind_membership_through_pr_14() {
             "page_flip_on_send",
             "simple_mode",
             "swarm_mode",
+            "antigravity_subagents",
             "vim_mode",
             "remember_tool_approvals",
             "toolset.ask_user_question.timeout_enabled",
@@ -2338,6 +2348,7 @@ fn defaults_round_trip_through_registry() {
             "scroll_lines" => SettingValue::Int(3),
             "invert_scroll" => SettingValue::Bool(false),
             "display_refresh_auto_cadence" => SettingValue::Bool(false),
+            "antigravity_subagents" => SettingValue::Bool(false),
             "coding_data_sharing" => SettingValue::Enum("opt-out"),
             "default_selected_permission" => SettingValue::Enum("always_allow_all_sessions"),
             "hunk_tracker_mode" => SettingValue::Enum("agent_only"),
@@ -2434,6 +2445,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
             | SettingsKeyOutcome::Action(Action::SetDisplayRefreshAutoCadence(_))
+            | SettingsKeyOutcome::Action(Action::SetAntigravitySubagents(_))
             | SettingsKeyOutcome::Action(Action::SetXSearchEnabled(_)) => {}
             other => panic!(
                 "expected a typed bool setter for `{}`, got {:?}",
@@ -7721,6 +7733,97 @@ fn display_refresh_auto_cadence_defaults_roundtrip_via_current_value_for() {
     ui_on.display_refresh.auto_cadence_enabled = Some(true);
     let value = current_value_for("display_refresh_auto_cadence", &ui_on, &pager)
         .expect("current_value_for(display_refresh_auto_cadence) must resolve");
+    assert_eq!(value, SettingValue::Bool(true));
+}
+
+// ---------------------------------------------------------------------------
+// antigravity_subagents — SHELL-owned Bool (Agent, default false, row gated
+// on the Antigravity CLI presence static — make_state() turns the gate on)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn antigravity_subagents_space_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "antigravity_subagents");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "antigravity_subagents", true);
+}
+
+#[test]
+fn antigravity_subagents_enter_dispatches_typed_setter() {
+    // Seed on so Enter toggles off.
+    xai_grok_pager::app::set_antigravity_cli_present_for_test(true);
+    let mut ui = UiConfig::default();
+    ui.antigravity_subagents = Some(true);
+    let mut s = SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        ui,
+        PagerLocalSnapshot {
+            auto_mode_gate: true,
+            ..PagerLocalSnapshot::default()
+        },
+    );
+    navigate_to(&mut s, "antigravity_subagents");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert_set_bool_action(outcome, "antigravity_subagents", false);
+}
+
+#[test]
+fn antigravity_subagents_mouse_click_two_stage_toggles() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "antigravity_subagents") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        10,
+        row_y,
+    );
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "first body-click should only select, got {outcome:?}"
+    );
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        10,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "antigravity_subagents", true);
+}
+
+#[test]
+fn antigravity_subagents_meta_agent_shell_restart() {
+    let reg = SettingsRegistry::defaults();
+    let meta = reg
+        .find("antigravity_subagents")
+        .expect("antigravity_subagents registered");
+    assert_eq!(meta.category, SettingCategory::Agent);
+    assert_eq!(meta.owner, SettingOwner::Shell);
+    assert!(meta.restart_required);
+    assert!(!meta.hidden_in_minimal);
+    assert_eq!(meta.label, "Antigravity subagents");
+    match &meta.kind {
+        SettingKind::Bool { default } => {
+            assert!(!default, "antigravity_subagents must default OFF")
+        }
+        other => panic!("expected Bool kind for antigravity_subagents, got {other:?}"),
+    }
+}
+
+#[test]
+fn antigravity_subagents_defaults_roundtrip_via_current_value_for() {
+    use xai_grok_pager::settings::current_value_for;
+    let ui = UiConfig::default();
+    let pager = PagerLocalSnapshot::default();
+    let value = current_value_for("antigravity_subagents", &ui, &pager)
+        .expect("current_value_for(antigravity_subagents) must resolve");
+    assert_eq!(value, SettingValue::Bool(false));
+
+    let mut ui_on = UiConfig::default();
+    ui_on.antigravity_subagents = Some(true);
+    let value = current_value_for("antigravity_subagents", &ui_on, &pager)
+        .expect("current_value_for(antigravity_subagents) must resolve");
     assert_eq!(value, SettingValue::Bool(true));
 }
 

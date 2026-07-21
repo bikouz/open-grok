@@ -1495,6 +1495,23 @@ pub(crate) async fn run(
             "note": "the toggle chord is scrollback-only; press Tab to focus scrollback first, or use /toggle-mouse-reporting from anywhere",
         })),
     );
+    // Antigravity CLI presence gate: the "Antigravity subagents" settings row
+    // is hidden unless the binary resolves (honoring `[antigravity].binary`).
+    let antigravity_present = {
+        let antigravity_cfg = effective_config
+            .as_ref()
+            .and_then(|cfg| cfg.get("antigravity"))
+            .and_then(|section| {
+                section
+                    .clone()
+                    .try_into::<xai_grok_shell::agent::config::AntigravityConfig>()
+                    .ok()
+            })
+            .unwrap_or_default();
+        xai_grok_shell::agent::antigravity::cli_installed(&antigravity_cfg)
+    };
+    crate::app::ANTIGRAVITY_CLI_PRESENT
+        .store(antigravity_present, std::sync::atomic::Ordering::Release);
     let config_session_bools = load_initial_config_session_bools();
     app.show_tips = config_session_bools.show_tips;
     app.auto_update = config_session_bools.auto_update;

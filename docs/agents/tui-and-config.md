@@ -120,6 +120,41 @@ swarm_mode = false
 - **Live UI:** an active session shows a bold `swarm` footer badge. Swarm children render in one foldable scrollback card with fixed input-order slots, running/queued/completed/failed/cancelled counts, elapsed time, tool/turn counts, and context usage. Ordinary child tracking remains available through the tasks pane and framed transcript view.
 - **Dispatch contract:** pager one-shot submission uses one ordered effect (`swarm_mode_changed` before `session/prompt`). If either send fails before the prompt is accepted, the optimistic turn is rolled back and the draft is restored.
 
+### Antigravity subagents
+
+```toml
+[ui]
+antigravity_subagents = false   # Settings row: "Antigravity subagents"
+
+[antigravity]                   # optional operator knobs (no Settings UI)
+binary = "agy"                  # name or absolute path of the Antigravity CLI
+skip_permissions = false        # allow file edits + commands (see below)
+```
+
+- **What it does:** when enabled, the Antigravity CLI's models become subagent
+  models for the `task`, `agent_swarm`, and `workflow` tools as
+  `antigravity:<model>` slugs (e.g. `antigravity:gemini-3.1-pro`), queried live
+  from `agy models`. The child runs out-of-process via `agy --print` — its own
+  model, login, and tool loop; no `SamplingClient` — with the workspace granted
+  via `--add-dir` and the conversation id captured from `--log-file` so
+  `resume_from` continues the same CLI conversation (`--conversation`).
+- **Gating:** the Settings row is hidden unless the binary resolves
+  (`xai-grok-pager` seeds `ANTIGRAVITY_CLI_PRESENT` at startup, honoring
+  `[antigravity].binary`). Being signed out of `agy` fails spawns with a
+  "run `agy` to sign in" error; the roster/validator caches probe results
+  (`agent/antigravity.rs`, 5m TTL signed-in / 30s signed-out). Restart
+  required after toggling.
+- **Permissions:** headless `agy` auto-denies mutating tools, so antigravity
+  subagents are read-only researchers by default. `skip_permissions = true`
+  passes agy's auto-approve flag for spawns whose capability mode is not
+  read-only — that trusts Antigravity's agent with workspace writes and
+  command execution; leave it off unless you want worker subagents.
+- **Anchors:** CLI mechanics `xai-grok-shell/src/agent/antigravity.rs`;
+  dispatch branch `agent/subagent/handle_request.rs` (routes `antigravity:*`
+  to `agent/subagent/antigravity_runner.rs`); roster/validator injection
+  `session/agent_rebuild.rs`; conversation id persisted in subagent
+  `meta.json` (`antigravity_conversation_id`).
+
 ### Notable env vars
 
 | Var | Role |

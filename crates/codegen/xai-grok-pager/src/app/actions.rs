@@ -633,6 +633,9 @@ pub enum Action {
     /// Commit `[ui.display_refresh].auto_cadence_enabled`. Restart-required —
     /// cadence is pinned once at startup.
     SetDisplayRefreshAutoCadence(bool),
+    /// Commit `[ui].antigravity_subagents` — allow Antigravity CLI (`agy`)
+    /// models as subagents. Restart-required — the shell reads it at startup.
+    SetAntigravitySubagents(bool),
     /// Preview a theme without persisting — updates the live display
     /// only. Used by the picker on Up/Down and Esc (revert).
     PreviewTheme(String),
