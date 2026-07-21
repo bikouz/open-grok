@@ -677,12 +677,12 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::KillTerminalCommandTool>();
         b.register::<grok_build::TodoWriteTool>();
         b.register::<grok_build::UpdateGoalTool>();
+        b.register::<grok_build::WorkflowTool>();
         b.register::<grok_build::TaskOutputTool>();
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();
         b.register::<grok_build::TaskTool>();
         b.register::<grok_build::AgentSwarmTool>();
-        b.register::<grok_build::WorkflowTool>();
         b.register::<grok_build::WebSearchTool>();
         b.register::<grok_build::XSearchTool>();
         b.register_with_params::<grok_build::WebFetchTool, grok_build::web_fetch::WebFetchParams>();
@@ -1202,9 +1202,12 @@ impl ToolRegistryBuilder {
         if let (Some(cmd_rx), Some(cancel_token)) = (scheduler_cmd_rx, &scheduler_cancel_token) {
             let actor = crate::implementations::grok_build::scheduler::actor::SchedulerActor {
                 resources: shared_resources.clone(),
+                resources_persistence: persistence.clone(),
                 notification_handle: scheduler_notification_handle,
                 cmd_rx,
                 cancel_token: cancel_token.clone(),
+                clock: Default::default(),
+                pending_removal: None,
             };
             tokio::spawn(actor.run());
         }

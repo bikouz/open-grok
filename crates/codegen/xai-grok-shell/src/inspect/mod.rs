@@ -73,7 +73,6 @@ pub struct InspectReport {
     pub lsp_servers: Vec<LspServerEntry>,
     pub config_sources: ConfigSources,
     pub external_compat: ExternalCompatReport,
-    /// Warnings from `[model.*]` and `[auth_provider.*]` parsing.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub config_warnings: Vec<crate::agent::config_model_override_parse::ConfigWarning>,
 }
@@ -758,11 +757,10 @@ async fn list_skills(
     )
     .await;
 
-    let grok_home = crate::util::grok_home::grok_home();
     skills
         .into_iter()
         .map(|s| {
-            let source = skill_entry_source(&s, &grok_home);
+            let source = skill_entry_source(&s);
             let vendor = derive_vendor(&s.path).map(String::from);
             SkillEntry {
                 name: s.label().to_string(),
@@ -781,22 +779,8 @@ async fn list_skills(
 /// Resolve the inspect-facing source for a discovered skill.
 ///
 /// Prefers the discovery-stamped `config_source` (plugin skills,
-/// `[skills].paths` entries), then falls back to a scope mapping. One
-/// display-only fixup: bundled skills are extracted to
-/// `<grok_home>/skills/<name>/SKILL.md` and discovered as user skills, so a
-/// skill at exactly that path with a bundled name is re-labeled `Bundled`
-/// (`builtin::is_extracted_bundled_skill`) — a same-named skill anywhere else
-/// stays non-bundled. Runtime discovery scopes/precedence are untouched.
-///
-/// `Bundled`/`Server` sources are constructed only here, never by runtime
-/// discovery: deployed pagers parse `x.ai/skills/list` into a typed
-/// `ConfigSource` and reject unknown tags, so runtime stamping must wait
-/// until clients without these variants have aged out. Until then this
-/// mapping is the single owner of the scope→source translation.
-fn skill_entry_source(
-    s: &xai_grok_agent::prompt::skills::SkillInfo,
-    grok_home: &Path,
-) -> ConfigSource {
+/// `[skills].paths` entries), then falls back to the discovered scope.
+fn skill_entry_source(s: &xai_grok_agent::prompt::skills::SkillInfo) -> ConfigSource {
     use xai_grok_tools::implementations::skills::types::SkillScope;
 
     if let Some(source) = s.config_source.clone() {
@@ -805,13 +789,7 @@ fn skill_entry_source(
     let path = PathBuf::from(&s.path);
     match s.scope {
         SkillScope::Local | SkillScope::Repo => ConfigSource::Project { path },
-        SkillScope::User => {
-            if crate::builtin::is_extracted_bundled_skill(&s.name, &path, grok_home) {
-                ConfigSource::Bundled { path }
-            } else {
-                ConfigSource::User { path }
-            }
-        }
+        SkillScope::User => ConfigSource::User { path },
         SkillScope::Server => ConfigSource::Server { path },
         SkillScope::Bundled => ConfigSource::Bundled { path },
         SkillScope::Plugin => ConfigSource::Plugin {
@@ -1239,9 +1217,6 @@ fn disabled_compat_tags(
     }
 }
 
-/// Renders the "Config Warnings" section of the human report; empty when
-/// there are no warnings. Covers `[model.*]` overrides and the
-/// `[auth_provider.*]` tables, which share the same warning channel.
 fn render_config_warnings(
     warnings: &[crate::agent::config_model_override_parse::ConfigWarning],
 ) -> String {
@@ -1933,25 +1908,20 @@ mod tests {
 
     #[test]
     fn skill_entry_source_maps_scopes() {
-        let home = Path::new("/home/u/.opengrok");
-
         let s = skill_fixture("a", "/repo/.opengrok/skills/a/SKILL.md", SkillScope::Local);
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::Project { .. }
         ));
 
         let s = skill_fixture("b", "/repo/.opengrok/skills/b/SKILL.md", SkillScope::Repo);
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::Project { .. }
         ));
 
         let s = skill_fixture("c", "/home/u/.opengrok/skills/c/SKILL.md", SkillScope::User);
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::User { .. }
-        ));
+        assert!(matches!(skill_entry_source(&s), ConfigSource::User { .. }));
 
         let s = skill_fixture(
             "d",
@@ -1959,7 +1929,7 @@ mod tests {
             SkillScope::Server,
         );
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::Server { .. }
         ));
 
@@ -1969,71 +1939,8 @@ mod tests {
             SkillScope::Bundled,
         );
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::Bundled { .. }
-        ));
-    }
-
-    /// Bundled skills are re-labeled `Bundled` only at their exact extraction
-    /// path `<grok_home>/skills/<name>/SKILL.md`; a same-named skill anywhere
-    /// else keeps its real source.
-    #[test]
-    fn skill_entry_source_relabels_extracted_bundled_skills() {
-        let home = Path::new("/home/u/.opengrok");
-
-        let s = skill_fixture(
-            "help",
-            "/home/u/.opengrok/skills/help/SKILL.md",
-            SkillScope::User,
-        );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::Bundled { .. }
-        ));
-
-        // Bundled name in a project dir: stays project.
-        let s = skill_fixture(
-            "help",
-            "/repo/.opengrok/skills/help/SKILL.md",
-            SkillScope::Repo,
-        );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::Project { .. }
-        ));
-
-        // Bundled name in a user dir outside <grok_home>/skills: stays user.
-        let s = skill_fixture(
-            "help",
-            "/home/u/other-skills/help/SKILL.md",
-            SkillScope::User,
-        );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::User { .. }
-        ));
-
-        // Bundled frontmatter name in a different dir under <grok_home>/skills:
-        // not the extracted copy — stays user.
-        let s = skill_fixture(
-            "help",
-            "/home/u/.opengrok/skills/my-tools/SKILL.md",
-            SkillScope::User,
-        );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::User { .. }
-        ));
-
-        // Non-bundled name under <grok_home>/skills: stays user.
-        let s = skill_fixture(
-            "my-skill",
-            "/home/u/.opengrok/skills/my-skill/SKILL.md",
-            SkillScope::User,
-        );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::User { .. }
         ));
     }
 
@@ -2041,13 +1948,12 @@ mod tests {
     /// over the scope fallback.
     #[test]
     fn skill_entry_source_prefers_stamped_config_source() {
-        let home = Path::new("/home/u/.opengrok");
         let mut s = skill_fixture("cfg", "/team/skills/cfg/SKILL.md", SkillScope::User);
         s.config_source = Some(ConfigSource::ConfigToml {
             path: PathBuf::from("/team/skills/cfg/SKILL.md"),
         });
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::ConfigToml { .. }
         ));
     }

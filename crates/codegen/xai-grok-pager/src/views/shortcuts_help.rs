@@ -1771,6 +1771,71 @@ mod tests {
     }
 
     #[test]
+    fn build_entries_show_mode_correct_ctrl_g_and_shared_ctrl_b() {
+        for mode in [
+            crate::app::ScreenMode::Fullscreen,
+            crate::app::ScreenMode::Inline,
+            crate::app::ScreenMode::Minimal,
+        ] {
+            let registry = ActionRegistry::defaults_for(mode);
+            let prompt_contexts = [When::PromptFocused, When::AgentScreen, When::Always];
+            let entries = build_entries(&prompt_contexts, &registry, true);
+
+            let row = |action: ActionId| {
+                entries.iter().find_map(|entry| match entry {
+                    ShortcutsHelpEntry::Hint {
+                        item,
+                        action_id: Some(id),
+                        ..
+                    } if *id == action => Some(item),
+                    _ => None,
+                })
+            };
+            let background = row(ActionId::SendToBackground).expect("background row");
+            assert_eq!(background.keys, vec![crate::key!('b', CONTROL)]);
+
+            let agent_ctrl_g_rows: Vec<_> = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    ShortcutsHelpEntry::Hint {
+                        item,
+                        action_id: Some(id),
+                        ..
+                    } if item.keys.contains(&crate::key!('g', CONTROL))
+                        && registry
+                            .find(*id)
+                            .is_some_and(|def| def.context == When::AgentScreen) =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if mode.is_minimal() {
+                assert!(row(ActionId::FocusScrollback).is_none());
+            } else {
+                assert!(row(ActionId::FocusScrollback).is_some());
+            }
+
+            let expected = if mode.is_minimal() {
+                ActionId::EditPromptExternal
+            } else {
+                ActionId::ToggleTasks
+            };
+            assert_eq!(agent_ctrl_g_rows, vec![expected]);
+            assert!(row(expected).is_some());
+            assert!(
+                row(if mode.is_minimal() {
+                    ActionId::ToggleTasks
+                } else {
+                    ActionId::EditPromptExternal
+                })
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn build_entries_includes_new_pane_actions() {
         let registry = ActionRegistry::defaults();
         let entries = build_entries(&all_contexts(), &registry, true);

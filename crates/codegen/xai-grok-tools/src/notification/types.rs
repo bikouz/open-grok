@@ -312,6 +312,10 @@ pub struct ScheduledTaskFired {
     /// RFC3339 timestamp of next fire (for live countdown viz).
     pub next_fire_at: Option<String>,
     pub subagent_id: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub generation: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub revision: u64,
 }
 
 /// Notification that a scheduled task was removed (deleted, expired, or one-shot completed).
@@ -319,6 +323,10 @@ pub struct ScheduledTaskFired {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScheduledTaskRemoved {
     pub task_id: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub generation: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub revision: u64,
 }
 
 /// Notification that a scheduled task was created and should appear in the tasks pane.
@@ -333,6 +341,10 @@ pub struct ScheduledTaskCreated {
     pub human_schedule: String,
     /// RFC3339 timestamp of next fire (for live countdown viz).
     pub next_fire_at: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub generation: String,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub revision: u64,
 }
 
 /// A streaming event from a Monitor tool background process.
@@ -354,22 +366,6 @@ pub struct MonitorEvent {
     /// legacy backends. The bridge drops events whose owner isn't its session.
     #[cfg_attr(feature = "serde", serde(default))]
     pub owner_session_id: Option<String>,
-}
-
-/// Progress snapshot streamed by the `workflow` tool while its orchestration
-/// script runs. Carries the rendered progress tail (phase, agent counts, and
-/// recent log lines) for the tool card.
-#[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct WorkflowProgress {
-    /// Tool call this progress belongs to.
-    pub tool_call_id: String,
-    /// Workflow run ID (also the swarm cohort ID for its subagents).
-    pub run_id: String,
-    /// `meta.name` of the running workflow script.
-    pub workflow_name: String,
-    /// Rendered progress text (summary line + recent log tail).
-    pub text: String,
 }
 
 /// A notification emitted by a tool during or after execution.
@@ -435,9 +431,6 @@ pub enum ToolNotification {
 
     /// A streaming event from a monitor background process.
     MonitorEvent(MonitorEvent),
-
-    /// A progress snapshot from a running `workflow` orchestration script.
-    WorkflowProgress(WorkflowProgress),
 }
 
 /// Single source of truth for the `(variant tag => payload type)` mapping of
@@ -499,7 +492,6 @@ notification_variants! {
     ScheduledTaskRemoved => ScheduledTaskRemoved,
     ScheduledTaskCreated => ScheduledTaskCreated,
     MonitorEvent => MonitorEvent,
-    WorkflowProgress => WorkflowProgress,
 }
 
 #[cfg(test)]
@@ -624,5 +616,22 @@ mod tests {
             }
             other => panic!("expected BashOutputChunk, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scheduler_lifecycle_versions_default_for_legacy_json_and_round_trip() {
+        let legacy: ScheduledTaskRemoved =
+            serde_json::from_value(serde_json::json!({ "task_id": "loop-1" })).unwrap();
+        assert_eq!(legacy.generation, "");
+        assert_eq!(legacy.revision, 0);
+
+        let current = ScheduledTaskRemoved {
+            task_id: "loop-1".into(),
+            generation: "019b0000-0000-7000-8000-000000000000".into(),
+            revision: 7,
+        };
+        let round_trip: ScheduledTaskRemoved =
+            serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
+        assert_eq!(round_trip, current);
     }
 }

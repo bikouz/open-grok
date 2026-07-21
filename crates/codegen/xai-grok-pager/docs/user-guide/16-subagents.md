@@ -197,49 +197,51 @@ Swarms use the same flat subagent tree: swarm members cannot spawn `task` or ano
 
 ## Workflows
 
-The `workflow` tool lets the agent orchestrate many subagents with a JavaScript script instead of individual tool calls — deterministic control flow (loops, fan-out, verification passes) with real concurrency. Where `agent_swarm` runs one prompt template over a list of items, a workflow script can express multi-stage pipelines, adversarial verification, judge panels, and loop-until-done discovery.
+The `workflow` tool lets the agent orchestrate many subagents with a [Rhai](https://rhai.rs) script instead of individual tool calls — deterministic control flow (loops, fan-out, verification passes) with real concurrency. Where `agent_swarm` runs one prompt template over a list of items, a workflow script can express multi-stage pipelines, adversarial verification, judge panels, and loop-until-done discovery.
 
-Every script starts with a literal `meta` header and then drives agents with the built-in hooks:
+Every script starts with a literal `meta` header and then drives agents with the built-in host functions:
 
-```javascript
-export const meta = {
-  name: 'review-changes',
-  description: 'Review changed files, verify findings',
-  phases: [{ title: 'Review' }, { title: 'Verify' }],
+```rhai
+let meta = #{
+    name: "review-changes",
+    description: "Review changed files, verify findings",
+    phases: [ #{ title: "Review" }, #{ title: "Verify" } ],
+};
+phase("Review");
+let jobs = [];
+for f in files {
+    jobs.push(#{ prompt: "Review " + f + " for bugs", label: "review:" + f, phase: "Review" });
 }
-phase('Review');
-const findings = await parallel(files.map(f => () =>
-  agent('Review ' + f + ' for bugs', { label: 'review:' + f })));
-phase('Verify');
-const verdicts = await pipeline(findings.filter(Boolean),
-  (finding, orig, i) => agent('Adversarially verify: ' + finding, { label: 'verify#' + i }));
-return { verdicts };
+let findings = parallel(jobs);
+phase("Verify");
+let verdicts = [];
+for finding in findings {
+    verdicts.push(agent("Adversarially verify: " + json_encode(finding), #{ phase: "Verify" }));
+}
+complete(#{ verdicts: verdicts });
 ```
 
-Key behaviors:
+Key host functions:
 
-| Hook | Behavior |
+| Function | Behavior |
 | --- | --- |
-| `agent(prompt, opts)` | Spawns a foreground subagent and resolves to its final text. `opts`: `label`, `phase`, `schema` (JSON output contract, parsed result), `model`, `effort`, `isolation: 'worktree'`, `agentType`. Failed agents resolve to `null`. |
-| `parallel(thunks)` | Runs tasks concurrently; a thunk that throws yields `null`. |
-| `pipeline(items, ...stages)` | Runs each item through all stages with no barrier between stages. |
-| `phase(title)` / `log(msg)` | Progress grouping and narration on the workflow card. |
-| `args`, `meta`, `budget` | Tool-call input, parsed meta, and `{total, spent(), remaining()}` token tracking. |
+| `agent(prompt, opts?)` | Spawns a subagent and returns `#{agent_id, success, output, cancelled, tokens_used, duration_ms}`. `opts`: `label`, `phase`, `model`, `agent_type`, `capability_mode` (`"read-only"`/`"read-write"`/`"execute"`/`"all"`), `isolation_worktree`, `resume_from`, `output_schema` (JSON-Schema contract enforced host-side with one corrective retry). |
+| `parallel([opts, ...])` | Runs many agent specs concurrently; order-preserving, failures become `()`. |
+| `phase(title)` / `log(msg)` | Progress grouping and narration in the workflow card and `/workflows` overlay. |
+| `complete(value?)` / `pause(kind, msg)` / `await_user(kind, msg)` | Terminate the run, pause it, or pause once for user input (resume passes through). |
+| `budget()` | `#{total, spent, reserved, remaining}` agent-call accounting. |
+| `write_scratch_file` / `read_scratch_file` / `render_template` / `git_diff_since` | Scratch artifacts, prompt templates, and a bounded diff of the workspace. |
+| `fingerprint(text)` / `json_encode(value)` | Hash and safely fence untrusted data into prompts. |
 
-Workflow children appear as a grouped cohort card (like a swarm) with live per-agent progress, and the workflow tool card streams phase/log lines while the script runs.
+Workflows always run **in the background**: the launch returns immediately, the conversation stays free while agents work, and completion is injected back into the session automatically — no polling. Watch and manage runs in the `/workflows` overlay (live phases, per-agent progress and tokens), or with `/workflow pause|resume|stop|save <name>`.
 
-Workflows run **in the background by default**: the launch returns immediately with a run id, the conversation stays free while agents work, and completion wakes the session with the result. A background run behaves like any other background task — poll it with the task output tool, watch it in the tasks pane, and interrupt it with the kill tool or the tasks-pane kill button. Sending a follow-up message never ends a running workflow.
+Budgets are counted in **agent calls** (default 128, max 1024 per run): every `agent()` call and `parallel()` item consumes one slot. A budget-limited run can be resumed with a strictly higher `agent_budget`; journaled calls replay without re-running.
 
-Runs are journaled under the session directory; calling `workflow` again with `resume_from_run_id` replays unchanged `agent()` calls instantly and re-runs only what changed. After interrupting (or when the agent edits the script), two controls make partial reruns precise:
+Runs are journaled under the session directory. Resuming (`resume_from_run_id`, same process only) replays completed host calls instantly and re-runs only what hadn't finished; the script and `args` must be byte-identical to the original run. Wall-clock (`timestamp()`), `sleep()`, and `exit()` are unavailable inside scripts so replays stay deterministic — pass timestamps through `args`. A process restart marks active runs interrupted (start a new run; the launch persists an editable `script_path` for iteration).
 
-| Control | Effect |
-| --- | --- |
-| `resume_mode: "positional"` | Replay by call position rather than exact prompt text — completed steps still replay after the script's wording was edited, as long as the call structure is unchanged. |
-| `resume_through: <point>` | Go back to a specific point: a phase title, an agent label, or a call index. Results through that point replay; everything after re-runs fresh. |
+Reusable workflows live in a three-scope registry — builtin (`deep-research` ships in the binary), project (`<repo>/.opengrok/workflows/*.rhai`, folder-trust gated), and user (`~/.opengrok/workflows/*.rhai`) — and each registered workflow also surfaces as its own slash command (e.g. `/deep-research`). `/workflow save <name>` persists a run's script to the project scope.
 
-`Date.now()`, `Math.random()`, and argless `new Date()` are unavailable inside scripts so replays stay deterministic — pass timestamps through `args`.
-
-Concurrency is capped automatically (`OPENGROK_WORKFLOW_MAX_CONCURRENCY` overrides; per-agent timeouts honor `OPENGROK_SUBAGENT_TIMEOUT_MS`), a run is limited to 1000 agents, and workflow members follow the same flat tree: they cannot spawn `task`, `agent_swarm`, or another `workflow`.
+A session runs at most 4 active workflows; a run is capped at 1024 agent calls; and workflow members follow the same flat tree: they cannot spawn `task`, `agent_swarm`, or another `workflow`.
 
 ---
 
@@ -328,7 +330,7 @@ Grok Build also discovers roles from `.opengrok/roles/*.toml` and personas from 
 
 Grok Build shows running and finished work in side panes on the agent screen:
 
-- Press `Ctrl+B` to toggle the tasks pane, which lists active and completed subagents and background commands with their status.
+- Press `Ctrl+G` to toggle the tasks pane, which lists active and completed subagents and background commands with their status.
 - Press `Ctrl+T` to toggle the separate todo pane.
 
 To view the available agent types and personas, open the command palette with `Ctrl+P` and choose **Manage Agents** (`/config-agents`).
@@ -354,7 +356,7 @@ Press **Enter** (or Ctrl-F) on the block to open the subagent's full transcript.
 
 For blocking subagents the single entry updates its bullet color when the child finishes. For background ones, a follow-up `Subagent completed/failed/cancelled in Xs: "..."` block is appended.
 
-### Tasks pane (Ctrl+B)
+### Tasks pane (Ctrl+G)
 
 As noted above — grouped under "Subagents", with spinners, elapsed times, and quick access to kill or inspect.
 

@@ -592,6 +592,10 @@ pub fn current_value_for(
         "page_flip_on_send" => Some(SettingValue::Bool(
             crate::appearance::cache::load_page_flip_on_send(),
         )),
+        // Cache is the drain-path source of truth (same pattern as page_flip_on_send).
+        "combine_queued_prompts" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_combine_queued_prompts(),
+        )),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         "swarm_mode" => Some(SettingValue::Bool(ui.swarm_mode.unwrap_or(false))),
         "antigravity_subagents" => Some(SettingValue::Bool(
@@ -985,6 +989,13 @@ mod tests {
                         *default,
                         ui.page_flip_on_send_enabled(),
                         "page_flip_on_send default drifts from UiConfig::default()"
+                    );
+                }
+                ("combine_queued_prompts", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.combine_queued_prompts.unwrap_or(false),
+                        "combine_queued_prompts default drifts from UiConfig::default()"
                     );
                 }
                 ("simple_mode", SettingKind::Bool { default }) => {

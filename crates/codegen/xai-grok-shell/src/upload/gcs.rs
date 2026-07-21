@@ -139,7 +139,7 @@ pub(crate) fn unified_log_url(
         "https://console.cloud.google.com/storage/browser/_details/{bucket}/{session_id}/turn_{turn_number}/unified_log.jsonl"
     ))
 }
-/// Upload bytes to the `auth-diagnostics/{version}/{email}/{ts}.jsonl` path
+/// Upload bytes to the `auth-diagnostics/{version}/{user_id}/{ts}.jsonl` path
 /// for easy aggregation across users. Used by both the auth refresh failure
 /// uploader and the 401/404 error trace uploader.
 pub(crate) async fn upload_to_auth_diagnostics(

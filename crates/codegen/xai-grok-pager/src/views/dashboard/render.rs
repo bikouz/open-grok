@@ -6081,8 +6081,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| matches!(l, DashboardLine::PinnedHeader { count }
-if *count == 1)),
+                .any(|l| matches!(l, DashboardLine::PinnedHeader { count } if *count == 1)),
             "collapsed Pinned header must still render",
         );
         // The pinned row is hidden; the (non-pinned) Working row remains.

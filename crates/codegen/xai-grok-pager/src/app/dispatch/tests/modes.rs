@@ -161,8 +161,7 @@ fn slash_plan_no_args_not_in_plan_enters_plan_mode() {
     // Should emit SetSessionMode to enter plan mode.
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(&effects[0], Effect::SetSessionMode { mode_id, .. }
-if &*mode_id.0 == "plan"),
+        matches!(&effects[0], Effect::SetSessionMode { mode_id, .. } if &*mode_id.0 == "plan"),
         "expected SetSessionMode(plan), got: {effects:?}"
     );
     // Optimistic pending state should be set.
@@ -2315,8 +2314,7 @@ fn set_plan_mode_idempotency_uses_pending_over_active() {
         "OFF from EFFECTIVE-ON must emit Effect::SetSessionMode (not idempotent)"
     );
     assert!(
-        matches!(&effects[0], Effect::SetSessionMode { mode_id, .. }
-if &*mode_id.0 == "default"),
+        matches!(&effects[0], Effect::SetSessionMode { mode_id, .. } if &*mode_id.0 == "default"),
         "OFF transition must emit SetSessionMode(default): {effects:?}"
     );
     let agent = app.agents.get(&AgentId(0)).unwrap();

@@ -626,6 +626,7 @@ fn restore_after_child(
 /// Each attempt uses a bounded safe-handoff wait; timeout leaves the one-shot
 /// request pending, reports once, and gates the next attempt behind a deferred
 /// timer so the feedback frame cannot trigger an immediate blocking retry.
+#[allow(clippy::too_many_arguments)]
 fn run_pending_suspends(
     app: &mut AppView,
     terminal: &mut PagerTerminal,
@@ -636,7 +637,7 @@ fn run_pending_suspends(
     suspend_retry_after: &mut Option<Instant>,
     suspend_wait_reports: &mut SuspendWaitReports,
 ) -> anyhow::Result<()> {
-    let editor_pending = app.pending_editor_path.is_some();
+    let editor_pending = app.pending_editor.is_some();
     let pager_pending = app.pending_pager_path.is_some();
     suspend_wait_reports.reset_missing(editor_pending, pager_pending);
     if !suspend_retry_ready(*suspend_retry_after, Instant::now()) {
@@ -651,50 +652,65 @@ fn run_pending_suspends(
     *suspend_retry_after = None;
 
     // $EDITOR suspend: leave alt screen, disable raw mode, spawn
-    // editor, wait for exit, then restore.
-    if let Some(path) = app.pending_editor_path.take() {
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "vi".to_string());
-        let moved_cursor = match suspend_for_child(
-            app.screen_mode,
-            terminal,
-            input_paused,
-            reader_parked,
-            input_rx,
-            || {
-                let _ = std::process::Command::new(&editor).arg(&path).status();
-            },
-        ) {
-            Ok(moved_cursor) => moved_cursor,
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                requeue_after_suspend_timeout(&mut app.pending_editor_path, path);
-                let first_timeout = defer_suspend_retry(
-                    suspend_retry_after,
-                    &mut suspend_wait_reports.editor_reported,
-                    Instant::now(),
-                );
-                if first_timeout {
-                    report_suspend_wait(app, EDITOR_SUSPEND_WAIT);
-                    presenter.request_presentation(app, terminal, false);
-                }
-                return Ok(());
+    // editor, wait for exit, then restore. Preparation materializes prompt
+    // drafts only immediately before this safe terminal handoff.
+    if let Some(request) = app.pending_editor.take() {
+        let retry_request = request.clone();
+        match crate::app::external_editor::prepare(app, request) {
+            Ok(Some(prepared)) => {
+                let launch = prepared.launch();
+                let mut editor_result = Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid editor command",
+                ));
+                let moved_cursor = match suspend_for_child(
+                    app.screen_mode,
+                    terminal,
+                    input_paused,
+                    reader_parked,
+                    input_rx,
+                    || {
+                        editor_result = std::process::Command::new(&launch.argv[0])
+                            .args(&launch.argv[1..])
+                            .arg(&launch.path)
+                            .status();
+                    },
+                ) {
+                    Ok(moved_cursor) => moved_cursor,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                        drop(prepared);
+                        requeue_after_suspend_timeout(&mut app.pending_editor, retry_request);
+                        let first_timeout = defer_suspend_retry(
+                            suspend_retry_after,
+                            &mut suspend_wait_reports.editor_reported,
+                            Instant::now(),
+                        );
+                        if first_timeout {
+                            report_suspend_wait(app, EDITOR_SUSPEND_WAIT);
+                            presenter.request_presentation(app, terminal, false);
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                crate::app::external_editor::finish(app, prepared, editor_result);
+                // The child owned the screen; re-anchor if it printed inline, and
+                // repaint the full viewport rather than diffing against a screen
+                // state we can no longer vouch for.
+                restore_after_child(terminal, app.screen_mode, moved_cursor);
+                presenter.request_presentation(app, terminal, true);
+                suspend_wait_reports.editor_reported = false;
             }
-            Err(error) => return Err(error.into()),
-        };
-        if let Some(tab) = app.pending_agents_modal_refresh.take()
-            && let ActiveView::Agent(id) = app.active_view
-            && let Some(agent) = app.agents.get_mut(&id)
-            && let Some(ref mut modal) = agent.agents_modal
-        {
-            modal.refresh_after_editor(tab);
+            Ok(None) => {
+                presenter.request_presentation(app, terminal, false);
+                suspend_wait_reports.editor_reported = false;
+            }
+            Err(error) => {
+                crate::app::external_editor::finish_prepare_error(app, error);
+                presenter.request_presentation(app, terminal, false);
+                suspend_wait_reports.editor_reported = false;
+            }
         }
-        // The child owned the screen; re-anchor if it printed inline, and
-        // repaint the full viewport rather than diffing against a screen
-        // state we can no longer vouch for.
-        restore_after_child(terminal, app.screen_mode, moved_cursor);
-        presenter.request_presentation(app, terminal, true);
-        suspend_wait_reports.editor_reported = false;
     }
 
     // /transcript suspend: open the rendered transcript in $PAGER,
@@ -830,6 +846,10 @@ pub(crate) async fn run(
     // poll the leader roster (see the roster-poll arm below).
     app.leader_mode = connection.leader_status_rx.is_some();
     app.screen_mode = term_state.screen_mode;
+    // `AppView::new` precedes the terminal's resolved screen mode. Rebuild the
+    // registry at this I/O boundary; the later config-aware rebuild preserves
+    // this mode while adding the optional mouse-reporting action.
+    app.registry = crate::actions::ActionRegistry::defaults_for(term_state.screen_mode);
     // Agent/dashboard prompts pick the mode up at their creation sites
     // (`apply_app_scoped_gates` / `ensure_dashboard_state`); the welcome prompt
     // already exists, so inject here.
@@ -1322,21 +1342,23 @@ pub(crate) async fn run(
     // when the user enters an agent session.
     {
         let ctx = crate::terminal::terminal_context();
-        let query = crate::diagnostics::LiveTmuxQuery;
-        let mut warnings = crate::diagnostics::collect_startup_warnings(
+        let query = crate::diagnostics::probes::LiveTmuxProbe;
+        let snapshot = crate::diagnostics::probes::collect_startup_tui(
             ctx,
-            &query,
+            crate::diagnostics::probes::TuiProbeEvidence {
+                fullscreen_active: term_state.screen_mode.is_fullscreen(),
+                kitty_flags_pushed: crate::app::kitty_flags_pushed(),
+                xtversion: crate::terminal::xtversion::detected(),
+            },
             term_state.is_control_mode,
-            term_state.screen_mode.is_fullscreen(),
+            &query,
         );
-        // Wayland no-data-control reads the live environment, so it rides its
-        // own wrapper (keeps `collect_startup_warnings` hermetic for tests).
-        warnings.extend(crate::diagnostics::diagnose_wayland_data_control_live());
+        let mut warnings = crate::diagnostics::collect_startup_warnings(&snapshot);
+        warnings.extend(crate::diagnostics::diagnose_wayland_data_control_from_snapshot(&snapshot));
         let notif_warnings = crate::diagnostics::collect_notification_warnings(
-            ctx,
+            &snapshot,
             app.notification_service.protocol(),
             app.notification_service.config().condition,
-            &query,
         );
         // Deduplicate by category: general terminal warnings take priority
         // over notification-specific ones (e.g. DcsPassthrough can fire from
@@ -1360,22 +1382,21 @@ pub(crate) async fn run(
         // `xtversion::detected()` is structurally `None` here (the probe is
         // only sent further down, right before the input reader thread is
         // spawned), so this banner covers env-detected WezTerm; the SSH shape
-        // surfaces in /terminal-setup once the async reply has landed.
-        let wezterm_warning = crate::diagnostics::wezterm_kitty_keyboard_warning(
-            ctx,
-            crate::app::kitty_flags_pushed(),
-            crate::terminal::xtversion::detected(),
-        );
+        // surfaces in /doctor once the async reply has landed.
+        let wezterm_warning = crate::diagnostics::wezterm_kitty_keyboard_warning(&snapshot);
         // Wayland no-data-control is surfaced without the SSH gate of
         // `summarize_warnings` — the broken shape is local (see
         // `assemble_startup_warnings`).
         let wayland_clipboard_warning = all_warnings
             .iter()
             .find(|w| w.category == crate::diagnostics::WarningCategory::WaylandNoDataControl);
+        let sandbox_profile_warning =
+            crate::diagnostics::sandbox_profile_conflict_warning(&app.cwd);
         app.startup_warnings = crate::diagnostics::assemble_startup_warnings(
             wezterm_warning.as_ref(),
             wayland_clipboard_warning,
-            crate::diagnostics::summarize_warnings(&all_warnings)
+            sandbox_profile_warning.as_ref(),
+            crate::diagnostics::summarize_warnings(&all_warnings, snapshot.terminal.is_ssh)
                 .into_iter()
                 .collect(),
         );
@@ -1472,7 +1493,10 @@ pub(crate) async fn run(
         effective_config.as_ref(),
         &app.current_ui,
     );
-    app.registry = crate::actions::ActionRegistry::defaults_with_config(mouse_toggle.value);
+    app.registry = crate::actions::ActionRegistry::defaults_with_config_for(
+        term_state.screen_mode,
+        mouse_toggle.value,
+    );
     // Cache the resolved flag so the `/toggle-mouse-reporting` slash command can
     // gate its visibility/execution without re-reading config on every keystroke.
     crate::app::MOUSE_REPORTING_TOGGLE_ENABLED
@@ -2083,12 +2107,11 @@ pub(crate) async fn run(
         };
 
         // Wake a deferred suspend retry without requiring unrelated input.
-        let suspend_retry_at =
-            if app.pending_editor_path.is_some() || app.pending_pager_path.is_some() {
-                suspend_retry_after
-            } else {
-                None
-            };
+        let suspend_retry_at = if app.pending_editor.is_some() || app.pending_pager_path.is_some() {
+            suspend_retry_after
+        } else {
+            None
+        };
         let suspend_retry = async move {
             match suspend_retry_at {
                 Some(at) => sleep_until(at).await,
@@ -3115,6 +3138,10 @@ struct RoutedInputEvent {
     paste_provenance: PasteProvenance,
 }
 
+fn tty_suspend_armed(app: &AppView) -> bool {
+    app.pending_editor.is_some() || app.pending_pager_path.is_some()
+}
+
 fn normalize_input_event(timed: TimedInputEvent) -> RoutedInputEvent {
     let TimedInputEvent { event, arrived_at } = timed;
     #[cfg(target_os = "linux")]
@@ -3207,6 +3234,7 @@ async fn drain_and_process(
         .map(normalize_input_event)
         .collect::<Vec<_>>();
 
+    let suspend_armed_after_event = std::cell::Cell::new(false);
     let mut handle_one = |routed: &mut RoutedInputEvent| -> bool {
         let ev = &routed.event;
         match ev {
@@ -3405,6 +3433,7 @@ async fn drain_and_process(
             }
             InputOutcome::Unchanged => {}
         }
+        suspend_armed_after_event.set(tty_suspend_armed(app));
         false
     };
 
@@ -3416,6 +3445,10 @@ async fn drain_and_process(
                 resize_only: false,
                 force_repaint: false,
             };
+        }
+        // Hand off to the TTY-taking child before later buffered events mutate UI state.
+        if suspend_armed_after_event.get() {
+            break;
         }
     }
 
@@ -3966,6 +3999,19 @@ mod tests {
             requested_model_provider(effective, &visible, &providers),
             Some(PrimaryProvider::Xai)
         );
+    }
+
+    #[test]
+    fn tty_suspend_arm_stops_same_batch_before_later_ownership_changes() {
+        let mut app = crate::app::app_view::tests::test_app();
+        assert!(!tty_suspend_armed(&app));
+        app.pending_editor = Some(
+            crate::app::external_editor::PendingEditorRequest::PromptDraft {
+                agent_id: crate::app::agent::AgentId(0),
+                original_text: "draft".to_owned(),
+            },
+        );
+        assert!(tty_suspend_armed(&app));
     }
 
     // ── is_voice_chord ───────────────────────────────────────────────────

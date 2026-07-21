@@ -827,6 +827,7 @@ impl ReasoningEffort {
             crate::rs::ReasoningEffort::Medium => Self::Medium,
             crate::rs::ReasoningEffort::High => Self::High,
             crate::rs::ReasoningEffort::Xhigh => Self::Xhigh,
+            crate::rs::ReasoningEffort::Max => Self::Max,
         }
     }
 
@@ -843,7 +844,6 @@ impl ReasoningEffort {
         }
     }
 
-    /// Anthropic Messages API `output_config.effort` string; `None` for unsupported variants.
     pub fn to_messages_api(self) -> Option<&'static str> {
         match self {
             Self::None | Self::Minimal => None,

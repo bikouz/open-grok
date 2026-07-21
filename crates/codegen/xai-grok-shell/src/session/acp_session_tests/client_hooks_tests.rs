@@ -3,8 +3,6 @@ use super::*;
 
 const AGENT_SWARM_EXCLUSIVITY_ERROR: &str = "`agent_swarm` must be the only tool call in its batch. Inspect briefly, then make one exclusive agent_swarm call for independent work; use ordinary task calls for heterogeneous small work.";
 
-const WORKFLOW_EXCLUSIVITY_ERROR: &str = "`workflow` must be the only tool call in its batch. Make one exclusive workflow call; run other tools before or after the workflow.";
-
 #[derive(Default)]
 struct RecordingPermissionClient {
     prompts: std::rc::Rc<std::cell::RefCell<Vec<acp::RequestPermissionRequest>>>,
@@ -1092,61 +1090,6 @@ async fn agent_swarm_batch_rejects_mixed_calls_and_records_error_for_each_tool()
             assert!(
                 bash_result.contains(AGENT_SWARM_EXCLUSIVITY_ERROR),
                 "swarm batch violation must cite the exclusivity message for every call: {bash_result}"
-            );
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn workflow_batch_rejects_mixed_calls_and_records_error_for_each_tool() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (gateway_tx, _gateway_rx) =
-                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-            let (persistence_tx, _persistence_rx) =
-                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
-            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
-
-            let calls = vec![
-                batch_call(
-                    "call_workflow",
-                    "workflow",
-                    r#"{"script":"export const meta = { name: 'x', description: 'd' };\nreturn 1;"}"#,
-                ),
-                batch_call("call_bash", "run_terminal_command", r#"{"command":"echo done"}"#),
-            ];
-
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                actor.execute_tool_calls(calls),
-            )
-            .await
-            .expect("execute_tool_calls should not hang")
-            .expect("execute_tool_calls must return a ToolLoop");
-
-            assert!(matches!(result, ToolLoop::Continue));
-
-            let conv = actor.chat_state_handle.get_conversation().await;
-            assert_eq!(
-                conv.iter()
-                    .filter(|item| matches!(item, ConversationItem::ToolResult(_)))
-                    .count(),
-                2,
-                "an exclusivity failure must post one error tool_result per call",
-            );
-
-            let workflow_result = tool_result_for_call(&conv, "call_workflow")
-                .expect("workflow call should have a result entry with exclusivity error");
-            let bash_result = tool_result_for_call(&conv, "call_bash")
-                .expect("non-workflow call should also have an exclusivity result");
-            assert!(
-                workflow_result.contains(WORKFLOW_EXCLUSIVITY_ERROR),
-                "workflow batch violation must cite the exclusivity message: {workflow_result}"
-            );
-            assert!(
-                bash_result.contains(WORKFLOW_EXCLUSIVITY_ERROR),
-                "workflow batch violation must cite the exclusivity message for every call: {bash_result}"
             );
         })
         .await;

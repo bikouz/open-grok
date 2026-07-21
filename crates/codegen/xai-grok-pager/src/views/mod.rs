@@ -51,3 +51,4 @@ pub mod todo_pane;
 pub mod turn_status;
 pub mod usage;
 pub mod welcome;
+pub mod workflows;
