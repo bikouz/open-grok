@@ -3,6 +3,7 @@
 //! Wires the pure-library patch engine (parser + apply) through `AsyncFileSystem`
 //! for all I/O and emits `FileWritten` notifications.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -154,6 +155,11 @@ async fn ensure_parent_dirs(path: &std::path::Path) -> Result<(), xai_tool_runti
 /// Validates every hunk (rather than stopping at the first failure) so a
 /// multi-file patch reports all bad hunks in one round trip, then appends a
 /// footer stating that nothing was applied and which hunks were valid.
+///
+/// A hunk that touches a path an earlier hunk already changed derives from
+/// that hunk's computed content (tracked in an in-memory overlay), matching
+/// upstream codex's sequential-apply semantics while keeping the atomic
+/// compute-then-write structure.
 async fn compute_all_changes(
     cwd: &std::path::Path,
     fs: &Arc<dyn AsyncFileSystem>,
@@ -162,12 +168,15 @@ async fn compute_all_changes(
     let mut changes = Vec::new();
     let mut valid_paths: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    // Content each path would hold after the hunks so far (`None` = deleted).
+    let mut overlay: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     for hunk in hunks {
         match hunk {
             Hunk::AddFile { path, contents } => {
                 let resolved = cwd.join(path);
                 valid_paths.push(path.display().to_string());
+                overlay.insert(resolved.clone(), Some(contents.clone()));
                 changes.push(FileChange::Add {
                     path: resolved,
                     content: contents.clone(),
@@ -175,9 +184,10 @@ async fn compute_all_changes(
             }
             Hunk::DeleteFile { path } => {
                 let resolved = cwd.join(path);
-                match read_file_as_string(fs, &resolved).await {
+                match read_current(&overlay, fs, &resolved).await {
                     Ok(original_content) => {
                         valid_paths.push(path.display().to_string());
+                        overlay.insert(resolved.clone(), None);
                         changes.push(FileChange::Delete {
                             path: resolved,
                             original_content,
@@ -194,7 +204,7 @@ async fn compute_all_changes(
                 chunks,
             } => {
                 let resolved = cwd.join(path);
-                let original_content = match read_file_as_string(fs, &resolved).await {
+                let original_content = match read_current(&overlay, fs, &resolved).await {
                     Ok(c) => c,
                     Err(e) => {
                         errors.push(format!(
@@ -210,6 +220,8 @@ async fn compute_all_changes(
                         valid_paths.push(path.display().to_string());
                         if let Some(dest) = move_path {
                             let resolved_dest = cwd.join(dest);
+                            overlay.insert(resolved.clone(), None);
+                            overlay.insert(resolved_dest.clone(), Some(new_content.clone()));
                             changes.push(FileChange::Move {
                                 source_path: resolved,
                                 dest_path: resolved_dest,
@@ -217,6 +229,7 @@ async fn compute_all_changes(
                                 new_content,
                             });
                         } else {
+                            overlay.insert(resolved.clone(), Some(new_content.clone()));
                             changes.push(FileChange::Update {
                                 path: resolved,
                                 original_content,
@@ -239,6 +252,20 @@ async fn compute_all_changes(
         return Ok(changes);
     }
     Err(build_failure_message(errors, &valid_paths, hunks.len()))
+}
+
+/// Read a path as the hunks so far would leave it: computed overlay content
+/// first, the real filesystem otherwise.
+async fn read_current(
+    overlay: &HashMap<PathBuf, Option<String>>,
+    fs: &Arc<dyn AsyncFileSystem>,
+    path: &std::path::Path,
+) -> Result<String, String> {
+    match overlay.get(path) {
+        Some(Some(content)) => Ok(content.clone()),
+        Some(None) => Err("file was deleted by an earlier hunk in this patch".to_string()),
+        None => read_file_as_string(fs, path).await,
+    }
 }
 
 /// Join per-hunk failures and append the patch-level status footer.
@@ -848,6 +875,129 @@ mod tests {
             }
             other => panic!("Expected ApplicationError, got: {other:?}"),
         }
+    }
+
+    // ── Repeated paths within one patch ──────────────────────────
+
+    #[tokio::test]
+    async fn two_update_hunks_same_file_chain_changes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "a\nb\nc\n").unwrap();
+
+        let tool = ApplyPatchTool;
+        let resources = test_resources(tmp.path());
+        let shared = resources.into_shared();
+
+        let patch = wrap_patch(
+            "*** Update File: f.txt\n@@\n-a\n+A\n\
+             *** Update File: f.txt\n@@\n-c\n+C",
+        );
+        let result =
+            xai_tool_runtime::Tool::run(&tool, test_ctx(shared.clone()), make_input(&patch))
+                .await
+                .unwrap();
+
+        match result {
+            ApplyPatchOutput::Success { .. } => {
+                // Both hunks must survive — the second derives from the
+                // first's computed content, not the on-disk original.
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+                    "A\nb\nC\n"
+                );
+            }
+            other => panic!("Expected Success, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_then_update_same_file_uses_added_content() {
+        let tmp = TempDir::new().unwrap();
+
+        let tool = ApplyPatchTool;
+        let resources = test_resources(tmp.path());
+        let shared = resources.into_shared();
+
+        let patch = wrap_patch(
+            "*** Add File: f.txt\n+hello\n\
+             *** Update File: f.txt\n@@\n-hello\n+world",
+        );
+        let result =
+            xai_tool_runtime::Tool::run(&tool, test_ctx(shared.clone()), make_input(&patch))
+                .await
+                .unwrap();
+
+        match result {
+            ApplyPatchOutput::Success { .. } => {
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+                    "world\n"
+                );
+            }
+            other => panic!("Expected Success, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_then_move_chains_through_move() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "one\ntwo\n").unwrap();
+
+        let tool = ApplyPatchTool;
+        let resources = test_resources(tmp.path());
+        let shared = resources.into_shared();
+
+        let patch = wrap_patch(
+            "*** Update File: f.txt\n@@\n-one\n+ONE\n\
+             *** Update File: f.txt\n*** Move to: g.txt\n@@\n-two\n+TWO",
+        );
+        let result =
+            xai_tool_runtime::Tool::run(&tool, test_ctx(shared.clone()), make_input(&patch))
+                .await
+                .unwrap();
+
+        match result {
+            ApplyPatchOutput::Success { .. } => {
+                assert!(!tmp.path().join("f.txt").exists());
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("g.txt")).unwrap(),
+                    "ONE\nTWO\n"
+                );
+            }
+            other => panic!("Expected Success, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_after_delete_same_file_errors_atomically() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "x\n").unwrap();
+
+        let tool = ApplyPatchTool;
+        let resources = test_resources(tmp.path());
+        let shared = resources.into_shared();
+
+        let patch = wrap_patch(
+            "*** Delete File: f.txt\n\
+             *** Update File: f.txt\n@@\n-x\n+y",
+        );
+        let result =
+            xai_tool_runtime::Tool::run(&tool, test_ctx(shared.clone()), make_input(&patch))
+                .await
+                .unwrap();
+
+        match result {
+            ApplyPatchOutput::ApplicationError(msg) => {
+                assert!(msg.contains("deleted by an earlier hunk"), "{msg}");
+                assert!(msg.contains("No changes were applied to any file"), "{msg}");
+            }
+            other => panic!("Expected ApplicationError, got: {other:?}"),
+        }
+        // Atomic: the valid delete hunk must not have been executed.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "x\n"
+        );
     }
 
     // ── Empty patch ──────────────────────────────────────────────
