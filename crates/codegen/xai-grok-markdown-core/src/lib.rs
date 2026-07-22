@@ -199,16 +199,6 @@ pub enum StructuralIssue {
     UnterminatedCodeBlock,
 }
 
-impl StructuralIssue {
-    /// Stable snake_case name for this issue (for logs, metrics, or FFI bindings).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::MalformedTable => "malformed_table",
-            Self::UnterminatedCodeBlock => "unterminated_code_block",
-        }
-    }
-}
-
 /// Element counts plus any structural issues from a single parse pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MarkdownAnalysis {

@@ -340,7 +340,7 @@ impl AgentView {
     /// with the full URL so the user can copy it, and best-effort copy to the
     /// clipboard (OSC 52 works over SSH even without a local display).
     ///
-    /// Unsafe schemes are rejected silently (same as [`open_url_if_safe`]).
+    /// Unsafe schemes are rejected silently (same as [`try_open_url`]).
     pub(crate) fn open_url_or_show(&mut self, url: &str) {
         use crate::app::link_opener::{OpenUrlResult, browser_unavailable_message, try_open_url};
         use crate::scrollback::block::RenderBlock;

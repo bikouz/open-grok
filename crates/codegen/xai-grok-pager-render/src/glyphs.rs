@@ -296,27 +296,6 @@ pub fn timeline_chevron_down() -> &'static str {
     }
 }
 
-/// `"━"` (U+2501 HEAVY HORIZONTAL) normally, `"─"` (U+2500 LIGHT
-/// HORIZONTAL, CP437 `0xC4`) on legacy ConHost. Always 1 column wide.
-///
-/// Prefer [`timeline_tick_active`] for the sidebar rail — on legacy ConHost
-/// this falls back to the same light stroke used for hover.
-pub fn heavy_horizontal() -> &'static str {
-    if is_legacy_windows_console() {
-        "\u{2500}"
-    } else {
-        "\u{2501}"
-    }
-}
-
-/// `"─"` (U+2500 LIGHT HORIZONTAL, CP437 `0xC4`). Always 1 column wide and
-/// present on every target, but exposed here so the timeline sidebar's
-/// inactive ticks share one glyph source with [`heavy_horizontal`] instead
-/// of hardcoding the codepoint.
-pub fn light_horizontal() -> &'static str {
-    "\u{2500}"
-}
-
 /// Precomposed 2-col active tick for the timeline rail: `"━━"` normally,
 /// `"══"` (U+2550 BOX DRAWINGS DOUBLE HORIZONTAL, CP437 `0xCD`) on legacy
 /// ConHost — distinct from the light hover/idle stroke there.
