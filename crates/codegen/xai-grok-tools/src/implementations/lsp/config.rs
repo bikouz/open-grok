@@ -131,61 +131,6 @@ pub fn filter_project_lsp_when_untrusted(
         .collect()
 }
 
-/// Load LSP server configs from `~/.opengrok/lsp.json` and `<cwd>/.opengrok/lsp.json`.
-/// Project config overrides user config for the same server name.
-pub fn load_servers(cwd: &Path) -> BTreeMap<String, LspServerConfig> {
-    let user_path = crate::util::grok_home::grok_home().join("lsp.json");
-    let project_path = cwd.join(".opengrok").join("lsp.json");
-
-    let mut merged = load_file(&user_path);
-    let project = load_file(&project_path);
-
-    if !merged.is_empty() {
-        tracing::info!(
-            source = "user",
-            path = %user_path.display(),
-            servers = ?merged.keys().collect::<Vec<_>>(),
-            "loaded user lsp.json"
-        );
-    }
-    if !project.is_empty() {
-        tracing::info!(
-            source = "project",
-            path = %project_path.display(),
-            servers = ?project.keys().collect::<Vec<_>>(),
-            "loaded project lsp.json"
-        );
-    }
-
-    for (key, val) in project {
-        merged.insert(key, val);
-    }
-
-    let mut ext_owners: HashMap<&str, &str> = HashMap::new();
-    for (server_name, server_cfg) in &merged {
-        for ext in server_cfg.extensions.keys() {
-            if let Some(prev) = ext_owners.insert(ext.as_str(), server_name.as_str()) {
-                tracing::warn!(
-                    extension = ext,
-                    server_a = prev,
-                    server_b = server_name,
-                    "extension claimed by multiple LSP servers; \
-                     '{prev}' will handle it (first alphabetically)"
-                );
-            }
-        }
-    }
-
-    if merged.is_empty() {
-        tracing::info!(
-            user = %user_path.display(),
-            project = %project_path.display(),
-            "no LSP servers configured"
-        );
-    }
-    merged
-}
-
 /// Load LSP server configs from a JSON file. Returns empty map on missing/invalid file.
 pub fn load_file(path: &Path) -> BTreeMap<String, LspServerConfig> {
     let s = match std::fs::read_to_string(path) {

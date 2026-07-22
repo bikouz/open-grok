@@ -199,7 +199,7 @@ Agent / preset ToolServerConfig          (which built-ins)
 | `grok-computer` | Sandbox-oriented shell/FS subset |
 | OpenCode / orchestrator / ask-user | Additional builders in the same module |
 
-Hashline is not a static preset name alone: shell `FileToolset::Hashline` + `grok_build_hashline_toolset(hashline_tools)` swaps file tools for `hashline_read` / `hashline_edit` / `hashline_grep` with scheme params.
+Hashline is not a static preset name alone: shell `FileToolset::Hashline` builds the configured `hashline_read` / `hashline_edit` / `hashline_grep` entries, then `AgentDefinition::override_file_tools` swaps them into the selected preset.
 
 ### Capability mode
 

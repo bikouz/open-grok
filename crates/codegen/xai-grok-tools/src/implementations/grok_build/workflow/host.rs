@@ -286,10 +286,6 @@ impl ReplayPlan {
             ResumeMode::Positional => self.by_index.remove(&call.index),
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_index.is_empty()
-    }
 }
 
 /// Re-key a journal entry written by an older binary whose keys still carried

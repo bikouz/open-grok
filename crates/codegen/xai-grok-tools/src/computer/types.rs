@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
@@ -365,25 +364,6 @@ pub trait TerminalBackend: Send + Sync {
         _exit_code: Option<i32>,
     ) -> Option<TaskSnapshot> {
         None
-    }
-}
-
-// ============================================================================
-// Computer struct
-// ============================================================================
-
-/// Contains the computer struct which provides access to both the terminal and the fs
-pub struct Computer {
-    pub terminal: Arc<dyn TerminalBackend>,
-    pub file_system: Arc<dyn AsyncFileSystem>,
-}
-
-impl Computer {
-    pub fn new(terminal: Arc<dyn TerminalBackend>, file_system: Arc<dyn AsyncFileSystem>) -> Self {
-        Self {
-            terminal,
-            file_system,
-        }
     }
 }
 

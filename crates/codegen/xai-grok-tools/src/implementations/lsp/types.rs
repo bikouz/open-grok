@@ -14,13 +14,6 @@ pub enum LspConfig {
     },
 }
 
-impl LspConfig {
-    pub fn is_enabled(&self) -> bool {
-        matches!(self, Self::Enabled { servers, .. }
-if !servers.is_empty())
-    }
-}
-
 pub struct LspToolResult {
     pub text: String,
     pub is_error: bool,
