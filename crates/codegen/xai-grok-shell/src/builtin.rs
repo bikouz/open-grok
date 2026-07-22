@@ -9,6 +9,10 @@ const BUILTIN_FILES: &[(&str, &str)] = &[("README.md", include_str!("../README.m
 /// `extract_builtin_files`). Keep each entry's name in sync with the `name:` in
 /// its frontmatter.
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
+    (
+        "agent-swarm",
+        include_str!("../skills/agent-swarm/SKILL.md"),
+    ),
     ("best-of-n", include_str!("../skills/best-of-n/SKILL.md")),
     ("check-work", include_str!("../skills/check-work/SKILL.md")),
     ("code-review", include_str!("../skills/code-review/SKILL.md")),
