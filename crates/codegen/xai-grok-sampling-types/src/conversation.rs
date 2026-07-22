@@ -736,30 +736,6 @@ impl ReasoningContent {
         self.text.is_none() && self.encrypted.is_none()
     }
 
-    // Parts are separate paragraphs (Codex summary parts each open with a
-    // bolded headline); join with a blank line so markdown renders them as
-    // paragraphs instead of one run-on line.
-    fn join_content(content: &Option<Vec<rs::ReasoningTextContent>>) -> Option<Arc<str>> {
-        let parts = content.as_ref()?;
-        let joined: String = parts
-            .iter()
-            .map(|p| p.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        (!joined.is_empty()).then_some(Arc::<str>::from(joined))
-    }
-
-    fn join_summary(summary: &[rs::SummaryPart]) -> Option<Arc<str>> {
-        let joined: String = summary
-            .iter()
-            .map(|p| {
-                let rs::SummaryPart::SummaryText(st) = p;
-                st.text.as_str()
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        (!joined.is_empty()).then_some(Arc::<str>::from(joined))
-    }
 }
 
 // ============================================================================
