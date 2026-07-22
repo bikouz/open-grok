@@ -57,10 +57,6 @@ pub struct ToolCallHookData {
 }
 
 impl ToolCallHookData {
-    pub fn is_empty(&self) -> bool {
-        self.pre_hooks.is_empty() && self.post_hooks.is_empty() && self.lifecycle.is_empty()
-    }
-
     pub fn has_content(&self) -> bool {
         self.pre_hooks
             .iter()

@@ -101,25 +101,6 @@ impl BgTaskBlock {
     pub fn is_running(&self) -> bool {
         matches!(self.kind, BgTaskKind::Started)
     }
-
-    /// Mark a Started block as completed (called when task finishes).
-    pub fn mark_completed(&mut self, elapsed: Duration) {
-        self.kind = BgTaskKind::Completed { elapsed };
-    }
-
-    /// Mark a Started block as failed (called when task fails).
-    pub fn mark_failed(
-        &mut self,
-        elapsed: Duration,
-        exit_code: Option<i32>,
-        signal: Option<String>,
-    ) {
-        self.kind = BgTaskKind::Failed {
-            elapsed,
-            exit_code,
-            signal,
-        };
-    }
 }
 
 impl BlockContent for BgTaskBlock {

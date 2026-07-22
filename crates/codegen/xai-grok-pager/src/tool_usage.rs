@@ -73,23 +73,6 @@ impl ToolCategory {
         }
     }
 
-    /// Compact symbol for sequence bar (single char, no emoji).
-    pub fn symbol(&self) -> char {
-        match self {
-            Self::Execute => '█',
-            Self::Read => '▓',
-            Self::Edit => '▒',
-            Self::Search => '░',
-            Self::Skill => crate::glyphs::diamond_filled_char(),
-            Self::ListDir => '▀',
-            Self::WebFetch => '▄',
-            Self::WebSearch => '○',
-            Self::Other => crate::glyphs::diamond_filled_char(),
-            Self::Thinking => crate::glyphs::diamond_hollow_char(),
-            Self::Message => '▪',
-        }
-    }
-
     /// Category color from theme.
     pub fn color(&self, theme: &Theme) -> Color {
         match self {
@@ -189,24 +172,6 @@ impl CategoryStats {
             return 0.0;
         }
         (self.count as f64 / total as f64) * 100.0
-    }
-
-    /// Format total time as human-readable string (Phase 2).
-    pub fn format_time(&self) -> String {
-        if self.total_time_ms == 0 {
-            return "—".to_string();
-        }
-        let secs = self.total_time_ms / 1000;
-        let ms = self.total_time_ms % 1000;
-        if secs == 0 {
-            format!("{}ms", ms)
-        } else if secs < 60 {
-            format!("{}.{:03}s", secs, ms)
-        } else {
-            let mins = secs / 60;
-            let secs = secs % 60;
-            format!("{}m {}s", mins, secs)
-        }
     }
 }
 

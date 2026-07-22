@@ -619,9 +619,6 @@ impl RenderBlock {
     }
 
     /// Create an empty streaming agent message block.
-    ///
-    /// Use `as_agent_message_mut()` to get the block and call `push_chunk()`
-    /// to append streaming content.
     pub fn agent_message_streaming() -> Self {
         RenderBlock::AgentMessage(AgentMessageBlock::streaming())
     }
@@ -709,13 +706,6 @@ impl RenderBlock {
         RenderBlock::ToolCall(ToolCallBlock::Edit(EditToolCallBlock::new(path, hunks)))
     }
 
-    /// Create a failed Edit block (with error message).
-    pub fn edit_failed(path: impl Into<String>, error: impl Into<String>) -> Self {
-        RenderBlock::ToolCall(ToolCallBlock::Edit(
-            EditToolCallBlock::new(path, vec![]).with_error(error),
-        ))
-    }
-
     /// Create a simple Edit block (no hunks, for legacy compatibility).
     pub fn edit(path: impl Into<String>, edit_info: Option<String>) -> Self {
         let mut block = EditToolCallBlock::new(path, vec![]);
@@ -743,9 +733,6 @@ impl RenderBlock {
     }
 
     /// Create an empty streaming thinking block.
-    ///
-    /// Use `as_thinking_mut()` to get the block and call `push_chunk()`
-    /// to append streaming content.
     pub fn thinking_streaming() -> Self {
         RenderBlock::Thinking(ThinkingBlock::streaming())
     }
@@ -823,53 +810,6 @@ impl RenderBlock {
             b.description = description;
         }
         self
-    }
-
-    /// Get mutable access to a StubBlock if this is one.
-    pub fn as_stub_mut(&mut self) -> Option<&mut StubBlock> {
-        match self {
-            RenderBlock::Stub(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Get mutable access to a ToolCallBlock if this is one.
-    pub fn as_tool_call_mut(&mut self) -> Option<&mut ToolCallBlock> {
-        match self {
-            RenderBlock::ToolCall(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Get mutable access to an AgentMessageBlock if this is one.
-    ///
-    /// This is useful for streaming: get the block, then call `push_chunk()`
-    /// to append streaming content.
-    pub fn as_agent_message_mut(&mut self) -> Option<&mut AgentMessageBlock> {
-        match self {
-            RenderBlock::AgentMessage(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Get shared (read-only) access to an AgentMessageBlock if this is one.
-    ///
-    /// The read-only counterpart of [`as_agent_message_mut`](Self::as_agent_message_mut),
-    /// for inspecting a message's content (e.g. its detected diagrams) without
-    /// mutating it.
-    pub fn as_agent_message(&self) -> Option<&AgentMessageBlock> {
-        match self {
-            RenderBlock::AgentMessage(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Get mutable access to a ThinkingBlock if this is one.
-    pub fn as_thinking_mut(&mut self) -> Option<&mut ThinkingBlock> {
-        match self {
-            RenderBlock::Thinking(b) => Some(b),
-            _ => None,
-        }
     }
 
     /// Check if this block is a UserPrompt.

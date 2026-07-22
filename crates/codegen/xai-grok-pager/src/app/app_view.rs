@@ -193,12 +193,6 @@ impl WorktreeMode {
         };
         Self::resolve_from_hint_strings(get_str)
     }
-    /// Same as [`Self::resolve_from_hints`], for merged effective config (`toml::Value`).
-    pub fn resolve_from_hints_value(hints: Option<&toml::Value>) -> (Self, Self) {
-        let (new_session, fork) =
-            xai_grok_shell::util::config::WorktreeHintMode::resolve_pair(hints);
-        (new_session.into(), fork.into())
-    }
     fn resolve_from_hint_strings(get_str: impl Fn(&str) -> Option<Self>) -> (Self, Self) {
         let legacy = get_str("worktree_mode");
         let new_session = get_str("new_session_worktree_mode")

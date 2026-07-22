@@ -99,11 +99,6 @@ impl AgentMessageBlock {
         &self.content
     }
 
-    /// Mutable access to the underlying markdown content.
-    pub fn content_mut(&mut self) -> &mut MarkdownContent {
-        &mut self.content
-    }
-
     /// Get copyable text for this block.
     ///
     /// When `raw` is true, returns the raw markdown source.
