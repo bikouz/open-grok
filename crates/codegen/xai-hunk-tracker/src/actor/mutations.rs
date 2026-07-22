@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::events::{HunkEvent, HunkRemovalReason};
-use crate::types::HunkSource;
+use crate::types::{HunkSource, TrackingMode};
 
 use super::HunkTrackerActor;
 use super::file_utils::{classify_string, missing_content, read_file_bounded};
