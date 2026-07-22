@@ -1427,6 +1427,7 @@ fn second_auth_failure_does_not_clobber_reauth_stash() {
             text: "first prompt".into(),
             images: Vec::new(),
             scrollback_entry: crate::scrollback::EntryId::new(0),
+            combined_scrollback_entries: Vec::new(),
             chip_elements: Vec::new(),
         });
         agent
@@ -1468,6 +1469,7 @@ fn cancel_login_drops_reauth_stashed_prompt() {
             text: "stale".into(),
             images: Vec::new(),
             scrollback_entry: crate::scrollback::EntryId::new(0),
+            combined_scrollback_entries: Vec::new(),
             chip_elements: Vec::new(),
         });
 
@@ -1494,6 +1496,7 @@ fn cancel_login_strips_reauth_prompt_from_scrollback() {
             text: "stale".into(),
             images: Vec::new(),
             scrollback_entry: crate::scrollback::EntryId::new(0),
+            combined_scrollback_entries: Vec::new(),
             chip_elements: Vec::new(),
         });
         agent

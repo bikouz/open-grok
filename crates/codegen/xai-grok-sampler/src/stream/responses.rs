@@ -4,6 +4,10 @@
 //! [`SamplingEvent`]s. Pure: no I/O, no shell coupling.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -56,8 +60,15 @@ pub(crate) fn responses_event_has_meaningful_content(event: &rs::ResponseStreamE
         ResponseStreamEvent::ResponseCodeInterpreterCallCodeDone(event) => !event.code.is_empty(),
         ResponseStreamEvent::ResponseCustomToolCallInputDelta(event) => !event.delta.is_empty(),
         ResponseStreamEvent::ResponseCustomToolCallInputDone(event) => !event.input.is_empty(),
+        ResponseStreamEvent::ResponseFailed(event) => {
+            !event.response.output.is_empty()
+                || event
+                    .response
+                    .usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.output_tokens > 0)
+        }
         ResponseStreamEvent::ResponseCompleted(_)
-        | ResponseStreamEvent::ResponseFailed(_)
         | ResponseStreamEvent::ResponseIncomplete(_)
         | ResponseStreamEvent::ResponseOutputItemAdded(_)
         | ResponseStreamEvent::ResponseOutputItemDone(_)
@@ -89,6 +100,11 @@ pub(crate) fn responses_event_has_meaningful_content(event: &rs::ResponseStreamE
     }
 }
 
+pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -> bool {
+    !matches!(event, rs::ResponseStreamEvent::ResponseError(_))
+        && responses_event_has_meaningful_content(event)
+}
+
 /// Transform a raw Responses API event stream into a stream of
 /// [`SamplingEvent`]s.
 ///
@@ -109,13 +125,14 @@ pub fn stream_responses<'a>(
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
 ) -> impl Stream<Item = SamplingEvent> + Send + 'a {
-    stream_responses_with_client_custom_tools(
+    stream_responses_tracked(
         raw_stream,
         model_metadata,
         request_id,
         idle_timeout,
         doom_loop,
         Vec::new(),
+        Arc::new(AtomicBool::new(false)),
     )
 }
 
@@ -129,6 +146,30 @@ pub fn stream_responses_with_client_custom_tools<'a>(
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
     client_custom_tool_names: Vec<String>,
+) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+    stream_responses_tracked(
+        raw_stream,
+        model_metadata,
+        request_id,
+        idle_timeout,
+        doom_loop,
+        client_custom_tool_names,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+/// Core Responses stream transform. `client_custom_tool_names` distinguishes
+/// client-executed custom calls from backend x_search (same Responses
+/// `CustomToolCall` wire item); `output_observed` is set once any model output
+/// is seen so the actor can suppress retries once a stream has produced output.
+pub(crate) fn stream_responses_tracked<'a>(
+    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+    model_metadata: Option<ResponseModelMetadata>,
+    request_id: RequestId,
+    idle_timeout: Duration,
+    doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
+    client_custom_tool_names: Vec<String>,
+    output_observed: Arc<AtomicBool>,
 ) -> impl Stream<Item = SamplingEvent> + Send + 'a {
     async_stream::stream! {
         use rs::{ResponseStreamEvent, Status};
@@ -211,6 +252,10 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                     return;
                 }
             };
+
+            if responses_event_may_have_output(&event) {
+                output_observed.store(true, Ordering::Relaxed);
+            }
 
             // A confident server-detected loop aborts the attempt (dropping
             // the SSE connection) so the retry loop can resample instead of
@@ -1035,6 +1080,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn empty_failed_response_is_not_treated_as_output() {
+        let event = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
+            response: failed_response_with_error("boom"),
+            sequence_number: 0,
+        });
+        assert!(!responses_event_may_have_output(&event));
+    }
+
     #[tokio::test]
     async fn display_citation_widgets_are_stripped_from_stream_and_items() {
         use crate::stream::display_citations::{CITATION_DELIMITER, CITATION_START, CITATION_STOP};
@@ -1546,6 +1600,68 @@ mod tests {
         assert!(!responses_event_has_meaningful_content(&empty));
         // Completed is meaningful (terminal).
         assert!(responses_event_has_meaningful_content(&completed_event()));
+    }
+
+    #[test]
+    fn output_classifier_covers_non_forwarded_backend_events() {
+        let queued = rs::ResponseStreamEvent::ResponseQueued(rs_types::ResponseQueuedEvent {
+            sequence_number: 0,
+            response: empty_completed_response(),
+        });
+        assert!(!responses_event_may_have_output(&queued));
+
+        let response_error = rs::ResponseStreamEvent::ResponseError(rs_types::ResponseErrorEvent {
+            sequence_number: 1,
+            code: Some("server_error".into()),
+            message: "failed before output".into(),
+            param: None,
+        });
+        assert!(!responses_event_may_have_output(&response_error));
+
+        let refusal =
+            rs::ResponseStreamEvent::ResponseRefusalDelta(rs_types::ResponseRefusalDeltaEvent {
+                sequence_number: 1,
+                item_id: "item-1".into(),
+                output_index: 0,
+                content_index: 0,
+                delta: "no".into(),
+            });
+        assert!(responses_event_may_have_output(&refusal));
+
+        let backend_progress = rs::ResponseStreamEvent::ResponseWebSearchCallSearching(
+            rs_types::ResponseWebSearchCallSearchingEvent {
+                sequence_number: 2,
+                output_index: 0,
+                item_id: "search-1".into(),
+            },
+        );
+        assert!(responses_event_may_have_output(&backend_progress));
+    }
+
+    #[tokio::test]
+    async fn tracked_stream_marks_non_forwarded_refusal_as_output() {
+        let output_observed = Arc::new(AtomicBool::new(false));
+        let refusal =
+            rs::ResponseStreamEvent::ResponseRefusalDelta(rs_types::ResponseRefusalDeltaEvent {
+                sequence_number: 0,
+                item_id: "item-1".into(),
+                output_index: 0,
+                content_index: 0,
+                delta: "no".into(),
+            });
+        let raw = stream::iter(vec![Ok(refusal), Ok(completed_event())]).boxed();
+        let _ = collect(stream_responses_tracked(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            Vec::new(),
+            Arc::clone(&output_observed),
+        ))
+        .await;
+
+        assert!(output_observed.load(Ordering::Relaxed));
     }
 
     fn function_call_added_event(

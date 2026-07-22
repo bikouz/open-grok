@@ -57,7 +57,6 @@ impl ToolKind {
             ToolKind::MemoryGet => "Memory Read",
             ToolKind::Task => "Subagent",
             ToolKind::AgentSwarm => "Agent Swarm",
-            ToolKind::Workflow => "Workflow",
             ToolKind::EnterPlan => "Enter Plan Mode",
             ToolKind::ExitPlan => "Exit Plan Mode",
             ToolKind::AskUser => "Ask User",
@@ -70,6 +69,7 @@ impl ToolKind {
             ToolKind::UseTool => "Use Tool",
             ToolKind::Monitor => "Monitor",
             ToolKind::GoalUpdate => "Update Goal",
+            ToolKind::Workflow => "Workflow",
             ToolKind::Other => "Tool",
         }
     }
@@ -103,7 +103,6 @@ impl ToolKind {
             | ToolKind::Skill
             | ToolKind::Task
             | ToolKind::AgentSwarm
-            | ToolKind::Workflow
             | ToolKind::ImageGen
             | ToolKind::VideoGen
             | ToolKind::ImageToVideo
@@ -113,6 +112,7 @@ impl ToolKind {
             | ToolKind::UseTool
             | ToolKind::Monitor
             | ToolKind::GoalUpdate
+            | ToolKind::Workflow
             | ToolKind::Other => false,
         }
     }

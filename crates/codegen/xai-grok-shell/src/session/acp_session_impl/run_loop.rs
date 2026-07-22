@@ -82,6 +82,37 @@ impl SessionActor {
         Some(fallback)
     }
 }
+async fn shutdown_workflows(session: &SessionActor) {
+    if let Err(run_ids) = session
+        .workflow_manager
+        .lock()
+        .await
+        .cancel_all_and_drain(std::time::Duration::from_secs(7))
+        .await
+    {
+        tracing::warn!(
+            ?run_ids,
+            "workflow shutdown completed with interrupted runs"
+        );
+    }
+    let (respond_to, ack) = tokio::sync::oneshot::channel();
+    if session
+        .notifications
+        .persistence_tx
+        .send(PersistenceMsg::FlushAndAck { respond_to })
+        .is_err()
+    {
+        tracing::warn!("workflow shutdown persistence channel closed before flush");
+        return;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(2), ack).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            tracing::warn!("workflow shutdown persistence actor dropped flush ack")
+        }
+        Err(_) => tracing::warn!("workflow shutdown persistence flush timed out"),
+    }
+}
 pub(super) async fn run_session(
     session: Arc<SessionActor>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
@@ -111,6 +142,25 @@ pub(super) async fn run_session(
             }
         });
     }
+    let _workflow_watch = crate::config::watcher::ProjectDiscoveryWatcher::start(
+        std::path::Path::new(session.session_info.cwd.as_str()),
+    )
+    .map(|(mut watcher, mut changes)| {
+        let session = session.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(change) = changes.recv().await {
+                watcher.refresh_new_dirs();
+                match change {
+                    crate::config::watcher::DiscoveryChange::Skills => {
+                        session.reload_skills_from_disk().await;
+                    }
+                    crate::config::watcher::DiscoveryChange::Workflows => {
+                        session.send_available_commands_update().await;
+                    }
+                }
+            }
+        })
+    });
     let _fs_watch: Option<fs_watch::FsWatchHandle> = if fs_watch_caps.needs_watcher() {
         let deps = fs_watch::FsWatchDeps::from_session(
             &session,
@@ -255,9 +305,10 @@ pub(super) async fn run_session(
             } => { if let Some(notification) = replay_buffer.flush() { session
             .emit_buffered(notification). await; } if let Some(tx) = respond_to { let _ =
             tx.send(()); } } } } } maybe_completion = completion_rx.recv() => { let
-            Some((prompt_id, result)) = maybe_completion else { if let Some(cancel) = &
-            session.sync_loop_cancel { cancel.cancel(); } cleanup_session_scratch(&
-            session); if let Err(error) = session.rebuild_spec.code_mode_runtime.shutdown().await {
+            Some((prompt_id, result)) = maybe_completion else { shutdown_workflows(&
+            session). await; if let Some(cancel) = & session.sync_loop_cancel { cancel
+            .cancel(); } cleanup_session_scratch(& session); if let Err(error) = session
+            .rebuild_spec.code_mode_runtime.shutdown().await {
             tracing::warn!(%error, "failed to shut down Code Mode runtime"); }
             return; }; if let Some(notification) = replay_buffer.flush() {
             session.emit_buffered(notification). await; } let (turn_succeeded,
@@ -314,11 +365,12 @@ pub(super) async fn run_session(
             xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SessionEnded
             { duration_secs : session.session_start.elapsed().as_secs(), turn_count :
             signals.turn_count as u64, tool_call_count : signals.tool_call_count as u64,
-            compaction_count : signals.compaction_count as u64, model_id, },); } } if let
-            Some(cancel) = & session.sync_loop_cancel { cancel.cancel(); } session
-            .feedback_manager.shutdown(session.upload_queue.get()). await; if ! session
-            .startup_hints.is_subagent { session.persist_background_task_manifest().
-            await; } if let Err(error) = session.rebuild_spec.code_mode_runtime.shutdown().await {
+            compaction_count : signals.compaction_count as u64, model_id, },); } }
+            shutdown_workflows(& session). await; if let Some(cancel) = & session
+            .sync_loop_cancel { cancel.cancel(); } session.feedback_manager
+            .shutdown(session.upload_queue.get()). await; if ! session.startup_hints
+            .is_subagent { session.persist_background_task_manifest(). await; }
+            if let Err(error) = session.rebuild_spec.code_mode_runtime.shutdown().await {
             tracing::warn!(%error, "failed to shut down Code Mode runtime"); }
             cleanup_session_scratch(& session); return; }; match cmd {
             SessionCommand::Initialize { system_prompt } => { session
@@ -472,6 +524,10 @@ pub(super) async fn run_session(
             owner } => { session.handle_clear_queue(owner.as_deref()). await; }
             SessionCommand::EditQueuedPrompt { id, new_text, editor } => { session
             .handle_edit_queued_prompt(& id, new_text, editor.as_deref()). await; }
+            SessionCommand::HoldCombineEdit { id } => { let mut state = session.state
+            .lock(). await; state.combine_edit_holds.insert(id); }
+            SessionCommand::ReleaseCombineEdit { id } => { let mut state = session.state
+            .lock(). await; state.combine_edit_holds.remove(& id); }
             SessionCommand::InterjectQueuedPrompt { id, expected_version, owner, new_text
             } => { let cancel_for_send_now = session.handle_interject_queued_prompt(& id,
             expected_version, owner.as_deref(), new_text.as_deref()). await; if
@@ -754,8 +810,22 @@ pub(super) async fn run_session(
             .send(resp); }); } SessionCommand::PersistFeedback(entry) => { let _ =
             session.notifications.persistence_tx.send(PersistenceMsg::Feedback(* entry));
             } SessionCommand::AdvertiseCommands => { session
-            .send_available_commands_update(). await; } SessionCommand::ReloadSkills => {
-            let s = session.clone(); tokio::task::spawn_local(async move { s
+            .send_available_commands_update(). await; }
+            SessionCommand::GetWorkflowCatalogState { respond_to } => { let tool_names =
+            session.registered_tool_names(). await; let has_runs = ! session
+            .workflow_tracker(). await .lock().list().is_empty(); let availability =
+            session.build_command_availability(& tool_names, has_runs); let _ =
+            respond_to.send((availability.workflows, availability.workflow_management));
+            } SessionCommand::ListAvailableCommands { respond_to } => { let bridge =
+            session.agent.borrow().tool_bridge().clone(); let skills = bridge
+            .slash_skills(). await; let tool_names = session.registered_tool_names().
+            await; let has_runs = ! session.workflow_tracker(). await .lock().list()
+            .is_empty(); let availability = session.build_command_availability(&
+            tool_names, has_runs); let (_, workflows) = session
+            .named_workflow_snapshot(); let commands =
+            slash_commands::available_commands(& skills, availability, & workflows,); let
+            _ = respond_to.send(commands); } SessionCommand::ReloadSkills => { let s =
+            session.clone(); tokio::task::spawn_local(async move { s
             .reload_skills_from_disk(). await; }); }
             SessionCommand::DispatchSessionStartHook { source } => { let envelope =
             session.fire_hook(xai_grok_hooks::event::HookEventName::SessionStart, None,
@@ -825,6 +895,30 @@ pub(super) async fn run_session(
             super::PromptOrigin::GoalSummary, task_wake_fallback : None, respond_to,
             persist_ack : None, parsed_prompt_tx : None, queue_meta : None, send_now :
             false, }); } SessionActor::maybe_start_running_task(session.clone(),
+            completion_tx.clone()). await; } SessionCommand::WorkflowCompletionTurn {
+            run_id, revision } => { let state_suppressed = session.state.lock(). await
+            .notifications_suppressed; let wake_suppressed = state_suppressed || session
+            .goal_loop_active() || session.tool_context.task_wake_suppressed.as_ref()
+            .is_some_and(| gate | gate.get()); let should_wake = if wake_suppressed {
+            false } else { let tracker = session.workflow_tracker(). await; tracker
+            .lock().is_unreported_completion(& run_id, revision) }; if ! should_wake {
+            continue; } let prompt_id =
+            format!("workflow-completed-{run_id}-{revision}"); let prompt_text =
+            "A background workflow stopped. Review the workflow completion reminder, report the result to the user, and take any appropriate next action.";
+            let (respond_to, _) = tokio::sync::oneshot::channel(); { let mut state =
+            session.state.lock(). await; let workflow_wake_queued = state.pending_inputs
+            .iter().any(| item | { matches!(item.origin,
+            super::PromptOrigin::WorkflowCompleted { .. }) }); if workflow_wake_queued {
+            continue; } state.pending_inputs.push_back(InputItem { prompt_id,
+            prompt_blocks :
+            vec![acp::ContentBlock::Text(acp::TextContent::new(prompt_text))],
+            prompt_mode : crate ::session::plan_mode::PromptMode::Agent, trace_gcs_config
+            : None, artifact_tracker : None, client_identifier : None, screen_mode :
+            None, verbatim : true, json_schema : None, origin :
+            super::PromptOrigin::WorkflowCompleted { completion_id :
+            format!("{run_id}-{revision}"), }, task_wake_fallback : None, respond_to,
+            persist_ack : None, parsed_prompt_tx : None, queue_meta : None, send_now :
+            false, }); } SessionActor::maybe_start_running_task(session.clone(),
             completion_tx.clone()). await; } SessionCommand::TakeTurnMessages {
             respond_to } => { let result = session.chat_state_handle.take_turn_messages()
             . await; let _ = respond_to.send(result); }
@@ -842,9 +936,10 @@ pub(super) async fn run_session(
             .finalize_for_upload(); (! cap.is_empty()).then_some(cap) }); let _ =
             respond_to.send(result); } SessionCommand::PersistGitHead { commit, branch }
             => { let _ = session.notifications.persistence_tx
-            .send(PersistenceMsg::GitHead { commit, branch },); } SessionCommand::Shutdown => { if let Some(notification) = replay_buffer
-            .flush() { session.emit_buffered(notification). await; } session
-            .drop_pending_synthetic_items(). await; let envelope = session
+            .send(PersistenceMsg::GitHead { commit, branch },); } SessionCommand::Shutdown => { shutdown_workflows(& session). await; if let
+            Some(notification) = replay_buffer.flush() { session
+            .emit_buffered(notification). await; } session.drop_pending_synthetic_items()
+            . await; let envelope = session
             .fire_hook(xai_grok_hooks::event::HookEventName::SessionEnd, None,
             xai_grok_hooks::event::HookPayload::SessionEnd { reason : "shutdown"
             .to_string(), turn_count : None, tool_call_count : None, },); if let

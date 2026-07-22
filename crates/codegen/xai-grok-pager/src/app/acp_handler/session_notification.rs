@@ -173,7 +173,12 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         return false;
     }
     let suppress_replay_redraw = meta.is_replay || agent.session.loading_replay;
-    if !meta.is_replay
+    let is_workflow_update = matches!(
+        session_notif.update,
+        XaiSessionUpdate::WorkflowUpdated { .. }
+    );
+    if !is_workflow_update
+        && !meta.is_replay
         && meta.event_seq.is_some_and(|seq| {
             agent
                 .last_applied_xai_event_seq
@@ -287,6 +292,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             swarm_index,
             swarm_item,
             swarm_expected_members,
+            workflow_run_id,
             ..
         } => {
             tracing::info!(
@@ -315,6 +321,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     context_source: effective_context_source.map(Arc::from),
                     resumed_from: resumed_from.map(Arc::from),
                     capability_mode: capability_mode.map(Arc::from),
+                    workflow_run_id: workflow_run_id.clone().map(Arc::from),
                     context_normalized,
                     parent_prompt_id: parent_prompt_id.map(Arc::from),
                     swarm_id: swarm_id.as_deref().map(Arc::from),
@@ -393,16 +400,9 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             child_scrollback.set_appearance(agent.scrollback.appearance().clone());
             let mut child_view = AgentView::new(child_session, child_scrollback);
             child_view.set_input_mode(InputMode::Vim);
-            child_view.is_subagent_view = true;
             child_view.active_pane = crate::views::agent::ActivePane::Scrollback;
             child_view.set_sharing_enabled(agent.sharing_enabled);
-            let usage_visible = agent
-                .prompt
-                .slash_controller
-                .registry()
-                .get("usage")
-                .is_some();
-            child_view.set_usage_visible(usage_visible);
+            child_view.set_billing_surface_visible(agent.billing_surface_visible);
             let dashboard_visible = agent
                 .prompt
                 .slash_controller
@@ -437,9 +437,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 .registry()
                 .restricted_commands();
             child_view.set_restricted_commands(&restricted);
-            agent
-                .subagent_views
-                .insert(child_session_id.clone(), Box::new(child_view));
+            agent.insert_subagent_view(child_session_id.clone(), Box::new(child_view));
             if !agent.session.loading_replay {
                 if let Some(child_view) = agent.subagent_views.get_mut(&child_session_id) {
                     crate::app::subagent::replay_inherited_updates(child_view, &child_session_id);
@@ -502,7 +500,8 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     entry.invalidate_cache();
                 }
                 agent.scrollback.set_last_running(true);
-            } else {
+                agent.maybe_push_parked_marker();
+            } else if workflow_run_id.is_none() {
                 let block = crate::scrollback::blocks::SubagentBlock::started(
                     &description,
                     &child_session_id,
@@ -518,8 +517,10 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     info.scrollback_entry_id = Some(entry_id);
                     info.is_background = is_background;
                 }
+                agent.maybe_push_parked_marker();
+            } else if let Some(info) = agent.subagent_sessions.get_mut(&child_session_id) {
+                info.is_background = is_background;
             }
-            agent.maybe_push_parked_marker();
             true
         }
         XaiSessionUpdate::SubagentProgress {
@@ -1035,6 +1036,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             });
             true
         }
+        update @ XaiSessionUpdate::WorkflowUpdated { .. } => ingest_workflow_update(agent, update),
         XaiSessionUpdate::GoalUpdated {
             goal_id,
             objective,
@@ -1176,6 +1178,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     if let Some(agent) = app.agents.get_mut(&parent_id) {
         if let Some(seq) = meta.event_seq
             && !meta.is_replay
+            && !is_workflow_update
         {
             agent.last_applied_xai_event_seq = Some(seq);
         }

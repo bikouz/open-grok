@@ -223,6 +223,7 @@ pub(super) async fn run_antigravity_subagent(
             swarm_index: request.swarm.as_ref().map(|swarm| swarm.index),
             swarm_item: request.swarm.as_ref().and_then(|swarm| swarm.item.clone()),
             swarm_expected_members: request.swarm.as_ref().map(|swarm| swarm.expected_members),
+            workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
         },
         ctx.parent_cmd_tx.as_ref(),
     );
@@ -266,6 +267,9 @@ pub(super) async fn run_antigravity_subagent(
                 turns: 1,
                 duration_ms,
                 tokens_used: 0,
+                output_tokens_used: 0,
+                total_tokens_used: 0,
+                output_usage_incomplete: false,
                 worktree_path: worktree_path
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string()),

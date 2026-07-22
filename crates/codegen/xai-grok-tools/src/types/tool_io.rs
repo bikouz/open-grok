@@ -42,7 +42,6 @@ use xai_tool_types::KillTaskToolInput;
 use xai_tool_types::TaskOutputToolInput;
 use xai_tool_types::TaskToolInput;
 use xai_tool_types::WaitTasksToolInput;
-use xai_tool_types::WorkflowToolInput;
 /// Raw input for an MCP (Model Context Protocol) tool call.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MCPToolInput {
@@ -75,7 +74,6 @@ pub enum ToolInput {
     KillTask(KillTaskToolInput),
     Task(TaskToolInput),
     AgentSwarm(AgentSwarmToolInput),
-    Workflow(WorkflowToolInput),
     WebSearch(WebSearchInput),
     ImageGen(ImageGenInput),
     ImageEdit(ImageEditInput),
@@ -101,6 +99,7 @@ pub enum ToolInput {
     SchedulerDelete(crate::implementations::grok_build::scheduler::delete::SchedulerDeleteInput),
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListInput),
     UpdateGoal(UpdateGoalInput),
+    Workflow(crate::implementations::grok_build::workflow::WorkflowToolInput),
     /// Dynamic input for runtime-registered tools (MCP, etc.)
     Dynamic(serde_json::Value),
 }

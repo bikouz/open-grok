@@ -34,6 +34,23 @@ impl std::fmt::Display for RepairHistoryBlocked {
 
 impl std::error::Error for RepairHistoryBlocked {}
 
+/// Result of a strict persistence-acknowledged working-directory switch append.
+#[derive(Debug, Clone)]
+pub enum StrictAppendAck {
+    Appended,
+    AlreadyPresent(ConversationItem),
+}
+
+#[derive(Debug)]
+pub enum StrictAppendError {
+    NotCommitted(std::io::Error),
+    Committed {
+        acknowledgement: StrictAppendAck,
+        source: std::io::Error,
+    },
+    Indeterminate(std::io::Error),
+}
+
 /// Commands sent to the ChatStateActor via mpsc channel.
 pub enum ChatStateCommand {
     // ═══ Mutations (fire-and-forget) ═══
@@ -45,6 +62,14 @@ pub enum ChatStateCommand {
     PushUserMessageAndAck {
         item: ConversationItem,
         reply: oneshot::Sender<()>,
+    },
+
+    /// Append one working-directory switch without repair or pruning, then
+    /// acknowledge only after persistence processes the generation-aware append.
+    AppendWorkingDirectorySwitchAndAck {
+        content: String,
+        cwd_generation: std::num::NonZeroU64,
+        reply: oneshot::Sender<Result<StrictAppendAck, StrictAppendError>>,
     },
 
     /// Record the assistant's response (text + tool calls).
@@ -361,6 +386,12 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::PushUserMessageAndAck {
             item: ConversationItem::user("hello"),
+            reply: tx,
+        };
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::AppendWorkingDirectorySwitchAndAck {
+            content: "moved".into(),
+            cwd_generation: std::num::NonZeroU64::new(1).unwrap(),
             reply: tx,
         };
         let _ = ChatStateCommand::PushAssistantResponse {

@@ -148,12 +148,6 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             );
             let turn_number = submission.turn_number;
 
-            if let Some(user_meta) =
-                crate::agent::mvp_agent::parse_json_object_env("GROK_USER_METADATA")
-            {
-                submission.merge_metadata(user_meta);
-            }
-
             // Enrich with session context for Slack notifications (best-effort).
             if let Some(ref session_handle) = session_handle {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -247,12 +241,22 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                     "no feedback client available (missing proxy credentials); feedback saved locally only"
                 );
             }
+            // Read the live feedback.user config (the session-actor path uses its
+            // spawn-time snapshot); both dedupe through the same process-wide
+            // identity cache, so a stable config resolves identically either way.
+            // Clone out so the RefCell borrow doesn't span an await.
+            let user_cfg = agent.cfg.borrow().feedback.user.clone();
+            let author_identity =
+                crate::util::user_identity::cached_identity(user_cfg.as_ref()).await;
             let outcome = crate::session::feedback_manager::submit_feedback_workflow(
                 &mut submission,
                 client.as_ref(),
                 session_handle.as_ref().map(|h| &h.persistence_tx),
-                feedback_input.is_solicited(),
-                telemetry_enabled,
+                crate::session::feedback_manager::SubmitFeedbackOptions {
+                    solicited: feedback_input.is_solicited(),
+                    telemetry_enabled,
+                    author_identity,
+                },
             )
             .await;
 

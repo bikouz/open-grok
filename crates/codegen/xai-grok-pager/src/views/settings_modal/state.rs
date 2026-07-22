@@ -307,20 +307,21 @@ impl SettingsModalState {
         self.invalidate_filter();
 
         if let Some(key) = subpane_key {
-            let still_visible = self.rows.iter().any(|r| {
-                matches!(r, RowEntry::Setting { key: k, .. }
-if *k == key)
-            });
+            let still_visible = self
+                .rows
+                .iter()
+                .any(|r| matches!(r, RowEntry::Setting { key: k, .. } if *k == key));
             if !still_visible {
                 self.transition_to_browse();
             }
         }
 
         if let Some(key) = prev_key {
-            if let Some(idx) = self.rows.iter().position(|r| {
-                matches!(r, RowEntry::Setting { key: k, .. }
-if *k == key)
-            }) {
+            if let Some(idx) = self
+                .rows
+                .iter()
+                .position(|r| matches!(r, RowEntry::Setting { key: k, .. } if *k == key))
+            {
                 self.selected = idx;
             } else {
                 self.selected = self
@@ -1011,6 +1012,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "antigravity_subagents" => Some(Action::SetAntigravitySubagents(new)),
         "respect_manual_folds" => Some(Action::SetRespectManualFolds(new)),
         "page_flip_on_send" => Some(Action::SetPageFlipOnSend(new)),
+        "combine_queued_prompts" => Some(Action::SetCombineQueuedPrompts(new)),
         "invert_scroll" => Some(Action::SetInvertScroll(new)),
         "show_tips" => Some(Action::SetShowTips(new)),
         "auto_update" => Some(Action::SetAutoUpdate(new)),

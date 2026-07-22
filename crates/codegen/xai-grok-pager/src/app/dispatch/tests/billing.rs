@@ -73,6 +73,7 @@ fn credit_limit_retry_preserves_image_submission_state() {
         text: "retry [Image #1]".into(),
         images: vec![image],
         scrollback_entry: crate::scrollback::EntryId::new(0),
+        combined_scrollback_entries: Vec::new(),
         chip_elements: vec![crate::app::agent::ChipElement {
             range: 6..16,
             kind: crate::views::prompt_widget::KIND_IMAGE,
@@ -482,14 +483,80 @@ fn upsell_max_tier_not_idempotent_pushes_multiple_cards() {
     );
 }
 
-// ── ShowUsage dispatch tests ────────────────────────────────────────
+// ── ShowUsage / session usage ───────────────────────────────────────
+
+fn is_session_usage_fetch(effects: &[Effect]) -> bool {
+    matches!(
+        effects,
+        [Effect::FetchSessionUsage { agent_id, .. }] if *agent_id == AgentId(0)
+    )
+}
+
+/// The user-initiated `/usage` follow-up: the fork's combined xAI + Codex
+/// fetch (`FetchUsage`), which replaces upstream's xAI-only `FetchBilling`.
+/// With xAI billing visible and no redirect, `include_xai` is true.
+fn is_combined_billing_fetch(effects: &[Effect]) -> bool {
+    matches!(
+        effects,
+        [Effect::FetchUsage {
+            agent_id,
+            include_xai: true,
+            xai_redirect_url: None,
+        }] if *agent_id == AgentId(0)
+    )
+}
+
+fn complete_session_usage(
+    app: &mut AppView,
+    session_id: &str,
+    usage: xai_grok_shell::extensions::notification::PromptUsage,
+) -> Vec<Effect> {
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionUsageComplete {
+            agent_id: AgentId(0),
+            session_id: session_id.to_string().into(),
+            usage: Box::new(usage),
+        }),
+        app,
+    )
+}
+
+fn fail_session_usage(app: &mut AppView, session_id: &str, error: &str) -> Vec<Effect> {
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionUsageFailed {
+            agent_id: AgentId(0),
+            session_id: session_id.to_string().into(),
+            error: error.into(),
+        }),
+        app,
+    )
+}
 
 #[test]
-fn show_usage_returns_combined_fetch_usage_effect() {
+fn show_usage_schedules_session_fetch_only() {
     let mut app = test_app_with_agent();
+    assert!(is_session_usage_fetch(&dispatch(
+        Action::ShowUsage,
+        &mut app
+    )));
+
+    app.usage_visible = false;
+    assert!(is_session_usage_fetch(&dispatch(
+        Action::ShowUsage,
+        &mut app
+    )));
+}
+
+#[test]
+fn show_usage_without_session_still_surfaces_credits() {
+    let mut app = test_app_with_agent();
+    app.agents.get_mut(&AgentId(0)).unwrap().session.session_id = None;
+    let before = agent_scrollback_len(&app);
     let effects = dispatch(Action::ShowUsage, &mut app);
-    // One manual provider fetch; background xAI polling still uses
-    // `FetchBilling` independently.
+    // No session: a note is pushed that usage is unavailable until the session
+    // starts, and the consumer billing surface still fetches both providers.
+    // Background xAI polling keeps using `FetchBilling` independently.
+    assert_eq!(agent_scrollback_len(&app), before + 1);
     assert_eq!(effects.len(), 1, "got: {effects:?}");
     assert!(
         matches!(&effects[0], Effect::FetchUsage { agent_id, include_xai: true, xai_redirect_url: None } if *agent_id == AgentId(0)),
@@ -506,7 +573,15 @@ fn show_usage_skips_hidden_xai_billing_but_still_fetches_codex() {
         plan_type: Some("Pro".into()),
     });
     app.apply_usage_visibility(false);
-    let effects = dispatch(Action::ShowUsage, &mut app);
+    // `/usage` schedules the per-session fetch first; the combined consumer
+    // usage fetch chains after the session block lands. With xAI billing hidden
+    // but a Codex account connected, that follow-up still fetches Codex quota
+    // (`include_xai: false`) rather than skipping the surface entirely.
+    assert!(is_session_usage_fetch(&dispatch(
+        Action::ShowUsage,
+        &mut app
+    )));
+    let effects = complete_session_usage(&mut app, "test-session", Default::default());
     assert!(matches!(
         effects.as_slice(),
         [Effect::FetchUsage {
@@ -611,6 +686,135 @@ fn codex_failure_does_not_change_xai_polling_or_paywall_state() {
         last_system_text(&app, AgentId(0))
             .contains("OpenAI Codex\nUsage unavailable: service unavailable")
     );
+}
+
+#[test]
+fn team_auth_disables_agent_billing_surface() {
+    let mut app = test_app_with_agent();
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .billing_surface_visible = true;
+    app.apply_auth_meta(&xai_grok_shell::auth::AuthMeta {
+        team_id: Some("team-uuid".into()),
+        team_name: Some("Acme Corp".into()),
+        ..Default::default()
+    });
+    assert!(!app.usage_visible);
+    assert!(!app.agents.get(&AgentId(0)).unwrap().billing_surface_visible);
+}
+
+#[serial_test::serial(GROK_TEST_OPEN_URL_FILE)]
+#[test]
+fn manage_billing_gates_on_consumer_billing_surface() {
+    let out = std::env::temp_dir().join(format!("grok-manage-billing-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    // SAFETY: serialized via `serial_test` so no other test races the env var.
+    unsafe { std::env::set_var("GROK_TEST_OPEN_URL_FILE", &out) };
+    let mut app = test_app_with_agent();
+    dispatch(Action::ManageBilling, &mut app);
+    let opened = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(opened.contains("grok.com/?_s=usage"), "got: {opened}");
+    let _ = std::fs::remove_file(&out);
+
+    // Non-consumer: silent no-op (slash command never offers manage).
+    let mut app = test_app_with_agent();
+    app.usage_visible = false;
+    let before = agent_scrollback_len(&app);
+    assert!(dispatch(Action::ManageBilling, &mut app).is_empty());
+    assert_eq!(agent_scrollback_len(&app), before);
+}
+
+#[test]
+fn session_usage_complete_pushes_block_and_chains_billing() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let usage = xai_grok_shell::extensions::notification::PromptUsage {
+        totals: xai_grok_shell::extensions::notification::PromptUsageModel {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            total_tokens: 1_100,
+            model_calls: 3,
+            cost_usd_ticks: Some(5_000_000_000),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let effects = complete_session_usage(&mut app, "test-session", usage);
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    let text = last_system_text(&app, AgentId(0));
+    assert!(
+        text.contains("Session usage") && text.contains("$0.5000"),
+        "{text}"
+    );
+    assert!(is_combined_billing_fetch(&effects));
+}
+
+#[test]
+fn session_usage_complete_no_billing_when_surface_hidden() {
+    let mut app = test_app_with_agent();
+    app.usage_visible = false;
+    let before = agent_scrollback_len(&app);
+    let effects = complete_session_usage(&mut app, "test-session", Default::default());
+    assert!(effects.is_empty());
+    // Only the credit follow-up is gated; the session block itself must land.
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+}
+
+#[test]
+fn session_usage_complete_redirect_after_session_block() {
+    let mut app = test_app_with_agent();
+    app.usage_billing_redirect_url = Some("https://billing.example.com/me".into());
+    // Dispatch defers the redirect until after the session block.
+    let before = agent_scrollback_len(&app);
+    assert!(is_session_usage_fetch(&dispatch(
+        Action::ShowUsage,
+        &mut app
+    )));
+    assert_eq!(agent_scrollback_len(&app), before);
+
+    let effects = complete_session_usage(&mut app, "test-session", Default::default());
+    assert!(effects.is_empty());
+    assert_eq!(agent_scrollback_len(&app), before + 2);
+    assert!(last_system_text(&app, AgentId(0)).contains("https://billing.example.com/me"));
+}
+
+#[test]
+fn session_usage_complete_drops_stale_session() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let effects = complete_session_usage(
+        &mut app,
+        "old-session",
+        xai_grok_shell::extensions::notification::PromptUsage {
+            totals: xai_grok_shell::extensions::notification::PromptUsageModel {
+                model_calls: 99,
+                cost_usd_ticks: Some(1_000_000_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(effects.is_empty());
+    assert_eq!(agent_scrollback_len(&app), before);
+}
+
+#[test]
+fn session_usage_failed_pushes_error_and_chains_billing() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let effects = fail_session_usage(&mut app, "test-session", "boom");
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    assert!(last_system_text(&app, AgentId(0)).contains("Couldn't load session usage: boom"));
+    assert!(is_combined_billing_fetch(&effects));
+}
+
+#[test]
+fn session_usage_failed_drops_stale_session() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    assert!(fail_session_usage(&mut app, "old-session", "boom").is_empty());
+    assert_eq!(agent_scrollback_len(&app), before);
 }
 
 // ── BillingFetched dispatch tests ───────────────────────────────────
@@ -975,8 +1179,7 @@ fn free_usage_failure_opens_paywall_modal() {
     // 1. Real send.
     let effects = dispatch(Action::SendPrompt("draw me a cat".into()), &mut app);
     assert!(
-        matches!(&effects[0], Effect::SendPrompt { text, .. }
-if text == "draw me a cat"),
+        matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "draw me a cat"),
         "send must dispatch: {effects:?}"
     );
     let prompt_id = app.agents[&id].session.current_prompt_id.clone();
@@ -1168,8 +1371,7 @@ fn unknown_non_restricted_command_still_passes_through() {
 
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(&effects[0], Effect::SendPrompt { text, .. }
-if text == "/frobnicate arg"),
+        matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "/frobnicate arg"),
         "unknown command must still pass through: {effects:?}"
     );
     assert!(

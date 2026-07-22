@@ -125,6 +125,9 @@ pub enum SyntheticReason {
     /// Feedback from a `Stop`/`SubagentStop` hook that blocked the agent from
     /// stopping. Injected in-turn so the model keeps working within the same turn.
     StopHookFeedback,
+    /// Working-directory switch context appended after a session relocation.
+    /// Carries a generation marker so recovery can detect an existing append.
+    WorkingDirectorySwitch,
     /// Catch-all for unknown/future variants.  Preserves forward compatibility
     /// so older clients can deserialize sessions written by newer versions.
     #[serde(other)]
@@ -160,6 +163,7 @@ impl SyntheticReason {
             | Self::Interjection
             | Self::GoalSummary
             | Self::StopHookFeedback
+            | Self::WorkingDirectorySwitch
             | Self::Unknown => false,
         }
     }
@@ -207,6 +211,10 @@ pub struct UserItem {
     /// deserialize correctly (`serde(default)` fills in `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic_reason: Option<SyntheticReason>,
+    /// Relocation generation for a working-directory switch reminder.
+    /// Structural metadata keeps recovery dedup independent of reminder text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_generation: Option<u64>,
     /// Set on a genuine user message that directly follows a user-interrupted
     /// turn (see [`PriorTurnInterrupt`]). `None` for synthetic messages and for
     /// real messages that did not follow an interrupt. `skip_serializing_if`
@@ -1115,6 +1123,8 @@ pub struct ConversationRequest {
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     /// JSON Schema for structured output (strict mode).
     pub json_schema: Option<serde_json::Value>,
+    /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
+    pub prompt_cache_key: Option<String>,
 }
 
 /// Location of a custom-output image whose requested detail is `original`.
@@ -2274,6 +2284,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: None,
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2286,6 +2297,7 @@ impl ConversationItem {
         Self::User(UserItem {
             content: parts,
             synthetic_reason: None,
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2302,6 +2314,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::CompactionMeta),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2319,9 +2332,23 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SystemReminder),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
+    }
+
+    /// Return the working-directory generation carried by this switch reminder.
+    pub fn working_directory_switch_generation(&self) -> Option<u64> {
+        match self {
+            Self::User(user)
+                if user.synthetic_reason.as_ref()
+                    == Some(&SyntheticReason::WorkingDirectorySwitch) =>
+            {
+                user.cwd_generation
+            }
+            _ => None,
+        }
     }
 
     /// User message containing project instructions (AGENTS.md / CLAUDE.md),
@@ -2334,6 +2361,20 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::ProjectInstructions),
+            cwd_generation: None,
+            prior_turn_interrupt: None,
+            prompt_index: None,
+        })
+    }
+
+    /// Working-directory switch reminder with a structural generation marker.
+    pub fn working_directory_switch(content: impl Into<String>, cwd_generation: u64) -> Self {
+        Self::User(UserItem {
+            content: vec![ContentPart::Text {
+                text: Arc::<str>::from(content.into()),
+            }],
+            synthetic_reason: Some(SyntheticReason::WorkingDirectorySwitch),
+            cwd_generation: Some(cwd_generation),
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2350,6 +2391,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::AutoContinue),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2366,6 +2408,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::AutoRecovery),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2383,6 +2426,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::Interjection),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2395,6 +2439,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::TaskCompleted),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2407,6 +2452,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SubagentCompleted),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2419,6 +2465,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::NotificationDrain),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2431,6 +2478,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::GoalSummary),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2447,6 +2495,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::GoalClassifierNudge),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2459,6 +2508,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SchedulerFired),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2471,6 +2521,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::StopHookFeedback),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -3840,7 +3891,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             parallel_tool_calls: None,
             previous_response_id: None,
             prompt: None,
-            prompt_cache_key: None,
+            prompt_cache_key: req.prompt_cache_key.clone(),
             prompt_cache_retention: None,
             reasoning: Some(rs::Reasoning {
                 effort: req.reasoning_effort.map(|e| e.to_responses_api()),
@@ -7918,8 +7969,7 @@ mod tests {
         let chat_msg = conversation_item_to_chat_message(user);
         let blocks = chat_msg.content.blocks();
         assert_eq!(blocks.len(), 4);
-        assert_matches!(&blocks[0], ChatContentBlock::Text { text }
-if text == "Compare these images:");
+        assert_matches!(&blocks[0], ChatContentBlock::Text { text } if text == "Compare these images:");
         assert_matches!(&blocks[1], ChatContentBlock::ImageUrl { .. });
         assert_matches!(&blocks[2], ChatContentBlock::ImageUrl { .. });
         assert_matches!(&blocks[3], ChatContentBlock::ImageUrl { .. });
@@ -8168,9 +8218,10 @@ if text == "Compare these images:");
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
             (crate::ReasoningEffort::Xhigh, "xhigh"),
-            // async-openai 0.33.1 has no Max/Ultra variants. The sampler
-            // retains the local selection on CreateResponseWrapper and
-            // patches Codex request JSON immediately before transport.
+            // The Responses typed layer models no Ultra variant, and the fork
+            // maps Max/Ultra onto `xhigh` here. The sampler retains the local
+            // selection on CreateResponseWrapper and patches the Codex request
+            // JSON with the true effort immediately before transport.
             (crate::ReasoningEffort::Max, "xhigh"),
             (crate::ReasoningEffort::Ultra, "xhigh"),
         ] {
@@ -10772,11 +10823,11 @@ if text == "Compare these images:");
             );
         };
         assert_eq!(blocks.len(), 2);
-        assert!(matches!(&blocks[0], ChatContentBlock::Text { text }
-if text == "Read image file: photo.png"));
         assert!(
-            matches!(&blocks[1], ChatContentBlock::ImageUrl { image_url }
-if image_url.url == "data:image/png;base64,iVBOR")
+            matches!(&blocks[0], ChatContentBlock::Text { text } if text == "Read image file: photo.png")
+        );
+        assert!(
+            matches!(&blocks[1], ChatContentBlock::ImageUrl { image_url } if image_url.url == "data:image/png;base64,iVBOR")
         );
     }
 
@@ -10842,12 +10893,10 @@ if image_url.url == "data:image/png;base64,iVBOR")
         };
         assert_eq!(inner.len(), 2);
         assert!(
-            matches!(&inner[0], crate::messages::ContentBlock::Text { text, .. }
-if text == "Read image file: photo.png")
+            matches!(&inner[0], crate::messages::ContentBlock::Text { text, .. } if text == "Read image file: photo.png")
         );
         assert!(
-            matches!(&inner[1], crate::messages::ContentBlock::Image { source: crate::messages::ImageSource::Base64 { media_type, data } }
-if media_type == "image/png" && data == "iVBOR")
+            matches!(&inner[1], crate::messages::ContentBlock::Image { source: crate::messages::ImageSource::Base64 { media_type, data } } if media_type == "image/png" && data == "iVBOR")
         );
     }
 
@@ -10897,8 +10946,7 @@ if media_type == "image/png" && data == "iVBOR")
 
         if let ConversationItem::ToolResult(t) = &back {
             assert_eq!(t.images.len(), 1);
-            assert!(matches!(&t.images[0], ContentPart::Image { url }
-if url.contains("iVBOR")));
+            assert!(matches!(&t.images[0], ContentPart::Image { url } if url.contains("iVBOR")));
         } else {
             panic!("Expected ToolResult");
         }
@@ -10952,6 +11000,30 @@ if url.contains("iVBOR")));
         } else {
             panic!("expected User variant");
         }
+    }
+
+    #[test]
+    fn working_directory_switch_round_trips_generation() {
+        let item = ConversationItem::working_directory_switch("moved", 7);
+        let json = serde_json::to_value(&item).expect("serialize");
+        assert_eq!(json["synthetic_reason"], "working_directory_switch");
+        assert_eq!(json["cwd_generation"], 7);
+        let back: ConversationItem = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.working_directory_switch_generation(), Some(7));
+    }
+
+    #[test]
+    fn legacy_user_defaults_cwd_generation_to_none() {
+        let item: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "user",
+            "content": [{"type": "text", "text": "hello"}],
+            "synthetic_reason": "system_reminder"
+        }))
+        .expect("deserialize legacy user");
+        let ConversationItem::User(user) = item else {
+            panic!("expected user");
+        };
+        assert!(user.cwd_generation.is_none());
     }
 
     /// `synthetic_reason` round-trips through JSON.  Old sessions that omit

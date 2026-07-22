@@ -17,7 +17,7 @@ use super::blocks::{
     EditToolCallBlock, ExecuteToolCallBlock, LineRange, ListDirToolCallBlock, OtherToolCallBlock,
     ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent, SessionEventBlock,
     SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock, ToolCallBlock,
-    UserPromptBlock,
+    UserPromptBlock, WorkflowBlock,
 };
 use super::types::{
     AccentStyle, BlockBackground, BlockContext, BlockOutput, DisplayMode, RenderedBlockOutput,
@@ -381,6 +381,8 @@ pub enum RenderBlock {
     Subagent(SubagentBlock),
     /// Grouped coordinated subagent swarm.
     Swarm(crate::scrollback::blocks::SwarmBlock),
+    /// Native workflow progress card.
+    Workflow(WorkflowBlock),
     /// /btw side-question response (golden accent).
     Btw(BtwBlock),
     /// `/context` snapshot with categorical bar + breakdown.
@@ -403,6 +405,7 @@ macro_rules! delegate_block {
             RenderBlock::BgTask(b) => b.$method($($arg),*),
             RenderBlock::Subagent(b) => b.$method($($arg),*),
             RenderBlock::Swarm(b) => b.$method($($arg),*),
+            RenderBlock::Workflow(b) => b.$method($($arg),*),
             RenderBlock::Btw(b) => b.$method($($arg),*),
             RenderBlock::ContextInfo(b) => b.$method($($arg),*),
             RenderBlock::CreditLimit(b) => b.$method($($arg),*),
@@ -921,6 +924,7 @@ impl RenderBlock {
         match self {
             RenderBlock::UserPrompt(_) => Some(theme.text_primary),
             RenderBlock::AgentMessage(_) => None, // No accent for agent messages
+            RenderBlock::Workflow(_) => None,
             RenderBlock::ToolCall(block) => {
                 // Execute: Green for success, red for failure
                 // Read/Edit/ListDir/Search: No accent
@@ -1092,6 +1096,9 @@ impl RenderBlock {
                         .join("\\n"),
                 ),
             ]),
+            RenderBlock::Workflow(b) => {
+                join_searchable([Some(b.name.clone()), Some(b.objective.clone())])
+            }
             RenderBlock::Subagent(b) => {
                 // Only the failed variant carries an error string worth indexing.
                 let error = match &b.kind {

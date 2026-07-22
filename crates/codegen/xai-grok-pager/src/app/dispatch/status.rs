@@ -1,5 +1,7 @@
 //! Session status, sharing, privacy, usage, and info dispatchers.
 
+use agent_client_protocol as acp;
+
 use super::ctx::get_active_agent;
 use super::settings::ui::refresh_open_settings_modals;
 use crate::app::actions::Effect;
@@ -253,24 +255,108 @@ pub(super) fn dispatch_show_context_info(app: &mut AppView) -> Vec<Effect> {
     }]
 }
 
-/// Show xAI credit usage and OpenAI Codex quota usage in one inline block.
+/// `/usage` — session token/cost, then the combined xAI + Codex usage block.
 ///
-/// When the remote settings `grok_build_usage_redirect_url` flag is set (delivered via
-/// RemoteSettings, targeted at personal-team users), skip only the xAI backend
-/// fetch and point that provider at the URL instead. Codex usage still loads.
-/// This remains a kill switch for the personal-team billing path while it is
-/// unreliable.
+/// Emits the per-session token/cost fetch first, then chains the combined
+/// consumer usage block so layout stays ordered. `usage_visible` (the xAI
+/// billing/UI gate) only controls the xAI half; OpenAI Codex quota loads
+/// independently whenever a Codex account is connected.
 pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
-    // This manual path fetches both providers independently. Background xAI
-    // billing refreshes continue to use `FetchBilling` and remain silent.
+    let session_id = {
+        let Some(agent) = app.agents.get_mut(&id) else {
+            return vec![];
+        };
+        agent.session.session_id.clone()
+    };
+    match session_id {
+        Some(session_id) => vec![Effect::FetchSessionUsage {
+            agent_id: id,
+            session_id,
+        }],
+        None => {
+            if let Some(agent) = app.agents.get_mut(&id) {
+                agent.scrollback.push_block(RenderBlock::system(
+                    "Session usage is unavailable until the session starts.".to_string(),
+                ));
+            }
+            append_consumer_billing_surface(app, id)
+        }
+    }
+}
+
+/// Commit a session-usage block if still on `session_id`, then consumer usage.
+pub(super) fn commit_session_usage_block(
+    app: &mut AppView,
+    agent_id: AgentId,
+    session_id: &acp::SessionId,
+    text: String,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(session_id) {
+        return vec![];
+    }
+    agent.scrollback.push_block(RenderBlock::system(text));
+    append_consumer_billing_surface(app, agent_id)
+}
+
+/// Combined consumer usage follow-up for `/usage`: fetch xAI billing and
+/// OpenAI Codex quota together. `usage_visible` gates only the xAI half —
+/// Codex quota loads independently whenever a Codex account is connected.
+///
+/// The remote `grok_build_usage_redirect_url` kill switch is resolved here,
+/// synchronously: when set, the xAI half is replaced by a scrollback notice
+/// pointing at the management URL (pushed after the session block so layout
+/// stays ordered) rather than calling `x.ai/billing`. Codex quota still loads.
+/// The combined `FetchUsage` effect is emitted only when at least one provider
+/// can still answer it; background xAI billing refreshes keep using silent
+/// `FetchBilling` independently of this surface.
+pub(super) fn append_consumer_billing_surface(app: &mut AppView, agent_id: AgentId) -> Vec<Effect> {
+    if !app.agents.contains_key(&agent_id) {
+        return vec![];
+    }
+    let codex_connected = app.startup_codex_account.is_some();
+    // xAI half: gated by `usage_visible`, then by the remote redirect kill
+    // switch. A redirect resolves to a scrollback notice (not a fetch).
+    let include_xai = if app.usage_visible {
+        match app.usage_billing_redirect_url.clone() {
+            Some(url) => {
+                if let Some(agent) = app.agents.get_mut(&agent_id) {
+                    agent
+                        .scrollback
+                        .push_block(RenderBlock::system(format!("View current usage at {url}.")));
+                }
+                false
+            }
+            None => true,
+        }
+    } else {
+        false
+    };
+    // Nothing left to fetch — neither xAI billing nor a connected Codex quota.
+    if !include_xai && !codex_connected {
+        return vec![];
+    }
     vec![Effect::FetchUsage {
-        agent_id: id,
-        include_xai: app.usage_visible,
-        xai_redirect_url: app.usage_billing_redirect_url.clone(),
+        agent_id,
+        include_xai,
+        xai_redirect_url: None,
     }]
+}
+
+/// `/usage manage` — open consumer billing. No-op when the surface is hidden.
+pub(super) fn dispatch_manage_billing(app: &mut AppView) -> Vec<Effect> {
+    if !app.usage_visible {
+        return vec![];
+    }
+    super::router::dispatch(
+        crate::app::actions::Action::OpenUrl("https://grok.com/?_s=usage".to_string()),
+        app,
+    )
 }
 
 /// Commit a one-line "update available" notice into the active agent's

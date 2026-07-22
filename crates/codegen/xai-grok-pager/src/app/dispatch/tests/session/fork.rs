@@ -747,6 +747,10 @@ fn dispatch_fork_inherits_appearance_sharing_and_plugin_visibility() {
     dispatch(Action::Fork(fork_args(Some(false), None)), &mut app);
     let new_agent = app.agents.get(&AgentId(1)).unwrap();
     assert!(!new_agent.sharing_enabled);
+    // The parent's combined `/usage` surface is unavailable here
+    // (`usage_visible = false` with no Codex account), so the fork inherits the
+    // hidden state: `/usage` is gated out of the registry entirely, in lockstep
+    // with `billing_surface_visible` below.
     assert!(
         new_agent
             .prompt
@@ -755,6 +759,7 @@ fn dispatch_fork_inherits_appearance_sharing_and_plugin_visibility() {
             .get("usage")
             .is_none()
     );
+    assert!(!new_agent.billing_surface_visible);
     assert_eq!(
         new_agent
             .credit_balance
