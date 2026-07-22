@@ -678,42 +678,4 @@ impl HunkTrackerActor {
 
         debug!("{REFRESH_SCAN_LOG_PREFIX} {:?}", start.elapsed());
     }
-
-    /// Set tracking mode.
-    pub(super) async fn set_mode(&mut self, mode: TrackingMode) {
-        let old_mode = self.mode;
-        self.mode = mode;
-
-        if old_mode == TrackingMode::AgentOnly && mode == TrackingMode::AllDirty {
-            // Switching to AllDirty - refresh git cache and track dirty files
-            self.refresh_git_dirty_cache(None).await;
-        } else if old_mode == TrackingMode::AllDirty && mode == TrackingMode::AgentOnly {
-            // Switching to AgentOnly - remove non-agent files
-            let non_agent_paths: Vec<PathBuf> = self
-                .file_states
-                .iter()
-                .filter(|(_, state)| !state.is_agent_file)
-                .map(|(path, _)| path.clone())
-                .collect();
-
-            for path in non_agent_paths {
-                if let Some(state) = self.file_states.remove(&path) {
-                    // Remove from turn_index and emit removed events for all hunks
-                    for hunk in state.hunks {
-                        if let Some(prompt_index) = hunk.source.prompt_index()
-                            && let Some(set) = self.turn_index.get_mut(&prompt_index)
-                        {
-                            set.remove(&hunk.id);
-                        }
-                        self.send_event(HunkEvent::HunkRemoved {
-                            path: path.clone(),
-                            hunk_id: hunk.id.clone(),
-                            reason: HunkRemovalReason::Superseded,
-                        });
-                    }
-                    self.send_event(HunkEvent::FileRemoved { path });
-                }
-            }
-        }
-    }
 }

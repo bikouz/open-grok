@@ -97,15 +97,6 @@ impl HunkSource {
         matches!(self, HunkSource::AgentEdit { .. })
     }
 
-    /// Returns true if this is any kind of agent-related source
-    /// (either agent edit or user edit on agent file)
-    pub fn is_agent_tracked(&self) -> bool {
-        matches!(
-            self,
-            HunkSource::AgentEdit { .. } | HunkSource::ExternalEditOnAgentFile
-        )
-    }
-
     /// Returns true if this was an external (user) edit
     pub fn is_external(&self) -> bool {
         matches!(
@@ -217,22 +208,6 @@ impl Hunk {
             created_at: Utc::now(),
             selected: false,
         }
-    }
-
-    /// Get a short summary for display
-    pub fn summary(&self) -> String {
-        let additions = self.new_text.lines().count();
-        let deletions = self
-            .old_text
-            .as_ref()
-            .map(|t| t.lines().count())
-            .unwrap_or(0);
-        format!("+{}/-{}", additions, deletions)
-    }
-
-    /// Get the display path with line number
-    pub fn display_path(&self) -> String {
-        format!("{}:{}", self.path.display(), self.line_info.new_start)
     }
 }
 

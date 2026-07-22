@@ -161,15 +161,6 @@ impl StreamingSttSession {
         }
     }
 
-    pub async fn send_pcm(&self, pcm_bytes: Vec<u8>) -> Result<(), VoiceError> {
-        let Some(tx) = &self.audio_tx else {
-            return Err(VoiceError::Stt("audio input closed".into()));
-        };
-        tx.send(pcm_bytes)
-            .await
-            .map_err(|_| VoiceError::Stt("audio channel closed".into()))
-    }
-
     pub async fn recv(&mut self) -> Option<StreamingSttEvent> {
         self.event_rx.recv().await
     }

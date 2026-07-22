@@ -180,7 +180,7 @@ fn is_hidden(
 /// ONE gate — paint, hit-rect, OSC 8 emission, and dispatch all inherit it.
 /// The scheme re-check fails closed here because OSC 8 activation is
 /// terminal-native and would otherwise hand a raw remote URL (`file://`,
-/// custom schemes) past `open_url_if_safe` entirely; a non-https CTA renders
+/// custom schemes) past `try_open_url` entirely; a non-https CTA renders
 /// as a plain message row instead of a dead or unsafe button.
 fn usable_cta(a: &xai_grok_announcements::RemoteAnnouncement) -> Option<(&str, &str)> {
     let cta = a.cta.as_ref()?;

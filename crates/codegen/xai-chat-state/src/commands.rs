@@ -4,8 +4,7 @@ use std::collections::BTreeSet;
 
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DanglingToolCallReason, SamplingConfig, TokenUsage,
-    ToolSpec, TraceContext,
+    ConversationItem, ConversationRequest, SamplingConfig, TokenUsage, ToolSpec, TraceContext,
 };
 
 use crate::types::{
@@ -71,12 +70,6 @@ pub enum ChatStateCommand {
         content: String,
         cwd_generation: std::num::NonZeroU64,
         reply: oneshot::Sender<Result<StrictAppendAck, StrictAppendError>>,
-    },
-
-    /// Push a user message with an explicit dangling-repair reason.
-    PushUserMessageWithRepairReason {
-        item: ConversationItem,
-        reason: DanglingToolCallReason,
     },
 
     /// Record the assistant's response (text + tool calls).

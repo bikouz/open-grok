@@ -160,9 +160,6 @@ impl ChatStateActor {
                 }
                 let _ = reply.send(result);
             }
-            ChatStateCommand::PushUserMessageWithRepairReason { item, reason } => {
-                self.push_user_message_with_repair_reason(item, reason);
-            }
             ChatStateCommand::PushAssistantResponse { item } => {
                 self.push_message(item);
             }

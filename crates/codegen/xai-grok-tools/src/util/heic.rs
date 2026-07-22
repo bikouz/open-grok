@@ -17,6 +17,7 @@
 /// JPEG encode quality for transcoded HEICs, matching the mid-quality rung
 /// of the read-tool compression ladder (the compress path may re-encode
 /// again anyway).
+#[cfg(target_os = "macos")]
 const JPEG_QUALITY: f64 = 0.85;
 
 /// Mime types this module transcodes (as sniffed by `infer`).

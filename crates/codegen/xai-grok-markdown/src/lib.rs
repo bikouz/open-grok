@@ -170,14 +170,3 @@ pub fn render_markdown(
         .parse()
         .render_ansi(pretty)
 }
-
-/// Render markdown to ratatui Lines (simple API).
-pub fn render_markdown_ratatui(
-    text: &str,
-    ms: MarkdownStyle,
-    pretty: bool,
-    syntect: Option<&Syntect>,
-) -> (Vec<ratatui::text::Line<'static>>, Vec<usize>) {
-    let (out, _checkpoint) = render_markdown_ratatui_full(text, ms, pretty, syntect);
-    (out.lines, out.line_source_map)
-}

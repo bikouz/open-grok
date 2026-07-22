@@ -150,16 +150,6 @@ impl AgentCommand {
             Self::ForkSession => "Forking session",
         }
     }
-    /// The raw command text (e.g., "/compact").
-    pub fn command_text(&self) -> &'static str {
-        match self {
-            Self::Compact => "/compact",
-            Self::CreateWorktree => "worktree",
-            Self::RestoreWorktree => "worktree",
-            Self::RestoreCode => "restore",
-            Self::ForkSession => "fork",
-        }
-    }
 }
 /// Maximum in-memory stdout per background task (10 MB).
 pub const BG_TASK_MAX_STDOUT: usize = 10 * 1024 * 1024;

@@ -37,23 +37,6 @@ pub enum ConfigSource {
 }
 
 impl ConfigSource {
-    /// Short human-readable label for terminal display.
-    pub fn display_short(&self) -> String {
-        match self {
-            Self::Builtin => "builtin".into(),
-            Self::Bundled { path } => format!("bundled: {}", path.display()),
-            Self::Server { path } => format!("server: {}", path.display()),
-            Self::Project { path } => format!("project: {}", path.display()),
-            Self::User { path } => format!("user: {}", path.display()),
-            Self::Plugin { plugin_name, .. } => format!("plugin: {plugin_name}"),
-            Self::ConfigToml { path } => format!("config: {}", path.display()),
-            Self::ClaudeJson { .. } => "~/.claude.json".into(),
-            Self::McpJson { path } => format!(".mcp.json: {}", path.display()),
-            Self::Cli { .. } => "cli".into(),
-            Self::Managed { .. } => "managed".into(),
-        }
-    }
-
     /// Compact label for columnar terminal display (no paths).
     pub fn display_label(&self) -> String {
         match self {
@@ -68,31 +51,6 @@ impl ConfigSource {
             Self::McpJson { .. } => ".mcp.json".into(),
             Self::Cli { .. } => "cli".into(),
             Self::Managed { .. } => "managed".into(),
-        }
-    }
-
-    /// Plugin name if this is a plugin-provided component, `None` otherwise.
-    pub fn plugin_name(&self) -> Option<&str> {
-        match self {
-            Self::Plugin { plugin_name, .. } => Some(plugin_name),
-            _ => None,
-        }
-    }
-
-    /// Filesystem path, if any.
-    pub fn path(&self) -> Option<&std::path::Path> {
-        match self {
-            Self::Builtin => None,
-            Self::Bundled { path }
-            | Self::Server { path }
-            | Self::Project { path }
-            | Self::User { path }
-            | Self::Plugin { path, .. }
-            | Self::ConfigToml { path }
-            | Self::ClaudeJson { path }
-            | Self::McpJson { path }
-            | Self::Cli { path } => Some(path),
-            Self::Managed { path } => path.as_deref(),
         }
     }
 }

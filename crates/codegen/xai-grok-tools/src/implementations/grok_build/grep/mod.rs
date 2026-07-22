@@ -202,18 +202,6 @@ fn resolve_effective_head_limit(input: &GrepSearchInput, output_mode: &OutputMod
     input.head_limit.unwrap_or(default).min(cap)
 }
 
-/// Hard `head_limit` ceiling for a mode (what an explicit limit is clamped to).
-///
-/// Callers that paginate over the full underlying result themselves
-/// must request this instead of `head_limit: None`, which
-/// now resolves to the small omitted-`head_limit` default and kills `rg` early.
-pub fn max_head_limit(output_mode: &OutputMode) -> usize {
-    match output_mode {
-        OutputMode::Content => CONTENT_LINE_LIMIT,
-        OutputMode::FilesWithMatches | OutputMode::Count => FILE_COUNT_LIMIT,
-    }
-}
-
 /// grep's capabilities incl. its streaming spec (single source of truth).
 /// grep streams the formatted card body (`PlainText` / `Append`), never raw
 /// stdout; the `<workspace_result …>` wrapper and "Found N …" summary are a

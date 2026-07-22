@@ -356,9 +356,6 @@ impl HunkTrackerActor {
             HunkTrackerCommand::ResetBaseline { path } => {
                 self.reset_baseline(&path);
             }
-            HunkTrackerCommand::SetMode { mode } => {
-                self.set_mode(mode).await;
-            }
             HunkTrackerCommand::HunkAction {
                 hunk_id,
                 action,
@@ -413,28 +410,6 @@ impl HunkTrackerActor {
                     debug!("GetFileHunkData reply channel dropped");
                 }
             }
-            HunkTrackerCommand::GetHunksBySource { source, reply } => {
-                let hunks = self.get_hunks_by_source(source);
-                if reply.send(hunks).is_err() {
-                    debug!("GetHunksBySource reply channel dropped");
-                }
-            }
-            HunkTrackerCommand::GetHunk { hunk_id, reply } => {
-                let hunk = self.get_hunk(&hunk_id);
-                if reply.send(hunk).is_err() {
-                    debug!("GetHunk reply channel dropped");
-                }
-            }
-            HunkTrackerCommand::IsAgentFile { path, reply } => {
-                let is_agent = self
-                    .file_states
-                    .get(&path)
-                    .map(|s| s.is_agent_file)
-                    .unwrap_or(false);
-                if reply.send(is_agent).is_err() {
-                    debug!("IsAgentFile reply channel dropped");
-                }
-            }
             HunkTrackerCommand::GetAllTrackedPaths { reply } => {
                 let paths = self.get_all_tracked_paths();
                 if reply.send(paths).is_err() {
@@ -486,17 +461,8 @@ impl HunkTrackerActor {
                     debug!("GetTurnHunks reply channel dropped");
                 }
             }
-            HunkTrackerCommand::ResetStats => {
-                self.session_stats = SessionStats::default();
-            }
             HunkTrackerCommand::RefreshAllBaselines => {
                 self.refresh_all_baselines().await;
-            }
-            HunkTrackerCommand::SnapshotState { reply } => {
-                let snapshot = self.take_snapshot();
-                if reply.send(snapshot).is_err() {
-                    debug!("SnapshotState reply channel dropped");
-                }
             }
             HunkTrackerCommand::SnapshotTurnDelta {
                 prompt_index,
@@ -515,8 +481,6 @@ impl HunkTrackerActor {
     }
 
     /// Snapshot one file's state (full FileContentState incl. Binary/TooLarge).
-    /// Shared by [`take_snapshot`](Self::take_snapshot) and
-    /// [`take_turn_delta`](Self::take_turn_delta) so they can't diverge.
     fn snapshot_file_state(state: &FileHunkState) -> FileHunkStateSnapshot {
         FileHunkStateSnapshot {
             baseline: state.baseline.clone(),
@@ -527,27 +491,8 @@ impl HunkTrackerActor {
         }
     }
 
-    /// Take a snapshot of all hunk tracker state for preservation across
-    /// session kill/reload cycles.
-    /// Preserves the full FileContentState (including Binary/TooLarge) for correctness
-    /// in fork and cross-session sync flows.
-    fn take_snapshot(&self) -> HunkTrackerSnapshot {
-        let file_states = self
-            .file_states
-            .iter()
-            .map(|(path, state)| (path.clone(), Self::snapshot_file_state(state)))
-            .collect();
-
-        HunkTrackerSnapshot {
-            file_states,
-            turn_index: self.turn_index.clone(),
-            session_stats: self.session_stats.clone(),
-        }
-    }
-
     /// Incremental single-turn delta for `prompt_index`: snapshots of the files
-    /// owning this turn's hunks plus the hunk-id set. Unlike
-    /// [`take_snapshot`](Self::take_snapshot), never copies the whole tracker.
+    /// owning this turn's hunks plus the hunk-id set. Never copies the whole tracker.
     fn take_turn_delta(&self, prompt_index: usize) -> HunkTurnDelta {
         let hunk_ids = self
             .turn_index

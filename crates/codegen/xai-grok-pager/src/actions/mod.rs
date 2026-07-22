@@ -448,13 +448,6 @@ impl ActionRegistry {
         hints
     }
 
-    /// Get hint items for the shortcuts bar, filtered by contexts and sorted by priority.
-    ///
-    /// Convenience method that converts `ActionDef`s to `HintItem`s.
-    pub fn hint_items(&self, contexts: &[When]) -> Vec<HintItem> {
-        self.hints(contexts).iter().map(|def| def.hint()).collect()
-    }
-
     /// Get the current key binding for an action.
     pub fn key_for(&self, id: ActionId) -> Option<KeyShortcut> {
         self.find(id).map(|def| def.default_key)

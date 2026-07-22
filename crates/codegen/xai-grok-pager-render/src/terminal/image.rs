@@ -217,11 +217,6 @@ pub fn kitty_format_from_bytes(image_data: &[u8]) -> Option<KittyImageFormat> {
     }
 }
 
-/// Whether Kitty can directly render this encoded MIME type in raw-byte mode.
-pub fn kitty_mime_is_directly_supported(mime_type: &str) -> bool {
-    mime_type == "image/png"
-}
-
 /// Prepare encoded image bytes for Kitty's raw-byte overlay path.
 ///
 /// Kitty accepts encoded PNG bytes via `f=100`, but not encoded JPEG/WebP/etc.

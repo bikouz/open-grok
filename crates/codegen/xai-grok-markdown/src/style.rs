@@ -5,8 +5,6 @@
 
 use anstyle::{Effects, Style};
 
-use crate::colors::adapt_style;
-
 /// Table border characters for rendering tables in pretty mode.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TableBorders {
@@ -29,18 +27,6 @@ impl TableBorders {
     pub const BOX: Self = Self {
         chars: ['─', '│', '┌', '┐', '└', '┘', '┬', '┴', '├', '┤', '┼'],
     };
-
-    pub const ASCII: Self = Self {
-        chars: ['-', '|', '+', '+', '+', '+', '+', '+', '+', '+', '+'],
-    };
-
-    pub const DOUBLE: Self = Self {
-        chars: ['═', '║', '╔', '╗', '╚', '╝', '╦', '╩', '╠', '╣', '╬'],
-    };
-
-    pub const fn new(chars: [char; 11]) -> Self {
-        Self { chars }
-    }
 
     // Short names (used in table formatting)
     pub const fn h(&self) -> char {
@@ -74,41 +60,6 @@ impl TableBorders {
         self.chars[Self::T_R]
     }
     pub const fn x(&self) -> char {
-        self.chars[Self::X]
-    }
-
-    // Long names (for readability)
-    pub const fn horizontal(&self) -> char {
-        self.chars[Self::H]
-    }
-    pub const fn vertical(&self) -> char {
-        self.chars[Self::V]
-    }
-    pub const fn top_left(&self) -> char {
-        self.chars[Self::TL]
-    }
-    pub const fn top_right(&self) -> char {
-        self.chars[Self::TR]
-    }
-    pub const fn bottom_left(&self) -> char {
-        self.chars[Self::BL]
-    }
-    pub const fn bottom_right(&self) -> char {
-        self.chars[Self::BR]
-    }
-    pub const fn t_top(&self) -> char {
-        self.chars[Self::T_T]
-    }
-    pub const fn t_bottom(&self) -> char {
-        self.chars[Self::T_B]
-    }
-    pub const fn t_left(&self) -> char {
-        self.chars[Self::T_L]
-    }
-    pub const fn t_right(&self) -> char {
-        self.chars[Self::T_R]
-    }
-    pub const fn cross(&self) -> char {
         self.chars[Self::X]
     }
 }
@@ -158,56 +109,6 @@ pub struct MarkdownStyle {
     /// Unicode conversion, and display math block lines). In raw mode the
     /// style applies to the unconverted TeX source.
     pub math: Style,
-}
-
-impl MarkdownStyle {
-    /// Adapt all styles for the terminal's color capabilities.
-    ///
-    /// This downgrades RGB colors to 256-color or 16-color as needed.
-    pub fn adapt(self) -> Self {
-        Self {
-            heading_inner: [
-                adapt_style(self.heading_inner[0]),
-                adapt_style(self.heading_inner[1]),
-                adapt_style(self.heading_inner[2]),
-                adapt_style(self.heading_inner[3]),
-                adapt_style(self.heading_inner[4]),
-                adapt_style(self.heading_inner[5]),
-            ],
-            heading_outer: [
-                adapt_style(self.heading_outer[0]),
-                adapt_style(self.heading_outer[1]),
-                adapt_style(self.heading_outer[2]),
-                adapt_style(self.heading_outer[3]),
-                adapt_style(self.heading_outer[4]),
-                adapt_style(self.heading_outer[5]),
-            ],
-            strong_inner: adapt_style(self.strong_inner),
-            strong_outer: adapt_style(self.strong_outer),
-            emphasis_inner: adapt_style(self.emphasis_inner),
-            emphasis_outer: adapt_style(self.emphasis_outer),
-            strikethrough_inner: adapt_style(self.strikethrough_inner),
-            strikethrough_outer: adapt_style(self.strikethrough_outer),
-            inline_code_inner: adapt_style(self.inline_code_inner),
-            inline_code_outer: adapt_style(self.inline_code_outer),
-            blockquote_outer: adapt_style(self.blockquote_outer),
-            task_checked: adapt_style(self.task_checked),
-            task_unchecked: adapt_style(self.task_unchecked),
-            list_item: adapt_style(self.list_item),
-            rule: adapt_style(self.rule),
-            link_outer: adapt_style(self.link_outer),
-            link_text: adapt_style(self.link_text),
-            link_url: adapt_style(self.link_url),
-            link_title: adapt_style(self.link_title),
-            code_outer: adapt_style(self.code_outer),
-            code_language: adapt_style(self.code_language),
-            code_untagged: adapt_style(self.code_untagged),
-            code_background: adapt_style(self.code_background),
-            table_outer: adapt_style(self.table_outer),
-            text: adapt_style(self.text),
-            math: adapt_style(self.math),
-        }
-    }
 }
 
 /// Check if ALL active styles have HIDDEN effect.

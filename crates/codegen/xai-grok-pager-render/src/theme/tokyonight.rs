@@ -282,11 +282,6 @@ impl Theme {
     pub const fn primary(&self) -> Style {
         Style::new().fg(self.text_primary)
     }
-
-    /// Get a bold style.
-    pub const fn bold(&self) -> Style {
-        Style::new().add_modifier(Modifier::BOLD)
-    }
 }
 
 /// Compute animated brightness for a traveling wave effect.

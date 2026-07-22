@@ -15,7 +15,10 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ),
     ("best-of-n", include_str!("../skills/best-of-n/SKILL.md")),
     ("check-work", include_str!("../skills/check-work/SKILL.md")),
-    ("code-review", include_str!("../skills/code-review/SKILL.md")),
+    (
+        "code-review",
+        include_str!("../skills/code-review/SKILL.md"),
+    ),
     (
         "create-skill",
         include_str!("../skills/create-skill/SKILL.md"),

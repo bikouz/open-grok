@@ -345,7 +345,7 @@ fn is_table_line(line: &Line<'_>) -> bool {
             }
             false
         }
-        // ASCII table borders (TableBorders::ASCII uses '+' and '|')
+        // ASCII table rows use vertical bars.
         Some('|') => true,
         _ => false,
     }
