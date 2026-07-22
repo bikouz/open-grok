@@ -5,8 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use serde_json::Value as JsonValue;
-
 use super::WorkflowTool;
 use crate::implementations::grok_build::task::backend::{SubagentBackend, SubagentBackendResource};
 use crate::implementations::grok_build::task::types::{

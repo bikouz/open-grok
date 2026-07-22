@@ -50,6 +50,7 @@ pub(super) fn minimal_auth_provider(
 }
 
 /// Map the app's [`AuthState`] to what the no-agent live region should show.
+#[cfg(test)]
 pub(super) fn minimal_auth_hint(
     auth: &AuthState,
     primary_provider: PrimaryProvider,

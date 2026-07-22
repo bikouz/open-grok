@@ -1,0 +1,7 @@
+[[production]]
+package = "xai-grok-pager-bin"
+bin = "open-grok"
+reason = "shipped Open Grok CLI and TUI"
+
+[[feature-profile]]
+name = "default"
