@@ -19,62 +19,6 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(10);
 /// Files larger than this will be skipped to avoid pathological diff behavior.
 const MAX_DIFF_FILE_SIZE: usize = 1024 * 1024; // 1 MB
 
-/// Generate a unified diff patch string from baseline and current content.
-/// This produces a patch that can be parsed by Pierre's `getSingularPatch`.
-///
-/// Returns None if:
-/// - Content is identical
-/// - Either file exceeds MAX_DIFF_FILE_SIZE
-/// - Diff computation times out
-pub fn generate_unified_patch(path: &Path, baseline: &str, current: &str) -> Option<String> {
-    // If content is identical, no patch needed
-    if baseline == current {
-        return None;
-    }
-
-    // Check file size limits
-    if baseline.len() > MAX_DIFF_FILE_SIZE || current.len() > MAX_DIFF_FILE_SIZE {
-        warn!(
-            path = %path.display(),
-            baseline_size = baseline.len(),
-            current_size = current.len(),
-            max_size = MAX_DIFF_FILE_SIZE,
-            "Skipping unified patch for file exceeding size limit"
-        );
-        return None;
-    }
-
-    let start_time = Instant::now();
-
-    let diff = TextDiff::configure()
-        .timeout(DIFF_TIMEOUT)
-        .diff_lines(baseline, current);
-
-    let elapsed = start_time.elapsed();
-    if elapsed >= DIFF_TIMEOUT {
-        warn!(
-            path = %path.display(),
-            elapsed_ms = elapsed.as_millis(),
-            "Unified patch diff timed out"
-        );
-        return None;
-    }
-
-    // Generate unified diff with file headers
-    let path_str = path.display().to_string();
-    let unified = diff
-        .unified_diff()
-        .context_radius(CONTEXT_LINES)
-        .header(&format!("a/{}", path_str), &format!("b/{}", path_str))
-        .to_string();
-
-    if unified.is_empty() {
-        None
-    } else {
-        Some(unified)
-    }
-}
-
 /// Generate a patch fragment for a single hunk with context lines.
 /// Returns just the hunk portion (no file headers), e.g.:
 /// "@@ -10,5 +10,7 @@\n context\n-old\n+new\n context\n"
@@ -457,17 +401,6 @@ fn calculate_overlap_size(a: &HunkLineInfo, b: &HunkLineInfo) -> usize {
     let overlap_end = a_end.min(b_end);
 
     overlap_end.saturating_sub(overlap_start)
-}
-
-/// Find all old hunks that overlap with a new hunk (for merging).
-pub fn find_overlapping_hunks<'a>(
-    new_hunk: &Hunk,
-    old_hunks: &'a [Arc<Hunk>],
-) -> Vec<&'a Arc<Hunk>> {
-    old_hunks
-        .iter()
-        .filter(|o| hunks_overlap(o, new_hunk))
-        .collect()
 }
 
 #[cfg(test)]

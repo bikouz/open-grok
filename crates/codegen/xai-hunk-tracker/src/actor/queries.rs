@@ -9,7 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::diff::generate_hunk_patch;
 use crate::types::{
-    FileContentView, FileHunkData, Hunk, HunkId, HunkSourceFilter, SessionSummary, TurnSummary,
+    FileContentView, FileHunkData, Hunk, HunkId, SessionSummary, TurnSummary,
 };
 
 use super::HunkTrackerActor;
@@ -95,19 +95,6 @@ impl HunkTrackerActor {
     /// when replicating a worktree's changes back to the root repo.
     pub(super) fn get_all_tracked_paths(&self) -> Vec<PathBuf> {
         self.file_states.keys().cloned().collect()
-    }
-
-    /// Get hunks filtered by source.
-    pub(super) fn get_hunks_by_source(&self, source: HunkSourceFilter) -> Vec<Arc<Hunk>> {
-        self.file_states
-            .values()
-            .flat_map(|state| &state.hunks)
-            .filter(|hunk| match source {
-                HunkSourceFilter::Agent => hunk.source.is_agent_edit(),
-                HunkSourceFilter::External => hunk.source.is_external(),
-            })
-            .cloned()
-            .collect()
     }
 
     /// Get a specific hunk by ID.
