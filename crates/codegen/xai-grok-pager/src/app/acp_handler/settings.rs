@@ -134,7 +134,7 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     }
     // Tier before voice: same payload may set "API Key" and voice_mode_enabled=false.
     // Always recompute is_api_key_auth from the tier so a later Free/SuperGrok
-    // stamp does not leave API-key bypass / hidden `/usage` stuck.
+    // stamp does not leave API-key bypass / a hidden billing surface stuck.
     if app.uses_xai_access_controls()
         && let Some(v) = update.subscription_tier_display
     {

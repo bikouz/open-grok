@@ -1,5 +1,6 @@
 //! Tests for session loading, restore, pickers, and deep search.
 use super::*;
+use xai_grok_shell::session::unified_list::ListScope;
 
 fn loaded_provider_models(model: &str, provider: &str) -> acp::SessionModelState {
     let model_id = acp::ModelId::new(model.to_string());
@@ -793,7 +794,8 @@ fn resume_known_session_id_loads_not_creates() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::LoadSession { session_id, .. } if
+            .any(|e| matches!(e, Effect::LoadSession { session_id, .. }
+if
         session_id == "resume-known-id")),
         "expected LoadSession, got {effects:?}"
     );
@@ -873,6 +875,12 @@ fn auth_complete_restores_view_after_mid_session_login() {
 }
 #[test]
 fn session_loaded_drains_pending_first_prompt_to_front() {
+    // Pin combine off: SessionLoaded drains only the FRONT prompt (the fork's
+    // pending-first directive), leaving the user-typed prompt queued. The drain
+    // reads the effective `[ui].combine_queued_prompts`, so a combine-on dev
+    // config would merge both into one send and drain the queue to empty. Keep
+    // the front-first assertion hermetic.
+    crate::appearance::cache::set_combine_queued_prompts(false);
     let mut app = fork_test_app();
     dispatch(
         Action::Fork(fork_args(Some(false), Some("first directive"))),
@@ -1329,7 +1337,8 @@ fn resume_after_load_failed_reissues_load() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::LoadSession { agent_id, .. } if *
+            .any(|e| matches!(e, Effect::LoadSession { agent_id, .. }
+if *
         agent_id == agent_0))
     );
     assert!(app.agents[&agent_0].loading_placeholder_id.is_some());
@@ -2041,6 +2050,7 @@ fn stale_session_list_responses_are_dropped() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-stale-1")],
             partial: None,
             seq: 1,
@@ -2066,6 +2076,7 @@ fn stale_session_list_responses_are_dropped() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-fresh-2")],
             partial: None,
             seq: 2,
@@ -2111,6 +2122,7 @@ fn modal_search_response_lands_and_stale_is_dropped() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-hit-1")],
             partial: None,
             seq: 1,
@@ -2149,6 +2161,7 @@ fn modal_search_response_lands_and_stale_is_dropped() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-stale-m")],
             partial: None,
             seq: 1,
@@ -2204,6 +2217,7 @@ fn modal_close_drops_in_flight_search_response() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-late-1")],
             partial: None,
             seq,
@@ -2250,6 +2264,7 @@ fn modal_pick_drops_in_flight_search_response() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-late-p")],
             partial: None,
             seq,
@@ -2294,6 +2309,7 @@ fn welcome_esc_drops_in_flight_fetch_response() {
     let _ = dispatch(Action::SessionPickerClosed, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-late-w")],
             partial: None,
             seq,
@@ -2324,6 +2340,7 @@ fn build_mode_modal_close_does_not_invalidate_plain_fetch() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("build-late-1", "/tmp/repo")],
             partial: None,
             seq,
@@ -2347,6 +2364,7 @@ fn zero_hit_search_shows_empty_list_without_toast() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![],
             partial: None,
             seq: 1,
@@ -2368,6 +2386,7 @@ fn zero_hit_search_shows_empty_list_without_toast() {
     let _ = dispatch(Action::FetchSessionList, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![],
             partial: None,
             seq: 2,
@@ -2552,6 +2571,7 @@ fn build_mode_list_response_preserves_deep_search_spinner() {
     assert!(app.session_picker_content_loading, "deep search in flight");
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("local-1", "/r")],
             partial: None,
             seq: app.session_picker_list_seq,
@@ -2605,6 +2625,7 @@ fn build_mode_rapid_plain_fetches_keep_last_write_wins() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("build-first", "/r")],
             partial: None,
             seq: 0,
@@ -2621,6 +2642,7 @@ fn build_mode_rapid_plain_fetches_keep_last_write_wins() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("build-second", "/r")],
             partial: None,
             seq: 0,

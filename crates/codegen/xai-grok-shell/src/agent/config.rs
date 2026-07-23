@@ -1,4 +1,7 @@
 use crate::agent::auth_method::ModelByok;
+use crate::agent::model_providers::{
+    ModelProviderConfig, auth_config_issues, model_provider_auth_name, parse_model_providers,
+};
 use crate::auth::{AuthManager, GrokComConfig, OidcAuthConfig};
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use crate::{config::StorageMode, sampling::ApiBackend, tools::config::ShellToolsetConfig};
@@ -731,6 +734,25 @@ pub struct RuntimeResolutionContext<'a> {
     /// CLI `--storage-mode` override. `None` = defer to env/remote/default.
     pub storage_mode: Option<&'a str>,
 }
+/// First-party credential env vars scrubbed from a BYOK auth-provider helper's
+/// environment so it can't inherit the keys Grok uses for its own first-party
+/// requests. Keep in sync with every first-party credential env read across the
+/// crate: `auth::manager` (`GROK_AUTH`/`GROK_AUTH_PATH`), `auth_method`
+/// (`XAI_API_KEY`/legacy), and the credential-bearing `env_string(...)` reads in
+/// `EndpointsConfig::default`. The `provider_helper_env_scrubs_first_party_credentials`
+/// test pins this against an independent audited literal, so any change here must
+/// be mirrored (and re-audited) there.
+pub(crate) const FIRST_PARTY_CREDENTIAL_ENV_VARS: &[&str] = &[
+    crate::agent::auth_method::XAI_API_KEY_ENV_VAR,
+    crate::agent::auth_method::LEGACY_XAI_API_KEY_ENV_VAR,
+    "GROK_AUTH",
+    "GROK_AUTH_PATH",
+    "GROK_DEPLOYMENT_KEY",
+    "GROK_EXTRA_AUTH_KEY",
+    "GROK_TRACE_UPLOAD_CREDENTIALS_FILE",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "GROK_INTERNAL_OTLP_HEADERS",
+];
 /// Read an env var as a trimmed string. Returns `None` if unset or empty/whitespace-only.
 pub(crate) fn env_string(name: &str) -> Option<String> {
     let value = std::env::var(name).ok()?;
@@ -1008,7 +1030,30 @@ impl PluginsConfig {
 /// Feedback submission configuration (`[feedback]` in config.toml).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct FeedbackConfig {}
+pub struct FeedbackConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<FeedbackUserConfig>,
+}
+/// Self-reported feedback author identity (never used for authorization).
+/// Merged only from trusted config tiers, so a cloned repo can't inject the
+/// `command` escape hatch.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeedbackUserConfig {
+    /// Sources tried in order for the name. `os_user` yields the OS user name;
+    /// any other entry is a literal (`$VAR` expanded at load).
+    pub name: Vec<String>,
+    /// Sources tried in order for the email. `git_email` yields the global git
+    /// email; any other entry is a literal (`$VAR` expanded at load) needing `@`.
+    pub email: Vec<String>,
+    /// Fallback domain for `<name>@<domain>` when no `email` source resolves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_domain: Option<String>,
+    /// Optional `sh -c` script printing `{"name","email"}` JSON; its fields win
+    /// over the lists above, with per-field fallback. Trusted config tiers only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompactionConfig {
@@ -1195,6 +1240,13 @@ pub struct WorktreePoolConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<usize>,
 }
+/// `[worktree]` section from config.toml (auto-GC policy lives under `auto_gc`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeConfigSection {
+    #[serde(default)]
+    pub auto_gc: crate::util::config::WorktreeAutoGcSettings,
+}
 /// `[sandbox]` section from config.toml.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -1362,11 +1414,16 @@ pub struct Config {
     /// `[goal]` section: canonical `/goal` configuration. See [`GoalConfig`].
     #[serde(default)]
     pub goal: GoalConfig,
+    #[serde(default)]
+    pub workflows: WorkflowsConfig,
     /// `[doom_loop_recovery]` section: the shared settings struct — ONE type
     /// serves this TOML table and the remote remote settings `doom_loop_recovery`
     /// object. See [`crate::util::config::DoomLoopRecoverySettings`].
     #[serde(default)]
     pub doom_loop_recovery: crate::util::config::DoomLoopRecoverySettings,
+    /// `[worktree]` section (currently `[worktree.auto_gc]` only).
+    #[serde(default)]
+    pub worktree: WorktreeConfigSection,
     /// `[auto_mode]` section: Auto permission-mode configuration. See [`AutoModeConfig`].
     #[serde(default)]
     pub auto_mode: AutoModeConfig,
@@ -1377,10 +1434,17 @@ pub struct Config {
     /// `[model.*]` overrides from config.toml. Resolve via `resolve_model_list()`.
     #[serde(skip)]
     pub config_models: IndexMap<String, ConfigModelOverride>,
-    /// Warnings from `[model.*]` parsing; surfaced by `open-grok inspect`.
+    /// Warnings from `[model.*]` and `[auth_provider.*]` parsing; surfaced by
+    /// `open-grok inspect`.
     #[serde(skip)]
-    pub model_override_warnings: Vec<super::config_model_override_parse::ModelOverrideWarning>,
+    pub config_warnings: Vec<super::config_model_override_parse::ConfigWarning>,
     pub grok_com_config: GrokComConfig,
+    /// `[auth_provider.<name>]` tables, populated by
+    /// [`parse_auth_providers`] from trusted config layers only.
+    #[serde(skip)]
+    pub auth_providers: IndexMap<String, crate::auth::AuthProviderConfig>,
+    #[serde(skip)]
+    pub model_providers: IndexMap<String, ModelProviderConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shortcuts: Option<toml::Value>,
     /// Written by the client via `config_toml_edit`; absorbed so it isn't
@@ -1803,12 +1867,16 @@ impl Default for Config {
         let mut cfg = Self {
             features: Features::default(),
             goal: GoalConfig::default(),
+            workflows: WorkflowsConfig::default(),
             doom_loop_recovery: crate::util::config::DoomLoopRecoverySettings::default(),
+            worktree: WorktreeConfigSection::default(),
             auto_mode: AutoModeConfig::default(),
             antigravity: AntigravityConfig::default(),
             config_models: IndexMap::new(),
-            model_override_warnings: Vec::new(),
+            config_warnings: Vec::new(),
             grok_com_config: GrokComConfig::default(),
+            auth_providers: IndexMap::new(),
+            model_providers: IndexMap::new(),
             shortcuts: None,
             hints: None,
             ui: UiConfig::default(),
@@ -1891,6 +1959,72 @@ impl Default for Config {
         cfg
     }
 }
+/// Parse `[auth_provider.<name>]` tables leniently: a malformed entry warns
+/// (surfaced by `grok inspect`) and is skipped, so it fails closed for the
+/// models referencing it instead of failing the whole config.
+fn parse_auth_providers(
+    raw_config: &toml::Value,
+) -> (
+    IndexMap<String, crate::auth::AuthProviderConfig>,
+    Vec<super::config_model_override_parse::ConfigWarning>,
+) {
+    use super::config_model_override_parse::{ConfigWarning, ConfigWarningKind};
+    let mut providers = IndexMap::new();
+    let mut warnings = Vec::new();
+    let Some(section) = raw_config.get("auth_provider") else {
+        return (providers, warnings);
+    };
+    let Some(table) = section.as_table() else {
+        warnings.push(ConfigWarning::auth_provider_section(
+            ConfigWarningKind::NotATable,
+            format!(
+                "`auth_provider` must be a table of [auth_provider.<name>] entries, got {}; \
+                 all auth providers ignored",
+                section.type_str()
+            ),
+        ));
+        return (providers, warnings);
+    };
+    for (name, value) in table {
+        let mut unknown = Vec::new();
+        match serde_ignored::deserialize::<_, _, crate::auth::AuthProviderConfig>(
+            value.clone(),
+            |path| unknown.push(path.to_string()),
+        ) {
+            Ok(provider) => {
+                for key in unknown {
+                    warnings.push(ConfigWarning::auth_provider(
+                        name,
+                        Some(key.as_str()),
+                        ConfigWarningKind::UnknownField,
+                        "unrecognized key; field ignored".to_owned(),
+                    ));
+                }
+                for (field, kind, reason) in auth_config_issues(&provider) {
+                    warnings.push(ConfigWarning::auth_provider(
+                        name,
+                        Some(field),
+                        kind,
+                        reason,
+                    ));
+                }
+                providers.insert(name.clone(), provider);
+            }
+            Err(error) => {
+                warnings.push(ConfigWarning::auth_provider(
+                    name,
+                    None,
+                    ConfigWarningKind::InvalidValue,
+                    format!(
+                        "failed to parse ({error}); provider skipped, referencing models \
+                         resolve with no credential"
+                    ),
+                ));
+            }
+        }
+    }
+    (providers, warnings)
+}
 impl Config {
     /// Reject invalid glob patterns in the model-filter lists at config load, so
     /// a typo fails loudly instead of silently changing availability.
@@ -1946,9 +2080,31 @@ impl Config {
         let raw_config = &Self::expand_auth_alias(raw_config);
         let super::config_model_override_parse::ParsedModelOverrides {
             models: config_models,
-            warnings: model_override_warnings,
+            warnings: config_warnings,
         } = super::config_model_override_parse::parse_model_overrides(raw_config);
-        super::config_model_override_parse::log_model_override_warnings(&model_override_warnings);
+        let (mut auth_providers, auth_provider_warnings) = parse_auth_providers(raw_config);
+        let (model_providers, mut model_provider_warnings) = parse_model_providers(raw_config);
+        for (id, provider) in &model_providers {
+            if let Some(auth) = &provider.auth {
+                let synthetic = model_provider_auth_name(id);
+                if auth_providers.contains_key(&synthetic) {
+                    model_provider_warnings
+                        .push(
+                            super::config_model_override_parse::ConfigWarning::model_provider(
+                                id,
+                                Some("auth"),
+                                super::config_model_override_parse::ConfigWarningKind::ConflictingFields,
+                                format!(
+                                    "inline auth overwrites a hand-written \
+                                 [auth_provider.\"{synthetic}\"]; the `model_provider:` prefix is \
+                                 a reserved namespace"
+                                ),
+                            ),
+                        );
+                }
+                auth_providers.insert(synthetic, auth.clone());
+            }
+        }
         let mut base = toml::Value::try_from(Self::default()).map_err(|e| e.to_string())?;
         if let toml::Value::Table(ref mut t) = base {
             t.remove("model");
@@ -1956,6 +2112,8 @@ impl Config {
         let mut raw_without_model_sections = raw_config.clone();
         if let toml::Value::Table(ref mut t) = raw_without_model_sections {
             t.remove("model");
+            t.remove("auth_provider");
+            t.remove("model_providers");
         }
         crate::config::deep_merge_toml(&mut base, &raw_without_model_sections);
         let (mut config, user_unused) =
@@ -1967,7 +2125,75 @@ impl Config {
             );
         }
         config.config_models = config_models;
-        config.model_override_warnings = model_override_warnings;
+        config.config_warnings = config_warnings;
+        config.auth_providers = auth_providers;
+        config.model_providers = model_providers;
+        config.config_warnings.extend(auth_provider_warnings);
+        config.config_warnings.extend(model_provider_warnings);
+        let declared_provider_names: std::collections::HashSet<&str> = raw_config
+            .get("auth_provider")
+            .and_then(toml::Value::as_table)
+            .map(|t| t.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let declared_model_provider_names: std::collections::HashSet<&str> = raw_config
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+            .map(|t| t.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        for (model_key, model) in &config.config_models {
+            if let Some(ref name) = model.auth_provider
+                && !config.auth_providers.contains_key(name)
+                && !declared_provider_names.contains(name.as_str())
+            {
+                config.config_warnings.push(
+                    super::config_model_override_parse::ConfigWarning::model(
+                        model_key,
+                        Some("auth_provider"),
+                        super::config_model_override_parse::ConfigWarningKind::InvalidValue,
+                        format!(
+                            "references [auth_provider.{name}], which is not defined; \
+                             the model resolves with no provider credential"
+                        ),
+                    ),
+                );
+            }
+            if let Some(ref id) = model.model_provider
+                && !config.model_providers.contains_key(id)
+                && !declared_model_provider_names.contains(id.as_str())
+            {
+                config.config_warnings.push(
+                    super::config_model_override_parse::ConfigWarning::model(
+                        model_key,
+                        Some("model_provider"),
+                        super::config_model_override_parse::ConfigWarningKind::InvalidValue,
+                        format!(
+                            "references [model_providers.{id}], which is not defined; \
+                             provider defaults are not applied — the model uses its own \
+                             credential if set, otherwise fails closed on a custom endpoint"
+                        ),
+                    ),
+                );
+            }
+        }
+        for (id, provider) in &config.model_providers {
+            if let Some(ref name) = provider.auth_provider
+                && !config.auth_providers.contains_key(name)
+                && !declared_provider_names.contains(name.as_str())
+            {
+                config.config_warnings.push(
+                    super::config_model_override_parse::ConfigWarning::model_provider(
+                        id,
+                        Some("auth_provider"),
+                        super::config_model_override_parse::ConfigWarningKind::InvalidValue,
+                        format!(
+                            "references [auth_provider.{name}], which is not defined; \
+                             inheriting models fail closed with no provider credential"
+                        ),
+                    ),
+                );
+            }
+        }
+        super::config_model_override_parse::log_config_warnings(&config.config_warnings);
         if config.grok_com_config.oidc.is_none() {
             config.grok_com_config.oidc = OidcAuthConfig::from_env();
         }
@@ -2306,6 +2532,18 @@ impl Config {
                 .map_or(Policy::DEFAULT_MAX_RETRIES, Policy::clamp_max_retries),
         })
     }
+    /// Automatic worktree GC policy. Precedence: env kill/dry-run >
+    /// `[worktree.auto_gc]` TOML > remote `worktree_auto_gc` > defaults.
+    /// Platform age-expiry (non-Linux dead-only) is enforced inside
+    /// `xai_fast_worktree::maybe_auto_gc`, not here.
+    pub fn resolve_worktree_auto_gc(&self) -> xai_fast_worktree::ResolvedWorktreeAutoGc {
+        crate::util::config::resolve_worktree_auto_gc_from_settings(
+            Some(&self.worktree.auto_gc),
+            self.remote_settings
+                .as_ref()
+                .and_then(|s| s.worktree_auto_gc.as_ref()),
+        )
+    }
     /// Gate first-run auto-registration of the official xAI marketplace source.
     /// Precedence: env `GROK_OFFICIAL_MARKETPLACE_AUTO_REGISTER` > remote settings >
     /// default off (so only remote settings-targeted teams get it pre-public). No
@@ -2418,13 +2656,30 @@ impl Config {
     /// reach cli-chat-proxy `/v1/settings` (custom `models_base_url`, external
     /// `auth_provider_command`, air-gapped proxies) never receive the
     /// remote settings `goal_enabled` flag, so the default must not carve them out.
-    /// Env, `[goal] enabled`, and the remote flag (`Some(false)` kill-switch)
-    /// all still override.
     pub(crate) fn resolve_goal(&self) -> Resolved<bool> {
         let ff = self.remote_settings.as_ref().and_then(|s| s.goal_enabled);
+        if ff == Some(false) {
+            return Resolved::new(false, ConfigSource::Remote);
+        }
         BoolFlag::env("GROK_GOAL")
             .config(self.goal.enabled)
             .feature_flag(ff)
+            .default(true)
+            .resolve()
+    }
+    pub(crate) fn resolve_workflows(&self) -> Resolved<bool> {
+        // Open Grok divergence: upstream stages its workflow rollout through
+        // the remote `workflows_enabled` flag served by cli-chat-proxy, and a
+        // remote `false` hard-disables workflows even over local opt-in
+        // (including `GROK_WORKFLOWS=1`). That flag tracks xAI's own client
+        // rollout and says nothing about this fork's feature set — in
+        // practice it shipped `false` here and silently stripped the
+        // workflow tool from every session. Open Grok ignores the remote
+        // flag entirely: workflows have been generally available since
+        // v0.1.220-open-grok.20 and stay on by default. Precedence:
+        // `GROK_WORKFLOWS` env > `[workflows] enabled` > on.
+        BoolFlag::env("GROK_WORKFLOWS")
+            .config(self.workflows.enabled)
             .default(true)
             .resolve()
     }
@@ -3500,13 +3755,50 @@ pub fn resolve_model_list_with_provider_catalogs(
                 );
             }
         }
-        let entry = model_override.apply(key, base, &cfg.endpoints);
+        let with_provider = model_override.model_provider.as_deref().map(|pid| {
+            match cfg.model_providers.get(pid) {
+                Some(provider) => model_override.with_provider_defaults(provider, pid),
+                None => model_override.with_missing_provider(),
+            }
+        });
+        let effective = with_provider.as_ref().unwrap_or(model_override);
+        let mut entry = effective.apply(key, base, &cfg.endpoints);
+        let session_bearer_unsafe = !crate::util::is_xai_api_bearer_url(&entry.info.base_url)
+            || entry
+                .api_base_url
+                .as_deref()
+                .is_some_and(|url| !crate::util::is_xai_api_bearer_url(url));
+        if let Some(pid) = model_override.model_provider.as_deref()
+            && entry.auth_provider.is_none()
+            && session_bearer_unsafe
+        {
+            entry.auth_provider = Some(crate::auth::AuthProviderRef::fail_closed(format!(
+                "model_provider:{pid} (fail-closed)"
+            )));
+        }
         tracing::debug!(
             model_key = % key, base_url = % entry.info.base_url, has_api_key = entry
-            .api_key.is_some(), env_key = ? entry.env_key, had_base,
+            .api_key.is_some(), env_key = ? entry.env_key, auth_provider = entry
+            .auth_provider.as_ref().map(| p | p.name.as_str()), model_provider =
+            model_override.model_provider.as_deref(), had_base,
             "config model override applied"
         );
         resolved.insert(key.clone(), entry);
+    }
+    for (key, entry) in resolved.iter_mut() {
+        if let Some(ref mut provider) = entry.auth_provider {
+            if provider.is_fail_closed() {
+                continue;
+            }
+            let config = cfg.auth_providers.get(&provider.name);
+            if config.is_none() {
+                tracing::debug!(
+                    model_key = % key, provider = % provider.name,
+                    "provider ref has no trusted config; failing closed with an empty command"
+                );
+            }
+            provider.attach_trusted_config(config);
+        }
     }
     {
         let default_cw = DEFAULT_CONTEXT_WINDOW;
@@ -4004,6 +4296,11 @@ pub struct ConfigModelOverride {
     pub api_key: Option<String>,
     /// Env var name(s) for the provider key — string or array in config.toml.
     pub env_key: Option<EnvKeys>,
+    /// Name of a `[auth_provider.<name>]` credential helper that mints
+    /// this model's bearer token. Static `api_key` / `env_key` win when both
+    /// are set.
+    pub auth_provider: Option<String>,
+    pub model_provider: Option<String>,
     pub api_base_url: Option<String>,
     pub max_completion_tokens: Option<u32>,
     pub temperature: Option<f32>,
@@ -4212,10 +4509,15 @@ impl ConfigModelOverride {
         if self.env_key.is_some() {
             entry.env_key.clone_from(&self.env_key);
         }
+        if let Some(ref name) = self.auth_provider {
+            entry.auth_provider = Some(crate::auth::AuthProviderRef::unresolved(name.clone()));
+        }
         if self.api_base_url.is_some() {
             entry.api_base_url.clone_from(&self.api_base_url);
         }
-        if self.supported_in_api.is_none() && (self.api_key.is_some() || self.env_key.is_some()) {
+        if self.supported_in_api.is_none()
+            && (self.api_key.is_some() || self.env_key.is_some() || self.auth_provider.is_some())
+        {
             entry.info.supported_in_api = true;
         }
         entry
@@ -4443,6 +4745,11 @@ pub struct ModelEntry {
     pub info: ModelInfo,
     pub api_key: Option<String>,
     pub env_key: Option<EnvKeys>,
+    /// Named credential helper (`[model.<id>] auth_provider = "<name>"`),
+    /// resolved against `[auth_provider.<name>]` by `resolve_model_list`.
+    /// Config-file models only: the built-in catalog never carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<crate::auth::AuthProviderRef>,
     /// When set, `base_url` is used for session auth, `api_base_url` for API-key auth.
     pub api_base_url: Option<String>,
 }
@@ -4455,6 +4762,7 @@ impl ModelEntry {
             info,
             api_key: None,
             env_key: None,
+            auth_provider: None,
             api_base_url: None,
         }
     }
@@ -4466,20 +4774,31 @@ impl ModelEntry {
             info: ModelInfo::from_config(entry),
             api_key: entry.api_key.clone(),
             env_key: entry.env_key.clone(),
+            auth_provider: None,
             api_base_url: entry.api_base_url.clone(),
         }
     }
-    /// The model's own (BYOK) credential: a non-empty `api_key`, else the first
-    /// set, non-empty `env_key` value. `None` means the model has no usable own
-    /// credential and resolution should fall through to the session / global key.
-    fn own_credential(&self) -> Option<String> {
+    /// Non-empty `api_key`, else first non-empty resolved `env_key`.
+    /// `None` → fall through to session / global key. Static only: never
+    /// consults auth-provider tokens.
+    pub(crate) fn own_credential(&self) -> Option<String> {
         first_own_credential(self.api_key.as_deref(), self.env_key.as_ref())
     }
-    /// `true` when the model has a non-empty `api_key` or an `env_key` that
-    /// resolves to a non-empty value.
-    /// Probes `std::env::var` at call time — result is not stable across env changes.
+    /// The provider governing this model's bearer: `None` when a static
+    /// `api_key`/`env_key` resolves. The turn paths consult this, so a
+    /// shadowed provider never runs.
+    pub(crate) fn effective_auth_provider(&self) -> Option<&crate::auth::AuthProviderRef> {
+        if self.own_credential().is_some() {
+            return None;
+        }
+        self.auth_provider.as_ref()
+    }
+    /// `true` when the model has a non-empty `api_key`, an `env_key` that
+    /// resolves to a non-empty value, or a named auth provider.
+    /// Probes `std::env::var` at call time: result is not stable across env
+    /// changes. Never executes a provider command.
     pub fn has_own_credentials(&self) -> bool {
-        self.own_credential().is_some()
+        self.own_credential().is_some() || self.auth_provider.is_some()
     }
 
     /// Whether this entry can resolve a credential owned by its selected
@@ -4681,6 +5000,12 @@ pub struct AntigravityConfig {
     pub skip_permissions: Option<bool>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkflowsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
 /// `[auto_mode]` section: server-side configuration for Auto permission mode.
 /// ONE struct serves both the local `[auto_mode]` TOML table and the remote
 /// remote settings `auto_mode` JSON object (coerced via `serde_json::from_value`), so
@@ -4934,15 +5259,25 @@ pub(crate) fn first_own_credential(
         .map(str::to_owned)
         .or_else(|| env_key.and_then(EnvKeys::resolve_value))
 }
-/// Resolve credentials for a model.
-/// Priority: model api_key/env_key > session token > XAI_API_KEY.
-///
-/// When `env_key` lists multiple names, the first set non-empty value is used.
+/// Priority: model api_key/env_key > cached auth-provider token > session
+/// token > XAI_API_KEY.
 pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
+            info.base_url.clone(),
+            xai_chat_state::AuthType::ApiKey,
+        )
+    } else if let Some(provider) = model.auth_provider.as_ref() {
+        // Upstream's named auth-provider credential: a cached token from
+        // `[auth_provider.<name>]`, consulted after the model's own static
+        // key and before session / global fallbacks. The provider-aware
+        // `match` below still governs session-token and XAI_API_KEY handling
+        // (with the fork's endpoint-trust checks).
+        debug_assert!(model.effective_auth_provider().is_some());
+        (
+            provider.cached_token(),
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
@@ -5142,28 +5477,47 @@ pub struct ModelAuthFacts {
     pub auth_scheme: AuthScheme,
     pub provider: ModelProvider,
 }
-/// Resolve `model_id` to its auth facts from one effective-config load.
-/// Load/parse failure → `byok = Unknown`; model absent from the catalog →
-/// `NotByok`. An empty `model_id` (no sampling config yet) → `Unknown`, not
-/// `NotByok`, so the gate isn't activated for an unidentified model.
-pub fn resolve_model_auth_facts(model_id: &str) -> ModelAuthFacts {
+/// Resolve `model_id` to its auth facts and auth-provider reference from one
+/// effective-config load; both ride the same memo (see
+/// `SessionActor::model_auth_memo`). Load/parse failure → `byok = Unknown`;
+/// model absent from the catalog → `NotByok`. An empty `model_id` (no sampling
+/// config yet) → `Unknown`, not `NotByok`, so the gate isn't activated for an
+/// unidentified model.
+pub fn resolve_model_auth_facts_and_provider(
+    model_id: &str,
+) -> (ModelAuthFacts, Option<crate::auth::AuthProviderRef>) {
     if model_id.is_empty() {
-        return ModelAuthFacts {
-            byok: ModelByok::Unknown,
-            auth_scheme: AuthScheme::default(),
-            provider: ModelProvider::default(),
-        };
+        return (
+            ModelAuthFacts {
+                byok: ModelByok::Unknown,
+                auth_scheme: AuthScheme::default(),
+                // Fork field: the inference provider, kept alongside upstream's
+                // named-auth-provider tuple element.
+                provider: ModelProvider::default(),
+            },
+            None,
+        );
     }
-    with_resolved_model(model_id, |lookup| ModelAuthFacts {
-        byok: byok_from_lookup(&lookup),
-        auth_scheme: match lookup {
-            ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
-            _ => AuthScheme::default(),
-        },
-        provider: match lookup {
-            ModelLookup::Loaded(Some(e)) => e.info().provider,
-            _ => ModelProvider::default(),
-        },
+    with_resolved_model(model_id, |lookup| {
+        let facts = ModelAuthFacts {
+            byok: byok_from_lookup(&lookup),
+            auth_scheme: match lookup {
+                ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
+                _ => AuthScheme::default(),
+            },
+            provider: match lookup {
+                ModelLookup::Loaded(Some(e)) => e.info().provider,
+                _ => ModelProvider::default(),
+            },
+        };
+        // Upstream: the named `[auth_provider.<name>]` reference for this model
+        // (distinct from the inference `provider` above), threaded out for the
+        // session actor's auth memo.
+        let provider = match lookup {
+            ModelLookup::Loaded(Some(e)) => e.effective_auth_provider().cloned(),
+            _ => None,
+        };
+        (facts, provider)
     })
 }
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
@@ -5250,6 +5604,13 @@ pub fn resolve_aux_model_sampling_config(
         if sampler.api_key.is_some() {
             return Some(sampler);
         }
+        if entry.effective_auth_provider().is_some() {
+            tracing::warn!(
+                model = % model_id,
+                "aux model uses an auth provider with no cached token; the caller falls back to its session default"
+            );
+            return None;
+        }
     }
     let xai_bearer = session_key
         .map(|s| s.to_owned())
@@ -5298,6 +5659,7 @@ pub fn resolve_aux_model_sampling_config(
             },
             api_key: Some(bearer),
             env_key: None,
+            auth_provider: None,
             api_base_url: None,
         };
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
@@ -5317,20 +5679,17 @@ pub fn resolve_aux_model_sampling_config(
     );
     None
 }
-/// Finalize image-describe model + sampler config for user attachments.
-/// Shared so the aux resolve happy path and the
-/// `None` fallback cannot diverge between those entry points.
-///
-/// On aux resolve `Some`, stamp compatible session-local fields onto the helper config.
-/// On `None`, fall back to the active session model and
-/// full config (not forcing `image_description_model` onto the agent endpoint, which 404s
-/// on BYOK / non-proxy routes for internal slugs like `grok-build`).
+/// Stamp session-local fields (client id, attribution, bearer resolver,
+/// retries) from the active session onto a routed aux `SamplerConfig` so a
+/// helper model keeps the session's auth/attribution. Shared by image-describe,
+/// summaries, and the auto-mode classifier so those paths cannot drift.
 ///
 /// Provider identity is a hard credential boundary. An auxiliary request may
 /// target a different provider or carry its own BYOK credential, so only copy
 /// an active session's resolver/attribution when both configs represent the
-/// same provider and the same credential. Shared by image-describe, summaries,
-/// and the auto-mode classifier so those paths cannot drift.
+/// same provider and the same credential; `client_identifier` yields
+/// xAI-specific request metadata and is dropped for providers that do not send
+/// x-grok headers (e.g. OpenAI Codex).
 pub fn stamp_session_local_sampler_fields(
     cfg: &mut SamplerConfig,
     active_session_config: &SamplerConfig,
@@ -5351,7 +5710,13 @@ pub fn stamp_session_local_sampler_fields(
         .flatten();
     if shares_session_credential {
         cfg.attribution_callback = active_session_config.attribution_callback.clone();
-        if cfg.bearer_resolver.is_none() {
+        // The session bearer resolver substitutes the live session JWT at
+        // request time. Only stamp it onto a first-party xAI bearer URL: a
+        // third-party endpoint (e.g. a corporate LiteLLM proxy) can share the
+        // provider enum and an unset api_key yet must never receive the
+        // session JWT. This layers upstream's host-based guard on top of the
+        // fork's provider/credential-identity gate.
+        if cfg.bearer_resolver.is_none() && crate::util::is_xai_api_bearer_url(&cfg.base_url) {
             cfg.bearer_resolver = active_session_config.bearer_resolver.clone();
         }
     }
@@ -5373,6 +5738,14 @@ pub fn should_use_active_for_implicit_aux_model(
     requested_model == default_model && resolved_aux.provider != active_session_config.provider
 }
 
+/// Finalize image-describe model + sampler config for user attachments.
+/// Shared so the aux resolve happy path and the `None` fallback cannot
+/// diverge between those entry points.
+///
+/// On aux resolve `Some`, stamp session-local fields onto the helper config.
+/// On `None`, fall back to the active session model and full config (not
+/// forcing `image_description_model` onto the agent endpoint, which 404s on
+/// BYOK / non-proxy routes for internal slugs like `grok-build`).
 pub fn finalize_image_describe_sampler_config(
     resolved_aux: Option<SamplerConfig>,
     requested_model: &str,
@@ -5684,6 +6057,7 @@ fn resolve_hidden_default_web_search_sampling_config(
         },
         api_key: None,
         env_key: None,
+        auth_provider: None,
         api_base_url: None,
     };
     let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
@@ -5707,6 +6081,13 @@ pub fn resolve_web_search_sampling_config(
 ) -> Option<SamplerConfig> {
     let resolved = if let Some(entry) = find_model_by_id(models, model_id).cloned() {
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
+        if credentials.api_key.is_none() && entry.effective_auth_provider().is_some() {
+            tracing::warn!(
+                web_search_model = % model_id,
+                "web search model uses an auth provider with no cached token; disabling web search"
+            );
+            return None;
+        }
         Some(sampling_config_for_model(
             &entry,
             credentials,
@@ -6321,12 +6702,17 @@ reasoning_effort = "low"
         let active = SamplerConfig {
             provider: ModelProvider::Xai,
             api_key: Some("shared-session-token".into()),
+            base_url: "https://api.x.ai/v1".into(),
             bearer_resolver: Some(resolver.clone()),
             ..Default::default()
         };
+        // A first-party xAI bearer URL: the session resolver is only stamped
+        // onto xAI-operated endpoints (upstream's host guard layered on top of
+        // the fork's provider/credential-identity gate).
         let mut aux = SamplerConfig {
             provider: ModelProvider::Xai,
             api_key: Some("shared-session-token".into()),
+            base_url: "https://api.x.ai/v1".into(),
             ..Default::default()
         };
 
@@ -6402,6 +6788,255 @@ reasoning_effort = "low"
         assert_eq!(resolved.model, "v9m-rl-learnability-tp8");
         assert_eq!(resolved.base_url, "https://vendor.example/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("vendor-key"));
+    }
+    /// Cold cache falls back to the session model, never the xAI proxy;
+    /// warm cache serves the provider token at the provider endpoint.
+    #[tokio::test]
+    async fn aux_model_with_auth_provider_never_reroutes() {
+        let endpoints = EndpointsConfig::default();
+        let provider = crate::auth::AuthProviderRef::new(
+            "aux-provider-test".into(),
+            crate::auth::AuthProviderConfig {
+                command: "printf aux-token".into(),
+                args: None,
+                token_ttl_secs: Some(3600),
+                timeout_secs: None,
+            },
+        );
+        let mut entry = test_model_entry("m", "https://litellm.example/v1", None, None, None);
+        entry.auth_provider = Some(provider.clone());
+        let mut catalog = IndexMap::new();
+        catalog.insert("proxied-aux".to_string(), entry);
+        assert!(
+            resolve_aux_model_sampling_config(
+                "proxied-aux",
+                &catalog,
+                &endpoints,
+                Some("session-jwt"),
+                false,
+                None,
+                None,
+            )
+            .is_none(),
+            "cold provider cache must not reroute the aux model through the xAI proxy"
+        );
+        let _ = provider.ensure_fresh_token(None).await;
+        let resolved = resolve_aux_model_sampling_config(
+            "proxied-aux",
+            &catalog,
+            &endpoints,
+            Some("session-jwt"),
+            false,
+            None,
+            None,
+        )
+        .expect("warm cache resolves");
+        assert_eq!(resolved.base_url, "https://litellm.example/v1");
+        assert_eq!(resolved.api_key.as_deref(), Some("aux-token"));
+    }
+    /// The session bearer resolver must never be stamped onto a third-party
+    /// sampler: the sampler substitutes the resolver's bearer at request
+    /// time.
+    #[test]
+    fn session_resolver_is_not_stamped_onto_third_party_samplers() {
+        #[derive(Debug)]
+        struct SessionResolver;
+        impl xai_grok_sampler::BearerResolver for SessionResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some("session-jwt".into())
+            }
+        }
+        let session_cfg = SamplerConfig {
+            bearer_resolver: Some(std::sync::Arc::new(SessionResolver)),
+            ..SamplerConfig::default()
+        };
+        let mut third_party = SamplerConfig {
+            base_url: "https://litellm.corp.example/v1".into(),
+            ..SamplerConfig::default()
+        };
+        stamp_session_local_sampler_fields(&mut third_party, &session_cfg, None, None);
+        assert!(
+            third_party.bearer_resolver.is_none(),
+            "a third-party endpoint must keep its resolved credential"
+        );
+        let mut first_party = SamplerConfig {
+            base_url: EndpointsConfig::default().resolve_inference_base_url(),
+            ..SamplerConfig::default()
+        };
+        stamp_session_local_sampler_fields(&mut first_party, &session_cfg, None, None);
+        assert!(
+            first_party.bearer_resolver.is_some(),
+            "first-party aux samplers keep the session refresh behavior"
+        );
+    }
+    /// A cold cache disables web search rather than sending an
+    /// unauthenticated request.
+    #[tokio::test]
+    async fn web_search_with_auth_provider_requires_warm_cache() {
+        let endpoints = EndpointsConfig::default();
+        let provider = crate::auth::AuthProviderRef::new(
+            "web-search-provider-test".into(),
+            crate::auth::AuthProviderConfig {
+                command: "printf ws-token".into(),
+                args: None,
+                token_ttl_secs: Some(3600),
+                timeout_secs: None,
+            },
+        );
+        let mut entry = test_model_entry("m", "https://litellm.example/v1", None, None, None);
+        entry.auth_provider = Some(provider.clone());
+        let mut catalog = IndexMap::new();
+        catalog.insert("proxied-search".to_string(), entry);
+        assert!(
+            resolve_web_search_sampling_config(
+                "proxied-search",
+                &catalog,
+                Some("session-jwt"),
+                false,
+                None,
+                None,
+                &endpoints,
+            )
+            .is_none(),
+            "a cold provider cache must disable web search, not send an unauthenticated request"
+        );
+        let _ = provider.ensure_fresh_token(None).await;
+        let resolved = resolve_web_search_sampling_config(
+            "proxied-search",
+            &catalog,
+            Some("session-jwt"),
+            false,
+            None,
+            None,
+            &endpoints,
+        )
+        .expect("warm cache resolves");
+        assert_eq!(resolved.api_key.as_deref(), Some("ws-token"));
+    }
+    /// The lenient parser warns per problem and never fails the whole
+    /// config.
+    #[test]
+    fn auth_provider_parse_warnings_are_lenient_and_specific() {
+        use super::super::config_model_override_parse::{ConfigWarningKind, WarningTarget};
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [auth_provider.good]
+            command = "printf ok"
+
+            [auth_provider.bad-type]
+            command = "printf x"
+            token_ttl_secs = "not-a-number"
+
+            [auth_provider.typo]
+            command = "printf y"
+            timeout_seconds = 5
+
+            [auth_provider.commandless]
+            token_ttl_secs = 60
+
+            [auth_provider.short-ttl]
+            command = "printf x"
+            token_ttl_secs = 60
+
+            [auth_provider.zero-timeout]
+            command = "printf x"
+            timeout_secs = 0
+
+            [auth_provider.slow]
+            command = "printf x"
+            timeout_secs = 601
+
+            [model.orphaned]
+            model = "m"
+            base_url = "https://x.example/v1"
+            context_window = 200000
+            auth_provider = "does-not-exist"
+            "#,
+        )
+        .unwrap();
+        let cfg =
+            Config::new_from_toml_cfg(&raw_config).expect("one bad table must not fail the config");
+        assert!(cfg.auth_providers.contains_key("good"));
+        assert!(
+            !cfg.auth_providers.contains_key("bad-type"),
+            "malformed entry is skipped (fails closed)"
+        );
+        let has_provider = |name: &str, field: Option<&str>, kind: ConfigWarningKind| {
+            cfg.config_warnings.iter().any(|w| {
+                w.kind == kind
+                    && matches!(
+                        & w.target, WarningTarget::AuthProvider { name : n, field : f
+                        }
+if n == name && f.as_deref() == field
+                    )
+            })
+        };
+        assert!(has_provider(
+            "bad-type",
+            None,
+            ConfigWarningKind::InvalidValue
+        ));
+        assert!(has_provider(
+            "typo",
+            Some("timeout_seconds"),
+            ConfigWarningKind::UnknownField
+        ));
+        assert!(has_provider(
+            "commandless",
+            Some("command"),
+            ConfigWarningKind::InvalidValue
+        ));
+        assert!(has_provider(
+            "short-ttl",
+            Some("token_ttl_secs"),
+            ConfigWarningKind::InvalidValue
+        ));
+        assert!(has_provider(
+            "zero-timeout",
+            Some("timeout_secs"),
+            ConfigWarningKind::InvalidValue
+        ));
+        assert!(has_provider(
+            "slow",
+            Some("timeout_secs"),
+            ConfigWarningKind::InvalidValue
+        ));
+        let provider_reason = |name: &str| {
+            cfg.config_warnings
+                .iter()
+                .find(|w| {
+                    matches!(
+                        & w.target, WarningTarget::AuthProvider { name : n, field : f }
+                        if n == name && f.as_deref() == Some("timeout_secs")
+                    )
+                })
+                .map(|w| w.reason.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(provider_reason("zero-timeout").contains("clamped to 1"));
+        assert!(provider_reason("slow").contains("clamped to 600"));
+        assert!(
+            cfg.config_warnings.iter().any(|w| {
+                w.kind == ConfigWarningKind::InvalidValue
+                    && matches!(& w.target, WarningTarget::Model
+            { field, .. } if field.as_deref() == Some("auth_provider"))
+            }),
+            "undefined reference warns at parse time: {:?}",
+            cfg.config_warnings
+        );
+        let raw_config: toml::Value = toml::from_str(r#"auth_provider = "oops""#).unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config)
+            .expect("a non-table auth_provider must not fail the config");
+        assert!(cfg.auth_providers.is_empty());
+        assert!(
+            cfg.config_warnings.iter().any(|w| {
+                matches!(w.target, WarningTarget::AuthProviderSection)
+                    && w.kind == ConfigWarningKind::NotATable
+            }),
+            "non-table section warns: {:?}",
+            cfg.config_warnings
+        );
     }
     #[test]
     fn web_search_disable_api_key_auth_swaps_first_party_key_for_session() {
@@ -6489,6 +7124,225 @@ reasoning_effort = "low"
         assert_eq!(explicit.base_url, "https://vendor.example/v1");
     }
 
+    #[test]
+    fn parses_auth_provider_tables_and_model_reference() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [auth_provider.litellm]
+            command = "/usr/local/bin/litellm-token"
+            args = ["--scope", "corp"]
+            token_ttl_secs = 3600
+            timeout_secs = 10
+
+            [model.proxied-claude]
+            model = "claude-sonnet-4-5"
+            base_url = "https://litellm.corp.example/v1"
+            context_window = 200000
+            auth_provider = "litellm"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        assert_eq!(
+            cfg.auth_providers.get("litellm"),
+            Some(&crate::auth::AuthProviderConfig {
+                command: "/usr/local/bin/litellm-token".into(),
+                args: Some(vec!["--scope".into(), "corp".into()]),
+                token_ttl_secs: Some(3600),
+                timeout_secs: Some(10),
+            })
+        );
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("proxied-claude").expect("model should exist");
+        let provider = model
+            .auth_provider
+            .as_ref()
+            .expect("model should reference the provider");
+        assert_eq!(provider.name, "litellm");
+        assert_eq!(provider.config.command, "/usr/local/bin/litellm-token");
+        assert_eq!(provider.config.token_ttl_secs, Some(3600));
+        assert!(
+            model.has_own_credentials(),
+            "provider-backed models classify as BYOK (session token must not leak)"
+        );
+        assert!(
+            model.info.supported_in_api,
+            "declaring an auth provider implies supported_in_api"
+        );
+    }
+    /// A static key shadows a fully defined provider through the real
+    /// `resolve_model_list` + `attach_trusted_config` pipeline (not a
+    /// hand-built ref): the static key wins even with the provider cache warm.
+    #[tokio::test]
+    async fn static_key_shadows_defined_provider_through_pipeline() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [auth_provider.understudy]
+            command = "printf provider-token"
+            token_ttl_secs = 3600
+
+            [model.dual-auth]
+            model = "m"
+            base_url = "https://switchboard.example/v1"
+            context_window = 200000
+            api_key = "sk-house-key"
+            auth_provider = "understudy"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("dual-auth").expect("model should exist");
+        assert_eq!(
+            model.effective_auth_provider().map(|p| p.name.as_str()),
+            None,
+            "a static key shadows the provider after real resolution"
+        );
+        let provider = model.auth_provider.as_ref().unwrap().clone();
+        let _ = provider.ensure_fresh_token(None).await;
+        let creds = resolve_credentials(model, Some("session-jwt"));
+        assert_eq!(creds.api_key.as_deref(), Some("sk-house-key"));
+        assert_eq!(creds.auth_type, xai_chat_state::AuthType::ApiKey);
+        assert_eq!(creds.base_url, "https://switchboard.example/v1");
+    }
+    #[test]
+    fn undefined_auth_provider_fails_closed() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.orphan]
+            model = "m"
+            base_url = "https://third-party.example/v1"
+            context_window = 200000
+            auth_provider = "nope"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("orphan").expect("model should exist");
+        let provider = model.auth_provider.as_ref().unwrap();
+        assert_eq!(provider.name, "nope");
+        assert!(
+            provider.config.command.is_empty(),
+            "undefined provider keeps an empty command"
+        );
+        assert!(model.has_own_credentials());
+        let creds = resolve_credentials(model, Some("session-jwt"));
+        assert_eq!(creds.api_key, None);
+    }
+    #[tokio::test]
+    async fn resolve_credentials_serves_cached_provider_token() {
+        use xai_chat_state::AuthType;
+        let mut model = test_model_entry("m", "https://litellm.example/v1", None, None, None);
+        let provider = crate::auth::AuthProviderRef::new(
+            "resolve-creds-test".into(),
+            crate::auth::AuthProviderConfig {
+                command: "printf provider-minted-token".into(),
+                args: None,
+                token_ttl_secs: Some(3600),
+                timeout_secs: None,
+            },
+        );
+        model.auth_provider = Some(provider.clone());
+        let creds = resolve_credentials(&model, Some("session-jwt"));
+        assert_eq!(creds.api_key, None, "cold cache must not run the command");
+        let _ = provider.ensure_fresh_token(None).await;
+        let creds = resolve_credentials(&model, Some("session-jwt"));
+        assert_eq!(creds.api_key.as_deref(), Some("provider-minted-token"));
+        assert_eq!(creds.auth_type, AuthType::ApiKey);
+        assert_eq!(creds.base_url, "https://litellm.example/v1");
+    }
+    /// A set `env_key` shadows even a warm provider cache at resolve time, so
+    /// the static credential wins on the wire and the provider never governs.
+    #[tokio::test]
+    async fn set_env_key_shadows_warm_provider_at_resolve_time() {
+        use xai_grok_test_support::EnvGuard;
+        let var = "GROK_TEST_ENVKEY_SHADOW";
+        let _guard = EnvGuard::set(var, "env-token");
+        let mut model = test_model_entry("m", "https://litellm.example/v1", None, Some(var), None);
+        let provider = crate::auth::AuthProviderRef::new(
+            "env-shadow-test".into(),
+            crate::auth::AuthProviderConfig {
+                command: "printf provider-token".into(),
+                args: None,
+                token_ttl_secs: Some(3600),
+                timeout_secs: None,
+            },
+        );
+        model.auth_provider = Some(provider.clone());
+        let _ = provider.ensure_fresh_token(None).await;
+        assert_eq!(
+            model.effective_auth_provider().map(|p| p.name.as_str()),
+            None,
+            "a resolvable env_key shadows the provider"
+        );
+        let creds = resolve_credentials(&model, Some("session-jwt"));
+        assert_eq!(
+            creds.api_key.as_deref(),
+            Some("env-token"),
+            "a set env_key must win over a warm provider cache"
+        );
+    }
+    /// A catalog deserialized from bytes cannot smuggle a runnable command.
+    #[test]
+    fn prefetched_entry_provider_config_comes_from_trusted_tables_only() {
+        let mut entry = test_model_entry("m", "https://cache.example/v1", None, None, None);
+        let smuggled: crate::auth::AuthProviderRef = serde_json::from_str(
+            r#"{"name": "cache-smuggle-test", "config": {"command": "evil"}}"#,
+        )
+        .unwrap();
+        entry.auth_provider = Some(smuggled);
+        let mut prefetched = IndexMap::new();
+        prefetched.insert("cached-model".to_string(), entry);
+        let cfg = Config::default();
+        let resolved = resolve_model_list(&cfg, Some(prefetched.clone()));
+        let provider = resolved["cached-model"].auth_provider.as_ref().unwrap();
+        assert_eq!(
+            resolve_credentials(&resolved["cached-model"], Some("session-jwt")).api_key,
+            None,
+            "an unusable provider fails closed"
+        );
+        assert_eq!(provider.config, crate::auth::AuthProviderConfig::default());
+        let mut cfg = Config::default();
+        cfg.auth_providers.insert(
+            "cache-smuggle-test".to_string(),
+            crate::auth::AuthProviderConfig {
+                command: "printf local".to_string(),
+                args: None,
+                token_ttl_secs: None,
+                timeout_secs: None,
+            },
+        );
+        let resolved = resolve_model_list(&cfg, Some(prefetched));
+        let provider = resolved["cached-model"].auth_provider.as_ref().unwrap();
+        assert_eq!(provider.config.command, "printf local");
+    }
+    #[test]
+    fn provider_model_fails_closed_on_prefetched_custom_base_url() {
+        let mut cfg = Config::default();
+        cfg.model_providers.insert(
+            "gw".to_string(),
+            crate::agent::model_providers::ModelProviderConfig::default(),
+        );
+        cfg.config_models.insert(
+            "m".to_string(),
+            ConfigModelOverride {
+                model_provider: Some("gw".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "m".to_string(),
+            test_model_entry("m", "https://evil.example/v1", None, None, None),
+        );
+        let resolved = resolve_model_list(&cfg, Some(prefetched));
+        assert_eq!(
+            resolve_credentials(&resolved["m"], Some("session-jwt")).api_key,
+            None,
+            "a prefetched custom base_url must fail closed, not leak the session token",
+        );
+    }
     fn test_model_entry(
         model: &str,
         base_url: &str,
@@ -6536,6 +7390,7 @@ reasoning_effort = "low"
             },
             api_key: api_key.map(|s| s.to_string()),
             env_key: env_key.map(EnvKeys::single),
+            auth_provider: None,
             api_base_url: api_base_url.map(|s| s.to_string()),
         }
     }
@@ -7096,7 +7951,10 @@ reasoning_effort = "low"
     }
     #[test]
     fn resolve_model_auth_facts_empty_model_id_is_unknown() {
-        assert_eq!(resolve_model_auth_facts("").byok, ModelByok::Unknown);
+        assert_eq!(
+            resolve_model_auth_facts_and_provider("").0.byok,
+            ModelByok::Unknown
+        );
     }
     #[test]
     fn user_override_adds_api_key_to_default_model() {
@@ -9440,6 +10298,47 @@ reasoning_effort = "low"
         assert_eq!(p.max_threshold, 12);
         assert_eq!(p.max_retries, 1);
     }
+    /// `[worktree.auto_gc]` deserializes through Config and resolve honors it.
+    #[test]
+    #[serial]
+    fn worktree_auto_gc_section_parses_from_toml() {
+        unsafe {
+            std::env::remove_var(xai_fast_worktree::ENV_AUTO_GC);
+            std::env::remove_var(xai_fast_worktree::ENV_AUTO_GC_DRY_RUN);
+            std::env::remove_var(xai_fast_worktree::ENV_AUTO_GC_MAX_AGE);
+        }
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [worktree.auto_gc]
+            enabled = true
+            max_age_secs = 7200
+            min_interval_secs = 120
+            dry_run = true
+            [worktree.auto_gc.max_age_by_kind]
+            subagent = 3600
+            manual = "never"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        assert_eq!(cfg.worktree.auto_gc.enabled, Some(true));
+        assert_eq!(cfg.worktree.auto_gc.max_age_secs, Some(7200));
+        let p = cfg.resolve_worktree_auto_gc();
+        assert!(p.enabled);
+        assert_eq!(p.max_age_secs, 7200);
+        assert_eq!(p.min_interval_secs, 120);
+        assert!(p.dry_run);
+        assert_eq!(
+            p.max_age_by_kind
+                .get(&xai_fast_worktree::WorktreeKind::Subagent),
+            Some(&Some(3600))
+        );
+        assert_eq!(
+            p.max_age_by_kind
+                .get(&xai_fast_worktree::WorktreeKind::Manual),
+            Some(&None)
+        );
+    }
     /// Out-of-range tunables clamp instead of being honored or dropped.
     #[test]
     #[serial]
@@ -9597,14 +10496,10 @@ reasoning_effort = "low"
     }
     #[test]
     #[serial]
-    fn resolve_goal_env_overrides_config() {
+    fn resolve_goal_env_overrides_config_without_remote_kill_switch() {
         unsafe { std::env::set_var("GROK_GOAL", "1") };
         let mut cfg = Config::default();
         cfg.goal.enabled = Some(false);
-        cfg.remote_settings = Some(crate::util::config::RemoteSettings {
-            goal_enabled: Some(false),
-            ..Default::default()
-        });
         let r = cfg.resolve_goal();
         assert_eq!(r.source, ConfigSource::Env);
         assert!(r.value);
@@ -9612,8 +10507,8 @@ reasoning_effort = "low"
     }
     #[test]
     #[serial]
-    fn resolve_goal_config_overrides_remote_settings() {
-        unsafe { std::env::remove_var("GROK_GOAL") };
+    fn resolve_goal_remote_false_kills_local_opt_in() {
+        unsafe { std::env::set_var("GROK_GOAL", "1") };
         let mut cfg = Config::default();
         cfg.goal.enabled = Some(true);
         cfg.remote_settings = Some(crate::util::config::RemoteSettings {
@@ -9621,8 +10516,9 @@ reasoning_effort = "low"
             ..Default::default()
         });
         let r = cfg.resolve_goal();
-        assert_eq!(r.source, ConfigSource::Config);
-        assert!(r.value);
+        assert_eq!(r.source, ConfigSource::Remote);
+        assert!(!r.value);
+        unsafe { std::env::remove_var("GROK_GOAL") };
     }
     #[test]
     #[serial]
@@ -9655,6 +10551,57 @@ reasoning_effort = "low"
         let r = cfg.resolve_goal();
         assert_eq!(r.source, ConfigSource::Remote);
         assert!(!r.value);
+    }
+    #[test]
+    #[serial]
+    fn background_workflows_default_on_without_affecting_goal() {
+        unsafe { std::env::remove_var("GROK_WORKFLOWS") };
+        let cfg = Config::default();
+        assert!(cfg.resolve_workflows().value);
+        assert!(cfg.resolve_goal().value);
+    }
+    /// Open Grok ignores xAI's remote `workflows_enabled` rollout flag: it
+    /// tracks upstream's own client rollout (and shipped `false` here,
+    /// silently stripping the workflow tool). Only local env/config gate the
+    /// feature.
+    #[test]
+    #[serial]
+    fn resolve_workflows_ignores_remote_flag() {
+        unsafe { std::env::remove_var("GROK_WORKFLOWS") };
+        let cfg = Config {
+            remote_settings: Some(crate::util::config::RemoteSettings {
+                workflows_enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = cfg.resolve_workflows();
+        assert_eq!(r.source, ConfigSource::Default);
+        assert!(r.value, "remote false must not disable workflows");
+    }
+    #[test]
+    #[serial]
+    fn resolve_workflows_local_opt_out_still_wins() {
+        unsafe { std::env::set_var("GROK_WORKFLOWS", "0") };
+        let mut cfg = Config::default();
+        cfg.remote_settings = Some(crate::util::config::RemoteSettings {
+            workflows_enabled: Some(true),
+            ..Default::default()
+        });
+        let r = cfg.resolve_workflows();
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(!r.value);
+        unsafe { std::env::remove_var("GROK_WORKFLOWS") };
+    }
+    #[test]
+    #[serial]
+    fn resolve_workflows_env_wins() {
+        unsafe { std::env::set_var("GROK_WORKFLOWS", "1") };
+        let cfg = Config::default();
+        let r = cfg.resolve_workflows();
+        assert_eq!(r.source, ConfigSource::Env);
+        assert!(r.value);
+        unsafe { std::env::remove_var("GROK_WORKFLOWS") };
     }
     #[test]
     #[serial]
@@ -10612,6 +11559,11 @@ agent_type = "cursor"
             enabled = true
             [harness]
             block_for_upload = true
+            [feedback.user]
+            name = ["os_user"]
+            email = ["git_email", "team@example.com"]
+            email_domain = "example.com"
+            command = "/opt/bin/grok-identity"
             [repo_changes_dedup]
             enabled = false
             [relay]
@@ -12018,6 +12970,7 @@ default = "grok-4.5"
             },
             api_key: None,
             env_key: None,
+            auth_provider: None,
             api_base_url: None,
         }
     }

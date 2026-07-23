@@ -1,66 +1,161 @@
-//! `workflow` — deterministic multi-subagent orchestration driven by a
-//! JavaScript script.
-//!
-//! The script runs in the code-mode V8 runtime (fresh isolate per run) with a
-//! prelude that provides `agent()`, `parallel()`, `pipeline()`, `phase()`,
-//! `log()`, `args`, `meta`, and `budget`. Every `agent()` call becomes a real
-//! foreground subagent spawned through the shared [`SubagentBackend`]; the
-//! script owns control flow (loops, fan-out, barriers) while the host owns
-//! concurrency capping, journaling, progress, and cancellation.
-//!
-//! Layering mirrors `agent_swarm`: the tool runs at depth 0, children run at
-//! depth 1 with `task`/`agent_swarm`/`workflow` stripped, so the tree stays
-//! flat. Children carry the parent prompt id, so turn-cancel sweeps them, and
-//! swarm cohort metadata (swarm id = run id) groups them in the TUI.
-
-pub mod host;
-pub mod meta;
-
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-
-use serde_json::Value as JsonValue;
-use tokio_util::sync::CancellationToken;
-use xai_grok_code_mode::InProcessCodeModeSession;
-use xai_grok_code_mode_protocol::{
-    CodeModeSession, CodeModeToolKind, ExecuteRequest, FunctionCallOutputContentItem,
-    RuntimeResponse, ToolDefinition as CodeModeToolDefinition, ToolName as CodeModeToolName,
-    WaitRequest,
-};
-use xai_tool_types::WorkflowToolInput;
-
-use crate::implementations::grok_build::task::MAX_SUBAGENT_DEPTH;
-use crate::implementations::grok_build::task::backend::SubagentBackendResource;
-use crate::implementations::grok_build::task::types::{
-    CurrentPromptIdResource, SessionIdResource, SubagentDepthCounter, TaskModelValidator,
-};
-use crate::types::output::ToolOutput;
 use crate::types::requirements::{Expr, ToolRequirement};
-use crate::types::resources::{NotificationHandle, SessionFolder};
 use crate::types::tool::{ToolKind, ToolNamespace};
-use host::{
-    ReplayPlan, ResumeBoundary, ResumeMode, WORKFLOW_AGENT_NESTED_TOOL, WorkflowHost,
-    WorkflowHostConfig,
-};
-use meta::SplitScript;
 
-/// JS prelude installed ahead of every workflow script body.
-const WORKFLOW_PRELUDE: &str = include_str!("prelude.js");
+use super::task::MAX_SUBAGENT_DEPTH;
+use super::task::types::SubagentDepthCounter;
 
-/// Marker the prelude prefixes onto the encoded script return value.
-const RETURN_MARKER: &str = "__WF_RETURN__";
+pub use xai_grok_tools_api::slash_commands::WORKFLOW_TOOL_NAME;
 
-/// Upper bound on workflow script size.
-const MAX_SCRIPT_BYTES: usize = 512 * 1024;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct WorkflowToolInput {
+    #[serde(default)]
+    #[schemars(
+        range(min = 1, max = 1024),
+        description = "Absolute cumulative cap on logical child-agent calls for this run. Every agent() and every parallel() item consumes one slot; schema retries do not. Defaults to 128 and may be set from 1 through 1,024. A panel that would exceed the remaining budget is rejected before any of its children launch."
+    )]
+    pub agent_budget: Option<u64>,
 
-/// Cadence of the completion-polling `wait` loop. Progress streams through
-/// notifications independently, so this only bounds cancellation latency of
-/// the observer (cancellation itself is select!-ed against the token).
-const WAIT_YIELD_MS: u64 = 30_000;
+    #[serde(default)]
+    #[schemars(
+        description = "Name of a registered workflow (built-in, or discovered from the project `.opengrok/workflows/` or user `~/.opengrok/workflows/`). Exactly one of `name`, `script`, or `script_path` must be set."
+    )]
+    pub name: Option<String>,
 
-/// Default per-agent wall-clock timeout (mirrors `agent_swarm`).
-const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+    #[serde(default)]
+    #[schemars(
+        description = "Inline Rhai workflow script. It must start with a pure-literal `let meta = #{ name: ..., description: ... };` map. Before authoring, read the `create-workflow` skill's SKILL.md. Run the path-specific `validate_only` smoke check with representative args."
+    )]
+    pub script: Option<String>,
+
+    #[serde(default)]
+    #[schemars(description = "Path to a .rhai workflow script on disk.")]
+    pub script_path: Option<String>,
+
+    #[serde(default)]
+    #[schemars(
+        description = "JSON value bound to the script's `args` global. Use an object for named arguments."
+    )]
+    pub args: Option<serde_json::Value>,
+
+    #[serde(default)]
+    #[schemars(
+        description = "Resume a same-process paused run, continuing its original immutable script and args; do not also pass name, script, script_path, or args. A budget-limited run resumes only when agent_budget is passed with a higher cap. Process-restart interruptions are terminal."
+    )]
+    pub resume_from_run_id: Option<String>,
+
+    #[serde(default)]
+    #[schemars(
+        description = "Run a path-specific smoke check without launching: validate metadata, compile the full script, and execute the single path selected by the supplied args and canned host results. It does not exercise every branch or prove live tools and agent outputs work."
+    )]
+    pub validate_only: bool,
+}
+
+impl WorkflowToolInput {
+    pub const MAX_AGENT_BUDGET: u64 = 1_024;
+
+    pub fn normalize(&mut self) {
+        self.name = blank_to_none(self.name.take());
+        self.script = blank_to_none(self.script.take());
+        self.script_path = blank_to_none(self.script_path.take());
+        self.resume_from_run_id = blank_to_none(self.resume_from_run_id.take());
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(budget) = self.agent_budget {
+            if budget == 0 {
+                return Err("`agent_budget` must be a positive integer".into());
+            }
+            if budget > Self::MAX_AGENT_BUDGET {
+                return Err(format!(
+                    "`agent_budget` must be at most {} agents",
+                    Self::MAX_AGENT_BUDGET
+                ));
+            }
+        }
+        let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let sources = [
+            present(&self.name),
+            present(&self.script),
+            present(&self.script_path),
+        ]
+        .iter()
+        .filter(|v| **v)
+        .count();
+        if present(&self.resume_from_run_id) {
+            return match sources {
+                0 => Ok(()),
+                _ => Err(
+                    "`resume_from_run_id` continues a same-process paused run's original immutable script and args; do not combine it with `name`, `script`, or `script_path`"
+                        .into(),
+                ),
+            };
+        }
+        match sources {
+            0 => Err("provide one of `name`, `script`, or `script_path`".into()),
+            1 => Ok(()),
+            _ => Err("`name`, `script`, and `script_path` are mutually exclusive".into()),
+        }
+    }
+}
+
+fn blank_to_none(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.trim().is_empty())
+}
+
+#[derive(Debug)]
+pub struct WorkflowLaunchRequest {
+    pub input: WorkflowToolInput,
+}
+
+#[derive(Debug)]
+pub enum WorkflowLaunchAck {
+    Started {
+        run_id: String,
+        task_id: String,
+        name: String,
+        script_path: Option<String>,
+    },
+    Validated {
+        name: String,
+        phases: usize,
+        summary: String,
+    },
+    Rejected {
+        code: &'static str,
+        detail: String,
+    },
+}
+
+pub type WorkflowLaunchEnvelope = (
+    WorkflowLaunchRequest,
+    tokio::sync::oneshot::Sender<WorkflowLaunchAck>,
+);
+
+pub struct WorkflowLaunchHandle(pub tokio::sync::mpsc::UnboundedSender<WorkflowLaunchEnvelope>);
+
+impl std::fmt::Debug for WorkflowLaunchHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowLaunchHandle").finish()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct WorkflowToolOutput {
+    pub run_id: String,
+    #[schemars(
+        description = "Alias of run_id; workflow runs are not background tasks — do not pass to task_output/wait_tasks. Completion notifies automatically."
+    )]
+    pub task_id: String,
+    #[schemars(
+        description = "The session-unique display handle for this run, such as review-changes or review-changes-2. Use it in user-facing status and /workflow management; keep run_id internal."
+    )]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_path: Option<String>,
+    pub message: String,
+}
+
+impl xai_tool_runtime::ToolOutput for WorkflowToolOutput {}
 
 #[derive(Debug, Default)]
 pub struct WorkflowTool;
@@ -75,58 +170,15 @@ impl crate::types::tool_metadata::ToolMetadata for WorkflowTool {
     }
 
     fn description_template(&self) -> &str {
-        concat!(
-            "Execute a JavaScript workflow script that orchestrates many subagents ",
-            "deterministically. Use workflow when control flow across agents should be code ",
-            "(loops, fan-out, barriers, verification passes) rather than model-driven tool ",
-            "calls: parallel review with adversarial verification, migrate-every-file ",
-            "pipelines, loop-until-dry discovery, judged multi-attempt design.\n\n",
-            "Every script must begin with `export const meta = { name, description, phases? }` ",
-            "as a pure literal (phases: [{ title, detail? }]). The body runs top-level in an ",
-            "async context — use await directly, and `return` a JSON-serializable value as the ",
-            "workflow result.\n\n",
-            "Script hooks:\n",
-            "- agent(prompt, opts?) -> Promise: spawn a subagent and await its final text. ",
-            "opts: {label, phase, schema, model, effort, isolation: 'worktree', agentType}. ",
-            "With schema (a JSON Schema), the agent must reply with matching JSON and the call ",
-            "resolves to the parsed value (one corrective retry is applied). Returns null when ",
-            "the agent fails or is cancelled — filter with .filter(Boolean). Throws on invalid ",
-            "options or an exhausted token budget.\n",
-            "- parallel(thunks) -> Promise<any[]>: run tasks concurrently and await all; a ",
-            "thunk that throws resolves to null.\n",
-            "- pipeline(items, ...stages) -> Promise<any[]>: run each item through all stages ",
-            "independently with NO barrier between stages; each stage receives (prev, ",
-            "originalItem, index); a stage that throws drops that item to null. Prefer ",
-            "pipeline over sequential parallel calls.\n",
-            "- phase(title): group subsequent agents under a progress phase. log(message): ",
-            "emit a progress line.\n",
-            "- args: the tool input `args` value, verbatim. meta: the parsed meta object. ",
-            "budget: {total, spent(), remaining()} tracking child token usage against ",
-            "token_budget.\n\n",
-            "Scripts are plain JavaScript (no TypeScript, no imports). Date.now(), ",
-            "Math.random(), and argless new Date() throw — pass timestamps via args and vary ",
-            "prompts by item index; runs are journaled and resumable via resume_from_run_id ",
-            "(unchanged agent() calls replay instantly from the journal; prefer script_path ",
-            "over regenerating the script so prompts stay identical). To resume an EDITED ",
-            "script, set resume_mode=\"positional\" (replay by call position). To go back to a ",
-            "specific point, set resume_through to a phase title, agent label, or call index — ",
-            "results through that point replay, everything after re-runs. Concurrent agents ",
-            "are capped and queue transparently; at most 1000 agents per run. agentType ",
-            "accepts the same types as the task tool. Workflows run in the background by ",
-            "default: the call returns a run id immediately, progress is pollable via the ",
-            "task output tool, the run is interruptible via the kill tool, and completion ",
-            "wakes the session with the result (set run_in_background: false to block for ",
-            "the result inline). workflow must be the only tool call in the model response, ",
-            "and workflow agents cannot spawn further task, agent_swarm, or workflow calls."
-        )
-    }
+        r##"Launch a workflow: a Rhai script that orchestrates subagents as one background run. Provide exactly one source: `name` (a registered workflow — built-in, or from the project `.opengrok/workflows/` or user `~/.opengrok/workflows/`), an inline `script`, or a `script_path`. Optionally pass `args` (bound to the script's `args`) and `agent_budget`, an absolute cap on cumulative child-agent calls: every agent() and parallel() item consumes one slot (schema retries do not); default 128. The call returns immediately; progress appears in `/workflows` and completion is reported automatically — do not poll or sleep-wait.
 
-    fn emitted_notifications(&self) -> &'static [&'static str] {
-        &["WorkflowProgress"]
+Prefer a registered workflow when one fits; author a script for bounded fan-out over a known work list, staged research and verification, or several independent perspectives, and confirm unusually large fan-out first. Before writing or editing a script, read the `create-workflow` skill's SKILL.md. `validate_only: true` runs a path-specific smoke check (metadata, compile, one canned-host path) — not proof that every branch or live tool works.
+
+A started run gets a session-unique display name (e.g. `review-changes`, `review-changes-2`) — the handle to show the user and use with `/workflow pause|resume|stop <name>`; keep run IDs internal. Each launch persists an editable `script_path`; edit it and launch as a new run to iterate. Use `resume_from_run_id` only for a same-process paused run (process restarts are terminal); a budget-limited run resumes only with a higher `agent_budget`. Save reusable scripts to `.opengrok/workflows/<name>.rhai`."##
     }
 
     fn requires_expr(&self) -> Expr<ToolRequirement> {
-        Expr::Value(ToolRequirement::tool_kind(ToolKind::Task))
+        Expr::True
     }
 
     fn is_read_only(&self) -> bool {
@@ -136,18 +188,18 @@ impl crate::types::tool_metadata::ToolMetadata for WorkflowTool {
 
 impl xai_tool_runtime::Tool for WorkflowTool {
     type Args = WorkflowToolInput;
-    type Output = ToolOutput;
+    type Output = WorkflowToolOutput;
 
     fn id(&self) -> xai_tool_protocol::ToolId {
-        xai_tool_protocol::ToolId::new("workflow").expect("valid tool id")
+        xai_tool_protocol::ToolId::new(WORKFLOW_TOOL_NAME).expect("valid tool id")
     }
 
     fn description(
         &self,
-        _ctx: &xai_tool_runtime::ListToolsContext,
+        _ctx: &::xai_tool_runtime::ListToolsContext,
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
-            "workflow",
+            WORKFLOW_TOOL_NAME,
             crate::types::tool_metadata::ToolMetadata::description_template(self),
         )
     }
@@ -160,702 +212,203 @@ impl xai_tool_runtime::Tool for WorkflowTool {
         }
     }
 
+    #[tracing::instrument(name = "new_tool.workflow", skip_all)]
     async fn run(
         &self,
         ctx: xai_tool_runtime::ToolCallContext,
-        input: WorkflowToolInput,
-    ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
-        let resources = crate::types::tool_metadata::shared_resources(&ctx)?;
-        let cwd = crate::types::tool_metadata::resolve_cwd(&ctx, &resources).await?;
-        let (
-            depth,
-            backend,
-            model_validator,
-            parent_session_id,
-            parent_prompt_id,
-            session_folder,
-            notifications,
-            terminal,
-            owner_session_id,
-        ) = {
+        mut input: WorkflowToolInput,
+    ) -> Result<WorkflowToolOutput, xai_tool_runtime::ToolError> {
+        use crate::types::tool_metadata::shared_resources;
+        let resources = shared_resources(&ctx)?;
+
+        input.normalize();
+
+        if let Err(detail) = input.validate() {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "workflow_invalid_input",
+                detail,
+            ));
+        }
+
+        let (depth, sender) = {
             let res = resources.lock().await;
-            (
-                res.get::<SubagentDepthCounter>().map(|d| d.0).unwrap_or(0),
-                res.get::<SubagentBackendResource>()
-                    .ok_or_else(|| {
-                        xai_tool_runtime::ToolError::custom(
-                            "missing_resource",
-                            "SubagentBackendResource (subagent support not initialized)",
-                        )
-                    })?
-                    .clone(),
-                res.get::<TaskModelValidator>().cloned(),
-                res.get::<SessionIdResource>()
-                    .map(|s| s.0.clone())
-                    .unwrap_or_default(),
-                res.get::<CurrentPromptIdResource>()
-                    .map(|p| p.0.clone())
-                    .filter(|id| !id.is_empty()),
-                res.get::<SessionFolder>().map(|f| f.0.clone()),
-                res.get::<NotificationHandle>()
-                    .map(|handle| handle.0.clone())
-                    .unwrap_or_default(),
-                res.get::<crate::types::resources::Terminal>()
-                    .map(|terminal| terminal.0.clone()),
-                res.get::<crate::types::resources::OwnerSessionId>()
-                    .map(|owner| owner.0.clone()),
-            )
+            let depth = res.get::<SubagentDepthCounter>().map(|d| d.0).unwrap_or(0);
+            let sender = res.get::<WorkflowLaunchHandle>().map(|h| h.0.clone());
+            (depth, sender)
         };
+
         if depth >= MAX_SUBAGENT_DEPTH {
-            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Subagent depth limit exceeded (current depth: {depth}, max: \
-                 {MAX_SUBAGENT_DEPTH}). workflow cannot run inside a subagent."
-            )));
-        }
-
-        let source = load_script(&input, &cwd)?;
-        let SplitScript { meta, body } =
-            meta::split_script(&source).map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
-
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let run_dir = session_folder
-            .as_deref()
-            .map(|folder| folder.join("workflows").join(&run_id));
-        let script_path = persist_script(run_dir.as_deref(), &source);
-        let journal_path = run_dir.as_deref().map(|dir| dir.join("journal.jsonl"));
-
-        let resume_mode = parse_resume_mode(input.resume_mode.as_deref())
-            .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
-        let resume_boundary = parse_resume_boundary(input.resume_through.as_ref())
-            .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
-        if input.resume_from_run_id.is_none()
-            && (resume_mode != ResumeMode::Exact || resume_boundary.is_some())
-        {
-            return Err(xai_tool_runtime::ToolError::invalid_arguments(
-                "resume_mode / resume_through require resume_from_run_id",
+            return Err(xai_tool_runtime::ToolError::custom(
+                "workflow_depth_exceeded",
+                "Workflows can only be launched from a top-level session (subagents and \
+                 workflow-spawned agents cannot start workflows)",
             ));
         }
-        let replay = match input.resume_from_run_id.as_deref() {
-            Some(resume_id) => {
-                let entries = load_resume_journal(session_folder.as_deref(), resume_id)?;
-                ReplayPlan::build(entries, resume_mode, resume_boundary)
-                    .map_err(xai_tool_runtime::ToolError::invalid_arguments)?
-            }
-            None => ReplayPlan::default(),
-        };
 
-        let progress_path = input
-            .run_in_background
-            .then(|| run_dir.as_deref().map(|dir| dir.join("progress.log")))
-            .flatten();
-
-        let host = WorkflowHost::new(WorkflowHostConfig {
-            backend: backend.0.clone(),
-            model_validator,
-            parent_session_id,
-            parent_prompt_id,
-            run_id: run_id.clone(),
-            workflow_name: meta.name.clone(),
-            tool_call_id: ctx.call_id.to_string(),
-            notifications: notifications.clone(),
-            concurrency: workflow_concurrency_from_env()
-                .map_err(xai_tool_runtime::ToolError::invalid_arguments)?,
-            per_agent_timeout: agent_timeout_from_env()
-                .map_err(xai_tool_runtime::ToolError::invalid_arguments)?,
-            token_budget: input.token_budget,
-            journal_path,
-            progress_path: progress_path.clone(),
-            replay,
-        });
-
-        let module = assemble_module(&meta.value, input.args.as_ref(), input.token_budget, &body);
-
-        if input.run_in_background {
-            let launch = BackgroundLaunch {
-                terminal,
-                notifications,
-                owner_session_id,
-                cwd,
-                progress_path,
-                tool_call_id: ctx.call_id.to_string(),
-            };
-            let renderer = {
-                let res = resources.lock().await;
-                res.get::<crate::types::template_renderer::TemplateRenderer>()
-                    .cloned()
-            };
-            return launch_background(launch, renderer, meta, run_id, script_path, host, module)
-                .await;
-        }
-
-        let cancellation = ctx
-            .extensions
-            .get::<xai_tool_runtime::Cancellation>()
-            .map(|c| c.0.clone())
-            .unwrap_or_default();
-        let outcome =
-            drive_script(host.clone(), ctx.call_id.to_string(), module, &cancellation).await?;
-
-        Ok(ToolOutput::Text(
-            render_output(
-                &meta,
-                &run_id,
-                script_path.as_deref(),
-                host.as_ref(),
-                &outcome,
+        let sender = sender.ok_or_else(|| {
+            xai_tool_runtime::ToolError::custom(
+                "workflow_not_available",
+                "Workflow launching is not available in this session (WorkflowLaunchHandle not \
+                 registered)",
             )
-            .into(),
-        ))
-    }
-}
+        })?;
 
-/// Session surfaces a background launch needs beyond the host itself.
-struct BackgroundLaunch {
-    terminal: Option<Arc<dyn crate::computer::types::TerminalBackend>>,
-    notifications: crate::notification::handle::ToolNotificationHandle,
-    owner_session_id: Option<String>,
-    cwd: PathBuf,
-    progress_path: Option<PathBuf>,
-    tool_call_id: String,
-}
-
-/// Launch the run as a virtual background task: register with the terminal
-/// backend (poll/kill/wait parity with process tasks), announce it to the
-/// tasks pane, detach the driver, and return the started notice. Completion
-/// finalizes the virtual task and fires the standard task-completed
-/// auto-wake.
-async fn launch_background(
-    launch: BackgroundLaunch,
-    renderer: Option<crate::types::template_renderer::TemplateRenderer>,
-    meta: meta::WorkflowMeta,
-    run_id: String,
-    script_path: Option<PathBuf>,
-    host: Arc<WorkflowHost>,
-    module: String,
-) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
-    let Some(terminal) = launch.terminal else {
-        return Err(xai_tool_runtime::ToolError::custom(
-            "missing_resource",
-            "background workflow execution needs the terminal backend; retry with \
-             run_in_background: false",
-        ));
-    };
-    let Some(progress_path) = launch.progress_path else {
-        return Err(xai_tool_runtime::ToolError::custom(
-            "missing_resource",
-            "background workflow execution needs session persistence for its progress log; \
-             retry with run_in_background: false",
-        ));
-    };
-
-    let command = format!("workflow {}", meta.name);
-    let snapshot = crate::computer::types::TaskSnapshot {
-        task_id: run_id.clone(),
-        command: command.clone(),
-        display_command: Some(format!("workflow: {}", meta.name)),
-        cwd: launch.cwd.display().to_string(),
-        start_time: std::time::SystemTime::now(),
-        end_time: None,
-        output: String::new(),
-        output_file: progress_path.clone(),
-        truncated: false,
-        exit_code: None,
-        signal: None,
-        completed: false,
-        kind: crate::computer::types::TaskKind::Bash,
-        block_waited: false,
-        explicitly_killed: false,
-        owner_session_id: launch.owner_session_id,
-    };
-    let Some(handle) = terminal.register_virtual_task(snapshot).await else {
-        return Err(xai_tool_runtime::ToolError::custom(
-            "unsupported",
-            "this terminal backend does not support background workflow runs; retry with \
-             run_in_background: false",
-        ));
-    };
-
-    launch
-        .notifications
-        .send_backgrounded(crate::notification::types::BashExecutionBackgrounded {
-            base: crate::notification::types::BashNotificationBase {
-                tool_call_id: launch.tool_call_id.clone(),
-                command: command.clone(),
-                output: Vec::new(),
-                total_bytes: 0,
-                truncated: false,
-                cwd: launch.cwd.clone(),
-            },
-            output_file: progress_path.clone(),
-            task_id: run_id.clone(),
-            monitor_description: None,
-            description: Some(format!("workflow: {}", meta.name)),
-        });
-
-    let render_tool = |template: &str, fallback: &str| {
-        renderer
-            .as_ref()
-            .and_then(|renderer| renderer.render(template).ok())
-            .unwrap_or_else(|| fallback.to_string())
-    };
-    let get_output_tool = render_tool(
-        "${{ tools.by_kind.background_task_action }}",
-        "get_command_or_subagent_output",
-    );
-    let kill_tool = render_tool(
-        "${{ tools.by_kind.kill_task_action }}",
-        "kill_command_or_subagent",
-    );
-
-    let detached_meta = meta.clone();
-    let detached_run_id = run_id.clone();
-    let detached_script_path = script_path.clone();
-    let notifications = launch.notifications.clone();
-    let tool_call_id = launch.tool_call_id.clone();
-    tokio::spawn(async move {
-        let outcome = drive_script(host.clone(), tool_call_id, module, &handle.cancellation)
-            .await
-            .unwrap_or_else(|error| ScriptOutcome {
-                return_value: None,
-                error_text: Some(error.to_string()),
-            });
-        let rendered = render_output(
-            &detached_meta,
-            &detached_run_id,
-            detached_script_path.as_deref(),
-            host.as_ref(),
-            &outcome,
-        );
-        let exit_code = Some(i32::from(outcome.error_text.is_some()));
-        if let Some(final_snapshot) = terminal
-            .complete_virtual_task(&detached_run_id, rendered, exit_code)
-            .await
-        {
-            // The bridge suppresses the wake for explicitly killed or
-            // block-waited runs; otherwise the session wakes with the result.
-            notifications.send_task_complete(final_snapshot);
-        }
-    });
-
-    let script_line = script_path
-        .as_deref()
-        .map(|path| format!("<script_path>{}</script_path>\n", path.display()))
-        .unwrap_or_default();
-    Ok(ToolOutput::Text(
-        format!(
-            "<workflow_started>\n<name>{}</name>\n<run_id>{run_id}</run_id>\n{script_line}\
-             <output_file>{}</output_file>\n<status>running in background</status>\n\
-             The conversation stays free while agents run; completion wakes this session with \
-             the result. Use {get_output_tool} with task_ids=[\"{run_id}\"] (optionally \
-             timeout_ms to block) for progress, or {kill_tool} with task_id=\"{run_id}\" to \
-             interrupt. After interrupting or editing the script, resume with \
-             workflow(script_path=..., resume_from_run_id=\"{run_id}\") — add \
-             resume_mode=\"positional\" and resume_through=<phase|label|index> to go back to a \
-             specific point; completed agents replay from the journal.\n</workflow_started>",
-            meta.name,
-            progress_path.display(),
-        )
-        .into(),
-    ))
-}
-
-/// Terminal state of one script execution.
-struct ScriptOutcome {
-    /// JSON-encoded script return value (absent when the script errored or
-    /// returned nothing recoverable).
-    return_value: Option<JsonValue>,
-    /// JS error text (message + stack) when the script threw.
-    error_text: Option<String>,
-}
-
-async fn drive_script(
-    host: Arc<WorkflowHost>,
-    tool_call_id: String,
-    module: String,
-    cancellation: &CancellationToken,
-) -> Result<ScriptOutcome, xai_tool_runtime::ToolError> {
-    let session: Arc<dyn CodeModeSession> = Arc::new(InProcessCodeModeSession::with_delegate(host));
-    let mut shutdown_guard = SessionShutdownGuard {
-        session: Some(session.clone()),
-    };
-
-    let request = ExecuteRequest {
-        tool_call_id,
-        enabled_tools: vec![CodeModeToolDefinition {
-            name: WORKFLOW_AGENT_NESTED_TOOL.to_string(),
-            tool_name: CodeModeToolName::plain(WORKFLOW_AGENT_NESTED_TOOL),
-            description: "workflow host agent spawn (internal)".to_string(),
-            kind: CodeModeToolKind::Function,
-            input_schema: None,
-            output_schema: None,
-        }],
-        source: module,
-        yield_time_ms: Some(WAIT_YIELD_MS),
-        max_output_tokens: None,
-    };
-
-    let execute_error = |error: String| {
-        xai_tool_runtime::ToolError::custom(
-            "workflow_runtime",
-            format!("workflow runtime: {error}"),
-        )
-    };
-
-    let started = session.execute(request).await.map_err(execute_error)?;
-    let cell_id = started.cell_id.clone();
-
-    let mut content_items: Vec<FunctionCallOutputContentItem> = Vec::new();
-    let mut response = tokio::select! {
-        response = started.initial_response() => response.map_err(execute_error)?,
-        _ = cancellation.cancelled() => {
-            let _ = session.terminate(cell_id).await;
-            return finish_cancelled(&mut shutdown_guard, session).await;
-        }
-    };
-    let (final_items, error_text) = loop {
-        match response {
-            RuntimeResponse::Result {
-                content_items: items,
-                error_text,
-                ..
-            } => break (items, error_text),
-            RuntimeResponse::Terminated {
-                content_items: items,
-                ..
-            } => {
-                content_items.extend(items);
-                break (Vec::new(), Some("workflow cell was terminated".to_string()));
-            }
-            RuntimeResponse::Yielded {
-                cell_id,
-                content_items: items,
-            } => {
-                content_items.extend(items);
-                response = tokio::select! {
-                    outcome = session.wait(WaitRequest {
-                        cell_id: cell_id.clone(),
-                        yield_time_ms: WAIT_YIELD_MS,
-                    }) => outcome.map_err(execute_error)?.into(),
-                    _ = cancellation.cancelled() => {
-                        let _ = session.terminate(cell_id).await;
-                        return finish_cancelled(&mut shutdown_guard, session).await;
-                    }
-                };
-            }
-        }
-    };
-    content_items.extend(final_items);
-
-    shutdown_guard.disarm();
-    let _ = session.shutdown().await;
-
-    let return_value = content_items.iter().rev().find_map(|item| match item {
-        FunctionCallOutputContentItem::InputText { text } => text
-            .strip_prefix(RETURN_MARKER)
-            .and_then(|encoded| serde_json::from_str::<JsonValue>(encoded).ok()),
-        _ => None,
-    });
-
-    Ok(ScriptOutcome {
-        return_value,
-        error_text,
-    })
-}
-
-async fn finish_cancelled(
-    guard: &mut SessionShutdownGuard,
-    session: Arc<dyn CodeModeSession>,
-) -> Result<ScriptOutcome, xai_tool_runtime::ToolError> {
-    guard.disarm();
-    let _ = session.shutdown().await;
-    Ok(ScriptOutcome {
-        return_value: None,
-        error_text: Some("workflow cancelled".to_string()),
-    })
-}
-
-/// Shuts the code-mode session down even when the tool future is dropped
-/// mid-run (turn cancellation drops tool futures).
-struct SessionShutdownGuard {
-    session: Option<Arc<dyn CodeModeSession>>,
-}
-
-impl SessionShutdownGuard {
-    fn disarm(&mut self) {
-        self.session = None;
-    }
-}
-
-impl Drop for SessionShutdownGuard {
-    fn drop(&mut self) {
-        if let Some(session) = self.session.take()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            handle.spawn(async move {
-                let _ = session.shutdown().await;
-            });
-        }
-    }
-}
-
-fn load_script(
-    input: &WorkflowToolInput,
-    cwd: &Path,
-) -> Result<String, xai_tool_runtime::ToolError> {
-    let source = match (&input.script, &input.script_path) {
-        (Some(script), None) => script.clone(),
-        (None, Some(path)) => {
-            let resolved = if Path::new(path).is_absolute() {
-                PathBuf::from(path)
-            } else {
-                cwd.join(path)
-            };
-            std::fs::read_to_string(&resolved).map_err(|error| {
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "cannot read script_path `{}`: {error}",
-                    resolved.display()
-                ))
-            })?
-        }
-        (Some(_), Some(_)) => {
-            return Err(xai_tool_runtime::ToolError::invalid_arguments(
-                "provide either `script` or `script_path`, not both",
-            ));
-        }
-        (None, None) => {
-            return Err(xai_tool_runtime::ToolError::invalid_arguments(
-                "provide a workflow `script` (or `script_path`)",
-            ));
-        }
-    };
-    if source.len() > MAX_SCRIPT_BYTES {
-        return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-            "workflow script is {} bytes; the maximum is {MAX_SCRIPT_BYTES}",
-            source.len()
-        )));
-    }
-    Ok(source)
-}
-
-fn persist_script(run_dir: Option<&Path>, source: &str) -> Option<PathBuf> {
-    let run_dir = run_dir?;
-    std::fs::create_dir_all(run_dir).ok()?;
-    let path = run_dir.join("script.js");
-    std::fs::write(&path, source).ok()?;
-    Some(path)
-}
-
-fn load_resume_journal(
-    session_folder: Option<&Path>,
-    resume_id: &str,
-) -> Result<Vec<host::JournalEntry>, xai_tool_runtime::ToolError> {
-    if resume_id.is_empty()
-        || !resume_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-            "invalid resume_from_run_id `{resume_id}`"
-        )));
-    }
-    let Some(folder) = session_folder else {
-        return Err(xai_tool_runtime::ToolError::invalid_arguments(
-            "resume_from_run_id requires session persistence, which is unavailable here",
-        ));
-    };
-    let journal = folder
-        .join("workflows")
-        .join(resume_id)
-        .join("journal.jsonl");
-    if !journal.is_file() {
-        return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-            "no journal found for run `{resume_id}` (expected {})",
-            journal.display()
-        )));
-    }
-    Ok(host::load_journal_entries(&journal))
-}
-
-fn parse_resume_mode(raw: Option<&str>) -> Result<ResumeMode, String> {
-    match raw.map(str::trim) {
-        None | Some("") | Some("exact") => Ok(ResumeMode::Exact),
-        Some("positional") => Ok(ResumeMode::Positional),
-        Some(other) => Err(format!(
-            "invalid resume_mode `{other}` (expected \"exact\" or \"positional\")"
-        )),
-    }
-}
-
-fn parse_resume_boundary(raw: Option<&JsonValue>) -> Result<Option<ResumeBoundary>, String> {
-    match raw {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Number(number)) => number
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .map(|index| Some(ResumeBoundary::Index(index)))
-            .ok_or_else(|| format!("invalid resume_through index `{number}`")),
-        Some(JsonValue::String(text)) if !text.trim().is_empty() => {
-            Ok(Some(ResumeBoundary::Point(text.clone())))
-        }
-        Some(other) => Err(format!(
-            "invalid resume_through `{other}` (expected a phase title, agent label, or call index)"
-        )),
-    }
-}
-
-/// Assemble the executable ES module: prelude, injected globals, then the
-/// user body wrapped in an async main whose return value is re-emitted as a
-/// marked `text()` content item.
-fn assemble_module(
-    meta_value: &JsonValue,
-    args: Option<&JsonValue>,
-    token_budget: Option<u64>,
-    body: &str,
-) -> String {
-    let args_json = serde_json::to_string(args.unwrap_or(&JsonValue::Null))
-        .unwrap_or_else(|_| "null".to_string());
-    let meta_json = serde_json::to_string(meta_value).unwrap_or_else(|_| "{}".to_string());
-    let budget_json = match token_budget {
-        Some(total) => total.to_string(),
-        None => "null".to_string(),
-    };
-    format!(
-        "{WORKFLOW_PRELUDE}\n\
-         const args = {args_json};\n\
-         const meta = {meta_json};\n\
-         __wf.budgetTotal = {budget_json};\n\
-         const __wf_main = async () => {{\n\
-         {body}\n\
-         }};\n\
-         text(__wf_encodeReturn(await __wf_main()));\n"
-    )
-}
-
-fn workflow_concurrency_from_env() -> Result<usize, String> {
-    match std::env::var("OPENGROK_WORKFLOW_MAX_CONCURRENCY") {
-        Ok(raw) => {
-            let parsed: usize = raw
-                .trim()
-                .parse()
-                .map_err(|_| format!("invalid OPENGROK_WORKFLOW_MAX_CONCURRENCY `{raw}`"))?;
-            if parsed == 0 {
-                return Err("OPENGROK_WORKFLOW_MAX_CONCURRENCY must be at least 1".to_string());
-            }
-            Ok(parsed)
-        }
-        Err(_) => {
-            let cores = std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(8);
-            Ok(cores.saturating_sub(2).clamp(2, 16))
-        }
-    }
-}
-
-fn agent_timeout_from_env() -> Result<Option<Duration>, String> {
-    match std::env::var("OPENGROK_SUBAGENT_TIMEOUT_MS") {
-        Ok(raw) => {
-            let parsed: u64 = raw
-                .trim()
-                .parse()
-                .map_err(|_| format!("invalid OPENGROK_SUBAGENT_TIMEOUT_MS `{raw}`"))?;
-            Ok((parsed > 0).then(|| Duration::from_millis(parsed)))
-        }
-        Err(_) => Ok(Some(DEFAULT_AGENT_TIMEOUT)),
-    }
-}
-
-fn render_output(
-    meta: &meta::WorkflowMeta,
-    run_id: &str,
-    script_path: Option<&Path>,
-    host: &WorkflowHost,
-    outcome: &ScriptOutcome,
-) -> String {
-    let mut out = String::new();
-    out.push_str("<workflow_result>\n");
-    out.push_str(&format!("<name>{}</name>\n", meta.name));
-    out.push_str(&format!("<run_id>{run_id}</run_id>\n"));
-    if let Some(path) = script_path {
-        out.push_str(&format!("<script_path>{}</script_path>\n", path.display()));
-    }
-    let status = if outcome.error_text.is_some() {
-        "failed"
-    } else {
-        "completed"
-    };
-    out.push_str(&format!("<status>{status}</status>\n"));
-
-    let (agents, log_tail) = host.snapshot(|state| {
-        let agents = state
-            .agents
-            .iter()
-            .map(|agent| {
-                let status = match agent.status {
-                    host::AgentStatus::Running => "running",
-                    host::AgentStatus::Done => "done",
-                    host::AgentStatus::Failed => "failed",
-                    host::AgentStatus::Cached => "cached",
-                };
-                let phase = agent
-                    .phase
-                    .as_deref()
-                    .map(|phase| format!(" phase=\"{phase}\""))
-                    .unwrap_or_default();
-                let detail = agent
-                    .detail
-                    .as_deref()
-                    .map(|detail| format!(" — {detail}"))
-                    .unwrap_or_default();
-                format!(
-                    "  <agent index=\"{}\" status=\"{status}\"{phase}>{}{detail}</agent>",
-                    agent.index, agent.label
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<WorkflowLaunchAck>();
+        sender
+            .send((WorkflowLaunchRequest { input }, ack_tx))
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom(
+                    "workflow_channel_closed",
+                    "Workflow launch channel closed — the session may be shutting down",
                 )
-            })
-            .collect::<Vec<_>>();
-        (agents, state.render_tail())
-    });
-    out.push_str(&format!(
-        "<agents total=\"{}\" tokens_used=\"{}\">\n{}\n</agents>\n",
-        host.agents_started(),
-        host.tokens_spent(),
-        agents.join("\n")
-    ));
-    if !log_tail.trim().is_empty() {
-        out.push_str(&format!("<log_tail>\n{log_tail}</log_tail>\n"));
+            })?;
+
+        match ack_rx.await {
+            Ok(WorkflowLaunchAck::Started {
+                run_id,
+                task_id,
+                name,
+                script_path,
+            }) => Ok(WorkflowToolOutput {
+                message: {
+                    let iterate = script_path
+                        .as_deref()
+                        .map(|p| {
+                            format!(
+                                " The editable script projection is at {p}. Edit it and launch \
+                                 that `script_path` as a new run to iterate; same-process pause \
+                                 resume continues only this run's original immutable source."
+                            )
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "Workflow '{name}' started in the background. Progress appears in \
+                         /workflows and completion is reported automatically. '{name}' is the \
+                         session-unique display handle for user-facing status and /workflow \
+                         management; keep the structured run id internal.{iterate}"
+                    )
+                },
+                run_id,
+                task_id,
+                name,
+                script_path,
+            }),
+            Ok(WorkflowLaunchAck::Validated {
+                name,
+                phases,
+                summary,
+            }) => Ok(WorkflowToolOutput {
+                message: format!(
+                    "Smoke check passed for workflow '{name}' ({phases} declared phases; \
+                     canned-host path {summary}). This did not launch the workflow and did not \
+                     exercise every branch or live dependency. Offer a real run next."
+                ),
+                run_id: String::new(),
+                task_id: String::new(),
+                name,
+                script_path: None,
+            }),
+            Ok(WorkflowLaunchAck::Rejected { code, detail }) => {
+                Err(xai_tool_runtime::ToolError::custom(code, detail))
+            }
+            Err(_) => Err(xai_tool_runtime::ToolError::custom(
+                "workflow_launch_no_ack",
+                "The session dropped the launch channel before answering; the workflow may not \
+                 have started.",
+            )),
+        }
     }
-    match (&outcome.error_text, &outcome.return_value) {
-        (Some(error), _) => {
-            out.push_str(&format!("<error>\n{error}\n</error>\n"));
-        }
-        (None, Some(value)) => {
-            let rendered =
-                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-            out.push_str(&format!("<result>\n{rendered}\n</result>\n"));
-        }
-        (None, None) => {
-            out.push_str("<result>null</result>\n");
-        }
-    }
-    out.push_str(&format!(
-        "<resume_hint>To resume with journal replay, call workflow again with \
-         resume_from_run_id=\"{run_id}\"{}. Unchanged agent() calls replay for free. If you \
-         edit the script, add resume_mode=\"positional\" so completed positions still replay, \
-         and use resume_through=\"<phase, label, or index>\" to go back to a specific point \
-         and re-run everything after it.</resume_hint>\n",
-        script_path
-            .map(|path| format!(
-                " and script_path=\"{}\" (edit that file in place rather than \
-                 regenerating the script — reworded prompts do not replay under exact mode)",
-                path.display()
-            ))
-            .unwrap_or_default()
-    ));
-    out.push_str("</workflow_result>");
-    crate::util::truncate::truncate_str_with_marker(&out, crate::DEFAULT_TOOL_OUTPUT_BYTES)
-        .into_owned()
 }
 
 #[cfg(test)]
-#[path = "workflow_tests.rs"]
-mod workflow_tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_requires_exactly_one_source_and_bounded_positive_budget() {
+        let base = WorkflowToolInput {
+            agent_budget: None,
+            name: None,
+            script: None,
+            script_path: None,
+            args: None,
+            resume_from_run_id: None,
+            validate_only: false,
+        };
+        assert!(base.validate().is_err());
+
+        let named = WorkflowToolInput {
+            name: Some("deep-research".into()),
+            ..base.clone()
+        };
+        assert!(named.validate().is_ok());
+
+        let both = WorkflowToolInput {
+            name: Some("goal".into()),
+            script: Some("let meta = #{};".into()),
+            ..base.clone()
+        };
+        assert!(both.validate().is_err());
+
+        let resume_only = WorkflowToolInput {
+            resume_from_run_id: Some("wf_123".into()),
+            ..base.clone()
+        };
+        assert!(resume_only.validate().is_ok());
+
+        let edited_resume = WorkflowToolInput {
+            script_path: Some("edited.rhai".into()),
+            resume_from_run_id: Some("wf_123".into()),
+            ..base.clone()
+        };
+        assert!(edited_resume.validate().is_err());
+        assert!(
+            WorkflowToolInput {
+                agent_budget: Some(10),
+                resume_from_run_id: Some("wf_123".into()),
+                name: None,
+                ..base.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+
+        assert!(
+            WorkflowToolInput {
+                agent_budget: Some(0),
+                name: Some("deep-research".into()),
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            WorkflowToolInput {
+                agent_budget: Some(WorkflowToolInput::MAX_AGENT_BUDGET + 1),
+                name: Some("deep-research".into()),
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            WorkflowToolInput {
+                agent_budget: Some(1),
+                name: Some("deep-research".into()),
+                ..base.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            WorkflowToolInput {
+                agent_budget: Some(1),
+                script: Some("let meta = #{};".into()),
+                validate_only: true,
+                ..base
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+}

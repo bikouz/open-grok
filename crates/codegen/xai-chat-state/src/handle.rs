@@ -4,11 +4,10 @@ use std::collections::BTreeSet;
 
 use tokio::sync::{mpsc, oneshot};
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DanglingToolCallReason, SamplingConfig, TokenUsage,
-    ToolSpec, TraceContext,
+    ConversationItem, ConversationRequest, SamplingConfig, TokenUsage, ToolSpec, TraceContext,
 };
 
-use crate::commands::{ChatStateCommand, RepairHistoryBlocked};
+use crate::commands::{ChatStateCommand, RepairHistoryBlocked, StrictAppendAck, StrictAppendError};
 use crate::types::{
     AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, Credentials, NotificationMeta,
     TurnCapture,
@@ -50,15 +49,27 @@ impl ChatStateHandle {
         .await
     }
 
-    /// Push a user message with an explicit dangling-repair reason.
-    pub fn push_user_message_with_repair_reason(
+    /// Strictly append one working-directory switch and await persistence.
+    /// A matching generation returns `AlreadyPresent`; indeterminate errors must be retried.
+    pub async fn append_working_directory_switch_and_ack(
         &self,
-        item: ConversationItem,
-        reason: DanglingToolCallReason,
-    ) {
-        let _ = self
-            .cmd_tx
-            .send(ChatStateCommand::PushUserMessageWithRepairReason { item, reason });
+        content: String,
+        cwd_generation: std::num::NonZeroU64,
+    ) -> Result<StrictAppendAck, StrictAppendError> {
+        self.query("AppendWorkingDirectorySwitchAndAck", |reply| {
+            ChatStateCommand::AppendWorkingDirectorySwitchAndAck {
+                content,
+                cwd_generation,
+                reply,
+            }
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(StrictAppendError::Indeterminate(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "chat-state actor unavailable; retry by generation",
+            )))
+        })
     }
 
     /// Record the assistant's response.
@@ -563,6 +574,20 @@ impl ChatStateHandle {
     pub async fn get_last_assistant_text(&self) -> Option<String> {
         self.query("GetLastAssistantText", |reply| {
             ChatStateCommand::GetLastAssistantText { reply }
+        })
+        .await
+        .flatten()
+    }
+
+    /// Get the current turn's last assistant message text, or `None` when the
+    /// turn produced none (or the actor is dead). Turn-scoped, unlike
+    /// [`get_last_assistant_text`], and cheaper than [`get_conversation`].
+    ///
+    /// [`get_conversation`]: Self::get_conversation
+    /// [`get_last_assistant_text`]: Self::get_last_assistant_text
+    pub async fn get_last_assistant_text_in_turn(&self) -> Option<String> {
+        self.query("GetLastAssistantTextInTurn", |reply| {
+            ChatStateCommand::GetLastAssistantTextInTurn { reply }
         })
         .await
         .flatten()

@@ -5097,15 +5097,17 @@ fn test_coalesced_batch_refresh_flags_deduplicate() {
 #[test]
 fn test_coalesced_batch_non_coalescable_preserved_in_order() {
     let mut batch = CoalescedBatch::new();
-    batch.add(HunkTrackerCommand::ResetStats);
     batch.add(HunkTrackerCommand::ResetBaseline {
         path: PathBuf::from("/tmp/x.rs"),
+    });
+    batch.add(HunkTrackerCommand::ResetBaseline {
+        path: PathBuf::from("/tmp/y.rs"),
     });
 
     assert_eq!(batch.other_commands.len(), 2);
     assert!(matches!(
         batch.other_commands[0],
-        HunkTrackerCommand::ResetStats
+        HunkTrackerCommand::ResetBaseline { .. }
     ));
     assert!(matches!(
         batch.other_commands[1],
@@ -5160,9 +5162,6 @@ fn test_is_coalescable() {
         &HunkTrackerCommand::RefreshGitDirtyCache
     ));
     assert!(!HunkTrackerActor::is_coalescable(
-        &HunkTrackerCommand::ResetStats
-    ));
-    assert!(!HunkTrackerActor::is_coalescable(
         &HunkTrackerCommand::ResetBaseline {
             path: PathBuf::from("/a")
         }
@@ -5207,7 +5206,9 @@ fn test_coalesced_batch_command_count() {
     batch.add(HunkTrackerCommand::HandleFileChange { path: path.clone() });
     batch.add(HunkTrackerCommand::HandleFileChange { path });
     batch.add(HunkTrackerCommand::RefreshAllBaselines);
-    batch.add(HunkTrackerCommand::ResetStats);
+    batch.add(HunkTrackerCommand::ResetBaseline {
+        path: PathBuf::from("/tmp/b.rs"),
+    });
 
     assert_eq!(batch.command_count, 4);
     assert_eq!(batch.file_actions.len(), 1);

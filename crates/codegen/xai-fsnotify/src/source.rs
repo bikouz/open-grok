@@ -104,8 +104,7 @@ fn event_loop_handle() -> Result<Handle, FsNotifyError> {
 /// Get a shared [`FsEventSource`] for `cwd`, reusing a live watcher for the
 /// same canonical directory or creating one if none exists. The OS watcher is
 /// dropped when the last returned [`Arc`] goes away, so callers must keep the
-/// `Arc` alive for as long as they want events — and must **not** call
-/// [`FsEventSource::shutdown`] (that would stop the watcher for every sharer).
+/// `Arc` alive for as long as they want events.
 ///
 /// `config` is honored only when a watcher is actually created; a live watcher
 /// for the same directory is reused as-is regardless of the requested config.
@@ -166,7 +165,7 @@ fn record_create(key: &Path, live_watchers: usize) {
     );
 }
 
-/// Construct via `FsConfig::default()` then chain `with_*` setters.
+/// Construct with explicit field values or use [`FsConfig::default`].
 /// Internal timing constants (cooldown, stale-lock) live in `crate::state`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -181,20 +180,6 @@ impl Default for FsConfig {
             debounce_ms: 100,
             ignore_patterns: vec![],
         }
-    }
-}
-
-impl FsConfig {
-    #[must_use]
-    pub fn with_debounce_ms(mut self, ms: u64) -> Self {
-        self.debounce_ms = ms;
-        self
-    }
-
-    #[must_use]
-    pub fn with_ignore_patterns(mut self, patterns: Vec<String>) -> Self {
-        self.ignore_patterns = patterns;
-        self
     }
 }
 
@@ -280,11 +265,6 @@ impl FsEventSource {
     #[must_use]
     pub fn os_watch_count(&self) -> usize {
         self.watcher.watch_count()
-    }
-
-    /// Idempotent. `Drop` also cancels.
-    pub fn shutdown(&self) {
-        self.shutdown.cancel();
     }
 }
 

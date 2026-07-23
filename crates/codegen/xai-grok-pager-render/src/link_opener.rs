@@ -62,7 +62,7 @@ pub fn browser_unavailable_message(url: &str) -> String {
 /// fails — callers should show [`browser_unavailable_message`].
 ///
 /// **Callers handling untrusted input** should call [`is_safe_to_open`]
-/// first, or use [`open_url_if_safe`] / [`try_open_url`] which combine both.
+/// first, or use [`try_open_url`] which combines both.
 pub fn open_url(url: &str) -> bool {
     // Test seam: PTY e2e must observe the open without launching a real
     // browser. When set, append the URL to the file and skip the OS opener.
@@ -259,15 +259,6 @@ pub fn is_safe_to_open(url: &str, filter: SchemeFilter) -> bool {
         return filter.allows(&scheme.to_ascii_lowercase());
     }
     false
-}
-
-/// Validate scheme and open a URL if permitted.
-///
-/// Returns `true` only when the scheme is allowed **and** the opener was
-/// launched. Distinguishes scheme rejection from browser unavailability
-/// via [`try_open_url`].
-pub fn open_url_if_safe(url: &str, filter: SchemeFilter) -> bool {
-    matches!(try_open_url(url, filter), OpenUrlResult::Opened)
 }
 
 /// Validate scheme and attempt to open. Prefer this when the caller needs

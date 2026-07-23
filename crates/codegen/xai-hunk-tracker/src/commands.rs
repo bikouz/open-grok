@@ -6,8 +6,8 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::types::{
-    FileContentEntry, FileHunkData, Hunk, HunkAction, HunkActionError, HunkId, HunkSourceFilter,
-    HunkTrackerSnapshot, HunkTurnDelta, SessionSummary, TrackingMode,
+    FileContentEntry, FileHunkData, Hunk, HunkAction, HunkActionError, HunkId, HunkTrackerSnapshot,
+    HunkTurnDelta, SessionSummary,
 };
 
 /// Commands sent to the HunkTrackerActor via mpsc channel.
@@ -36,9 +36,6 @@ pub enum HunkTrackerCommand {
 
     /// Reset baseline after commit
     ResetBaseline { path: PathBuf },
-
-    /// Set tracking mode
-    SetMode { mode: TrackingMode },
 
     // === Action Commands (accept/reject hunks) ===
     /// Apply action (accept/reject) to a specific hunk
@@ -86,24 +83,6 @@ pub enum HunkTrackerCommand {
         reply: oneshot::Sender<FileHunkData>,
     },
 
-    /// Get hunks filtered by source
-    GetHunksBySource {
-        source: HunkSourceFilter,
-        reply: oneshot::Sender<Vec<Arc<Hunk>>>,
-    },
-
-    /// Get a specific hunk by ID
-    GetHunk {
-        hunk_id: HunkId,
-        reply: oneshot::Sender<Option<Arc<Hunk>>>,
-    },
-
-    /// Check if a path is being tracked as an agent file
-    IsAgentFile {
-        path: PathBuf,
-        reply: oneshot::Sender<bool>,
-    },
-
     /// Get all tracked file paths (agent + external, regardless of hunk state)
     GetAllTrackedPaths {
         reply: oneshot::Sender<Vec<PathBuf>>,
@@ -133,20 +112,11 @@ pub enum HunkTrackerCommand {
         reply: oneshot::Sender<Vec<Arc<Hunk>>>,
     },
 
-    /// Reset session stats (e.g., after commit)
-    ResetStats,
-
     /// Refresh all baselines from the current git HEAD and re-read current
     /// content from disk. Used after a git HEAD/index change to reconcile stale state.
     RefreshAllBaselines,
 
     // === Snapshot / Restore Commands (for cross-session sync-back) ===
-    /// Take a snapshot of all hunk tracker state for preservation across
-    /// session kill/reload cycles.
-    SnapshotState {
-        reply: oneshot::Sender<HunkTrackerSnapshot>,
-    },
-
     /// Incremental single-turn delta for the rewind checkpoint store.
     SnapshotTurnDelta {
         prompt_index: usize,

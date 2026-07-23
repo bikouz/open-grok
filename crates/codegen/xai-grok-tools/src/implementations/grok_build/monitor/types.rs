@@ -26,9 +26,6 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 36_000_000; // 10 hours
 /// Maximum monitor timeout.
 pub const MAX_TIMEOUT_MS: u64 = 36_000_000; // 10 hours
 
-/// Max result size for the tool_result response.
-pub const MAX_RESULT_SIZE_CHARS: usize = 10_000;
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct MonitorInput {
     /// Shell command or script. Each stdout line is an event; exit ends the watch.

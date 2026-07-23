@@ -4,8 +4,7 @@ use std::collections::BTreeSet;
 
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DanglingToolCallReason, SamplingConfig, TokenUsage,
-    ToolSpec, TraceContext,
+    ConversationItem, ConversationRequest, SamplingConfig, TokenUsage, ToolSpec, TraceContext,
 };
 
 use crate::types::{
@@ -35,6 +34,23 @@ impl std::fmt::Display for RepairHistoryBlocked {
 
 impl std::error::Error for RepairHistoryBlocked {}
 
+/// Result of a strict persistence-acknowledged working-directory switch append.
+#[derive(Debug, Clone)]
+pub enum StrictAppendAck {
+    Appended,
+    AlreadyPresent(ConversationItem),
+}
+
+#[derive(Debug)]
+pub enum StrictAppendError {
+    NotCommitted(std::io::Error),
+    Committed {
+        acknowledgement: StrictAppendAck,
+        source: std::io::Error,
+    },
+    Indeterminate(std::io::Error),
+}
+
 /// Commands sent to the ChatStateActor via mpsc channel.
 pub enum ChatStateCommand {
     // ═══ Mutations (fire-and-forget) ═══
@@ -48,10 +64,12 @@ pub enum ChatStateCommand {
         reply: oneshot::Sender<()>,
     },
 
-    /// Push a user message with an explicit dangling-repair reason.
-    PushUserMessageWithRepairReason {
-        item: ConversationItem,
-        reason: DanglingToolCallReason,
+    /// Append one working-directory switch without repair or pruning, then
+    /// acknowledge only after persistence processes the generation-aware append.
+    AppendWorkingDirectorySwitchAndAck {
+        content: String,
+        cwd_generation: std::num::NonZeroU64,
+        reply: oneshot::Sender<Result<StrictAppendAck, StrictAppendError>>,
     },
 
     /// Record the assistant's response (text + tool calls).
@@ -306,6 +324,13 @@ pub enum ChatStateCommand {
         reply: oneshot::Sender<Option<String>>,
     },
 
+    /// Like `GetLastAssistantText`, but bounded to the current prompt turn:
+    /// returns `None` when the turn produced no assistant text (the walk stops
+    /// at the first turn-starting user item).
+    GetLastAssistantTextInTurn {
+        reply: oneshot::Sender<Option<String>>,
+    },
+
     /// Get the text of the first `Text` content part in the first `User` message.
     /// Returns `None` if the conversation has no user messages or the first user
     /// message has no text content part.
@@ -361,6 +386,12 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::PushUserMessageAndAck {
             item: ConversationItem::user("hello"),
+            reply: tx,
+        };
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::AppendWorkingDirectorySwitchAndAck {
+            content: "moved".into(),
+            cwd_generation: std::num::NonZeroU64::new(1).unwrap(),
             reply: tx,
         };
         let _ = ChatStateCommand::PushAssistantResponse {
@@ -470,6 +501,9 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetLastAssistantText { reply: tx };
+
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::GetLastAssistantTextInTurn { reply: tx };
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetFirstUserText { reply: tx };

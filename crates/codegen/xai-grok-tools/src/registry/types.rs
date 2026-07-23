@@ -677,12 +677,12 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::KillTerminalCommandTool>();
         b.register::<grok_build::TodoWriteTool>();
         b.register::<grok_build::UpdateGoalTool>();
+        b.register::<grok_build::WorkflowTool>();
         b.register::<grok_build::TaskOutputTool>();
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();
         b.register::<grok_build::TaskTool>();
         b.register::<grok_build::AgentSwarmTool>();
-        b.register::<grok_build::WorkflowTool>();
         b.register::<grok_build::WebSearchTool>();
         b.register::<grok_build::XSearchTool>();
         b.register_with_params::<grok_build::WebFetchTool, grok_build::web_fetch::WebFetchParams>();
@@ -755,24 +755,6 @@ impl ToolRegistryBuilder {
     pub fn with_local_registry(mut self, registry: xai_computer_hub_sdk::LocalRegistry) -> Self {
         self.shared_local_registry = Some(registry);
         self
-    }
-    /// Dump tools manifest as JSON for the client.
-    pub fn get_tools_config_raw(&self) -> serde_json::Value {
-        let out: HashMap<&str, serde_json::Value> = self
-            .tools
-            .iter()
-            .map(|(name, e)| {
-                (
-                    name.as_str(),
-                    serde_json::json!(
-                        { "namespace" : e.namespace, "id" : e.id, "kind" : e.kind,
-                        "default_params" : e.default_params, "input_schema" : e.input_schema,
-                        "requires" : e.requires, }
-                    ),
-                )
-            })
-            .collect();
-        serde_json::to_value(&out).expect("tool_config_raw_to_not_fail")
     }
     /// Validate a client-proposed configuration. Returns errors (empty = valid).
     pub fn validate_config(&self, config: &ToolServerConfig) -> Vec<RequirementError> {
@@ -1202,9 +1184,12 @@ impl ToolRegistryBuilder {
         if let (Some(cmd_rx), Some(cancel_token)) = (scheduler_cmd_rx, &scheduler_cancel_token) {
             let actor = crate::implementations::grok_build::scheduler::actor::SchedulerActor {
                 resources: shared_resources.clone(),
+                resources_persistence: persistence.clone(),
                 notification_handle: scheduler_notification_handle,
                 cmd_rx,
                 cancel_token: cancel_token.clone(),
+                clock: Default::default(),
+                pending_removal: None,
             };
             tokio::spawn(actor.run());
         }
@@ -1287,9 +1272,6 @@ impl FinalizedToolset {
             system_reminder_tag: "system-reminder",
             workspace_viewer_ctx: None,
         }
-    }
-    pub fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
-        &self.local_registry
     }
     /// Get all tool definitions to send to the client.
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -1431,6 +1413,9 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(parent_ctx.call_id.clone());
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(
+            crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
+        );
         if let Some(cwd) = parent_ctx.extensions.get::<xai_tool_runtime::Cwd>() {
             ctx.extensions.insert((*cwd).clone());
         }
@@ -1559,6 +1544,9 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(
+            crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
+        );
         if let Some(cwd) = cwd_override {
             ctx.extensions.insert(xai_tool_runtime::Cwd(cwd));
         }
@@ -1640,27 +1628,6 @@ impl FinalizedToolset {
             prompt_text,
             effective_tool_name,
         })
-    }
-    /// Reverse-remap client-facing param names to canonical names.
-    pub fn remap_params(&self, tool_name: &str, tool_args: serde_json::Value) -> serde_json::Value {
-        let reverse_params = {
-            let tools = self.tools.read();
-            tools
-                .iter()
-                .find(|t| t.client_name == tool_name)
-                .map(|t| t.reverse_params.clone())
-                .unwrap_or_default()
-        };
-        if reverse_params.is_empty() {
-            tool_args
-        } else {
-            remap_json_keys(tool_args, &reverse_params)
-        }
-    }
-    /// Persist resources state to disk.
-    pub async fn persist_state(&self) {
-        let res = self.resources.lock().await;
-        self.resources_persistence.save(&res);
     }
     /// Register a tool at runtime (e.g., MCP tools).
     ///
@@ -1757,16 +1724,11 @@ impl FinalizedToolset {
         }
         removed
     }
-    /// Flush any pending persistence writes. Call on graceful shutdown.
-    pub async fn flush_persistence(&self) {
-        self.resources_persistence.flush().await;
-    }
     /// Serialize current in-memory state, write it to disk, and wait for
     /// the write to complete. Returns the path to the persisted file.
     ///
-    /// Unlike `flush_persistence()` (which only flushes previously queued
-    /// snapshots), this method captures a **fresh** snapshot of the current
-    /// `Resources` and ensures it hits disk before returning.
+    /// This method captures a **fresh** snapshot of the current `Resources`
+    /// and ensures it hits disk before returning.
     pub async fn save_and_flush_persistence(&self) -> &std::path::Path {
         {
             let res = self.resources.lock().await;

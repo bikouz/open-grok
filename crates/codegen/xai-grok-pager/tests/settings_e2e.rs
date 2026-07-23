@@ -33,6 +33,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "show_timestamps",
     "show_timeline",
     "page_flip_on_send",
+    "combine_queued_prompts",
     "simple_mode",
     "swarm_mode",
     "vim_mode",
@@ -232,6 +233,12 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
         ("page_flip_on_send", Action::SetPageFlipOnSend(b)) => {
             assert_eq!(b, expected, "SetPageFlipOnSend value differs from expected")
         }
+        ("combine_queued_prompts", Action::SetCombineQueuedPrompts(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetCombineQueuedPrompts value differs from expected"
+            )
+        }
         ("simple_mode", Action::SetSimpleMode(b)) => {
             assert_eq!(b, expected, "SetSimpleMode value differs from expected")
         }
@@ -421,6 +428,15 @@ fn space_on_page_flip_on_send_dispatches_typed_setter() {
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
     let default_on = UiConfig::default().page_flip_on_send_enabled();
     assert_set_bool_action(outcome, "page_flip_on_send", !default_on);
+}
+
+#[test]
+fn space_on_combine_queued_prompts_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "combine_queued_prompts");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    let default_on = UiConfig::default().combine_queued_prompts.unwrap_or(false);
+    assert_set_bool_action(outcome, "combine_queued_prompts", !default_on);
 }
 
 #[test]
@@ -903,6 +919,21 @@ fn mouse_click_on_swarm_mode_indicator_toggles_in_one_click() {
         row_y,
     );
     assert_set_bool_action(outcome, "swarm_mode", true);
+}
+
+#[test]
+fn mouse_click_on_combine_queued_prompts_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "combine_queued_prompts") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    let default_on = UiConfig::default().combine_queued_prompts.unwrap_or(false);
+    assert_set_bool_action(outcome, "combine_queued_prompts", !default_on);
 }
 
 /// Value-column click toggles `remember_tool_approvals` in one click.
@@ -2124,6 +2155,7 @@ fn registry_kind_membership_through_pr_14() {
             "show_timeline",
             "show_timestamps",
             "page_flip_on_send",
+            "combine_queued_prompts",
             "simple_mode",
             "swarm_mode",
             "antigravity_subagents",
@@ -2291,6 +2323,7 @@ fn defaults_round_trip_through_registry() {
     xai_grok_pager::appearance::cache::set_prompt_suggestions(true);
     xai_grok_pager::appearance::cache::set_group_tool_verbs(true);
     xai_grok_pager::appearance::cache::set_page_flip_on_send(true);
+    xai_grok_pager::appearance::cache::set_combine_queued_prompts(false);
     xai_grok_pager::appearance::cache::set_scroll_mode(
         xai_grok_pager::appearance::ScrollMode::Auto,
     );
@@ -2306,6 +2339,7 @@ fn defaults_round_trip_through_registry() {
             "show_timestamps" => SettingValue::Bool(true),
             "show_timeline" => SettingValue::Bool(false),
             "page_flip_on_send" => SettingValue::Bool(true),
+            "combine_queued_prompts" => SettingValue::Bool(false),
             "simple_mode" => SettingValue::Bool(true),
             "swarm_mode" => SettingValue::Bool(false),
             "vim_mode" => SettingValue::Bool(false),
@@ -2429,6 +2463,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetTimestamps(_))
             | SettingsKeyOutcome::Action(Action::SetTimeline(_))
             | SettingsKeyOutcome::Action(Action::SetPageFlipOnSend(_))
+            | SettingsKeyOutcome::Action(Action::SetCombineQueuedPrompts(_))
             | SettingsKeyOutcome::Action(Action::SetSimpleMode(_))
             | SettingsKeyOutcome::Action(Action::SetSwarmMode { .. })
             | SettingsKeyOutcome::Action(Action::SetMultilineMode(_))

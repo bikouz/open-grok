@@ -295,7 +295,8 @@ fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
         effects[0],
     );
     assert!(
-        matches!(& effects[1], Effect::SwitchModel { model_id : mid, .. } if mid == &
+        matches!(& effects[1], Effect::SwitchModel { model_id : mid, .. }
+if mid == &
         model_id),
         "second effect must be SwitchModel(<resolved id>), got {:?}",
         effects[1],
@@ -1073,39 +1074,57 @@ fn dispatch_open_reset_confirm_no_op_in_release_when_no_settings_modal() {
 #[test]
 fn every_setting_has_action_for_reset_arm() {
     use crate::settings::current_value_for;
-    let reg = crate::settings::SettingsRegistry::defaults();
-    for meta in reg.all() {
-        if matches!(meta.kind, crate::settings::SettingKind::Group { .. }) {
-            continue;
-        }
-        let default_value = crate::settings::default_value_for(meta);
-        let action = action_for_reset(meta.key, &default_value);
-        assert!(
-            action.is_some(),
-            "Setting `{}` has no `action_for_reset` arm — `d`-reset would silently \
+    with_theme_test_env(|| {
+        let reg = crate::settings::SettingsRegistry::defaults();
+        for meta in reg.all() {
+            if matches!(meta.kind, crate::settings::SettingKind::Group { .. }) {
+                continue;
+            }
+            let default_value = crate::settings::default_value_for(meta);
+            let action = action_for_reset(meta.key, &default_value);
+            assert!(
+                action.is_some(),
+                "Setting `{}` has no `action_for_reset` arm — `d`-reset would silently \
                  no-op. Add an arm to `action_for_reset` in dispatch.rs.",
-            meta.key,
-        );
-        if meta.key == "default_model"
-            || matches!(meta.kind, crate::settings::SettingKind::Secret { .. })
-        {
-            // Secret values intentionally are not read into AppView/test
-            // fixtures. The action-arm assertion above covers reset wiring;
-            // credential storage round trips have dedicated auth tests.
-            continue;
+                meta.key,
+            );
+            if meta.key == "default_model"
+                || matches!(meta.kind, crate::settings::SettingKind::Secret { .. })
+                || meta.key.starts_with("toolset.web_search_source.")
+                || meta.key == "toolset.x_search.enabled"
+            {
+                // Secret values intentionally are not read into AppView/test
+                // fixtures. The action-arm assertion above covers reset wiring;
+                // credential storage round trips have dedicated auth tests.
+                //
+                // The `[toolset.web_search_source]` per-provider selectors and
+                // `[toolset.x_search].enabled` are SHELL-owned and read straight
+                // back from the effective config on disk
+                // (`load_web_search_source_sync` / `load_x_search_config_sync`)
+                // with NO in-memory mirror — unlike every other setter, which
+                // mutates AppView / the appearance cache synchronously. This
+                // effect-less dispatch harness never runs the `PersistSetting`
+                // effect, so the read-back here would reflect the developer's real
+                // `config.toml` (e.g. a hand-set `kimi_platform = "perplexity"`)
+                // rather than the just-dispatched reset. The action-arm assertion
+                // above still pins the reset wiring; the disk round-trip is covered
+                // by `tests/settings_e2e.rs` and the `persist_setting` handler
+                // tests in `app/effects/tests.rs`.
+                continue;
+            }
+            let mut app = test_app_with_agent();
+            move_setting_away_from_default(&mut app, meta.key);
+            let _ = dispatch(action.unwrap(), &mut app);
+            let pager = build_pager_snapshot(&app);
+            let reread = current_value_for(meta.key, &app.current_ui, &pager);
+            assert_eq!(
+                reread,
+                Some(default_value.clone()),
+                "action_for_reset({}, ...) round-trip drift: dispatch did not restore the default",
+                meta.key,
+            );
         }
-        let mut app = test_app_with_agent();
-        move_setting_away_from_default(&mut app, meta.key);
-        let _ = dispatch(action.unwrap(), &mut app);
-        let pager = build_pager_snapshot(&app);
-        let reread = current_value_for(meta.key, &app.current_ui, &pager);
-        assert_eq!(
-            reread,
-            Some(default_value.clone()),
-            "action_for_reset({}, ...) round-trip drift: dispatch did not restore the default",
-            meta.key,
-        );
-    }
+    });
 }
 
 #[test]
@@ -1126,41 +1145,43 @@ fn swarm_setting_uses_manual_trigger_for_live_session_updates() {
 /// persist, then asserts the rollback hits a real arm (not the catch-all).
 #[test]
 fn every_persisting_setting_has_rollback_arm() {
-    let reg = crate::settings::SettingsRegistry::defaults();
-    for meta in reg.all() {
-        if matches!(meta.kind, crate::settings::SettingKind::Secret { .. }) {
-            continue;
-        }
-        let default_value = crate::settings::default_value_for(meta);
-        let Some(reset_action) = action_for_reset(meta.key, &default_value) else {
-            continue;
-        };
-        let mut app = test_app_with_agent();
-        move_setting_away_from_default(&mut app, meta.key);
-        for eff in dispatch(reset_action, &mut app) {
-            let Effect::PersistSetting {
-                key,
-                rollback_value,
-                ..
-            } = eff
-            else {
+    with_theme_test_env(|| {
+        let reg = crate::settings::SettingsRegistry::defaults();
+        for meta in reg.all() {
+            if matches!(meta.kind, crate::settings::SettingKind::Secret { .. }) {
+                continue;
+            }
+            let default_value = crate::settings::default_value_for(meta);
+            let Some(reset_action) = action_for_reset(meta.key, &default_value) else {
                 continue;
             };
-            let mut rb_app = test_app_with_agent();
-            let _ = apply_setting_rollback(&mut rb_app, key, &rollback_value);
-            let toast = rb_app
-                .agents
-                .get(&AgentId(0))
-                .and_then(|a| a.toast.as_ref())
-                .map(|(s, _)| s.as_str().to_owned());
-            assert_ne!(
-                toast.as_deref(),
-                Some(crate::app::dispatch::ROLLBACK_NO_ARM_TOAST),
-                "Setting `{key}` emits Effect::PersistSetting but apply_setting_rollback has \
+            let mut app = test_app_with_agent();
+            move_setting_away_from_default(&mut app, meta.key);
+            for eff in dispatch(reset_action, &mut app) {
+                let Effect::PersistSetting {
+                    key,
+                    rollback_value,
+                    ..
+                } = eff
+                else {
+                    continue;
+                };
+                let mut rb_app = test_app_with_agent();
+                let _ = apply_setting_rollback(&mut rb_app, key, &rollback_value);
+                let toast = rb_app
+                    .agents
+                    .get(&AgentId(0))
+                    .and_then(|a| a.toast.as_ref())
+                    .map(|(s, _)| s.as_str().to_owned());
+                assert_ne!(
+                    toast.as_deref(),
+                    Some(crate::app::dispatch::ROLLBACK_NO_ARM_TOAST),
+                    "Setting `{key}` emits Effect::PersistSetting but apply_setting_rollback has \
                      no arm — a failed persist diverges in-memory state from config.toml. Add an arm.",
-            );
+                );
+            }
         }
-    }
+    });
 }
 
 #[test]
@@ -1453,6 +1474,8 @@ fn pr13_set_show_tips_toast_includes_restart_marker() {
 /// setting to a non-default value so the round-trip dispatch has
 /// an observable effect (otherwise the assertion would pass
 /// vacuously when current == default).
+/// Dispatches theme-mutating actions for the theme keys — callers must
+/// hold the theme test lock (wrap the test in [`with_theme_test_env`]).
 fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::SettingKey) {
     match key {
         "compact_mode" => {
@@ -1468,6 +1491,10 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "page_flip_on_send" => {
             let away = !crate::appearance::cache::load_page_flip_on_send();
             let _ = dispatch(Action::SetPageFlipOnSend(away), app);
+        }
+        "combine_queued_prompts" => {
+            let away = !crate::appearance::cache::load_combine_queued_prompts();
+            let _ = dispatch(Action::SetCombineQueuedPrompts(away), app);
         }
         "simple_mode" => {
             let _ = dispatch(Action::SetSimpleMode(false), app);

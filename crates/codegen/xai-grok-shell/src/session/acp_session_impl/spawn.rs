@@ -299,6 +299,7 @@ pub(crate) async fn spawn_session_actor(
     persisted_signals: Option<crate::session::signals::SessionSignals>,
     persisted_plan_mode: Option<crate::session::plan_mode::PlanModeSnapshot>,
     persisted_goal_mode: Option<crate::session::goal_tracker::GoalOrchestration>,
+    persisted_workflow_runs: Vec<crate::session::workflow::store::RestoredWorkflowRun>,
     persisted_announcement_state: Option<crate::session::announcement_state::AnnouncementState>,
     memory_config: Option<crate::config::MemoryConfig>,
     loc_tracking_enabled: bool,
@@ -320,6 +321,7 @@ pub(crate) async fn spawn_session_actor(
     app_builder_deployer_config: xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig,
     write_file_enabled: bool,
     goal_enabled: bool,
+    background_workflows_enabled: bool,
     subagents_enabled: bool,
     ask_user_question_enabled: bool,
     client_hooks: crate::extensions::hooks::ClientHooks,
@@ -653,6 +655,7 @@ pub(crate) async fn spawn_session_actor(
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
+        combine_edit_holds: std::collections::HashSet::new(),
         pending_notifications: Vec::new(),
         lifecycle_mutation: None,
         pending_web_search_reload: None,
@@ -703,6 +706,7 @@ pub(crate) async fn spawn_session_actor(
         };
         Arc::new(parking_lot::Mutex::new(tracker))
     };
+    let goal_was_restored = persisted_goal_mode.is_some();
     let goal_tracker = {
         let session_dir = crate::session::persistence::session_dir(&session_info);
         let tracker = if let Some(snapshot) = persisted_goal_mode {
@@ -726,7 +730,7 @@ pub(crate) async fn spawn_session_actor(
             prompt_index: prompt_index_for_bridge,
             cwd: tool_context.cwd.as_path().to_path_buf(),
             gateway_enabled: gateway_enabled.clone(),
-            persistence_tx: persistence.tx.clone(),
+            persistence: persistence.clone(),
             incremental_bash_output,
             plan_mode: plan_mode.clone(),
             current_prompt_mode: current_prompt_mode.clone(),
@@ -766,38 +770,26 @@ pub(crate) async fn spawn_session_actor(
     );
     let terminal_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend> =
         match terminal_backend_kind {
-            // The parent's backend is already wrapped for virtual tasks.
             TerminalBackendKind::ReuseParent => parent_terminal_backend
                 .expect("ReuseParent is only selected when a parent backend is present"),
-            TerminalBackendKind::AcpClient => std::sync::Arc::new(
-                xai_grok_tools::computer::virtual_tasks::VirtualTaskTerminalBackend::new(
-                    std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
-                        tool_context.gateway.clone().unwrap(),
-                        tool_context.session_id.clone().unwrap(),
-                    )),
-                ),
-            ),
+            TerminalBackendKind::AcpClient => {
+                std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
+                    tool_context.gateway.clone().unwrap(),
+                    tool_context.session_id.clone().unwrap(),
+                ))
+                    as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>
+            }
             TerminalBackendKind::LocalPersistent => std::sync::Arc::new(
-                xai_grok_tools::computer::virtual_tasks::VirtualTaskTerminalBackend::new(
-                    std::sync::Arc::new(LocalTerminalBackend::new_local_with_persistent_shell(
-                        resolve_search_shadows(),
-                    )),
-                ),
+                LocalTerminalBackend::new_local_with_persistent_shell(resolve_search_shadows()),
             ),
             TerminalBackendKind::LocalNonPersistent => {
                 let login_shell_capture = crate::util::config::resolve_login_shell_capture(
                     remote_settings.as_ref().and_then(|r| r.login_shell_capture),
                 );
-                std::sync::Arc::new(
-                    xai_grok_tools::computer::virtual_tasks::VirtualTaskTerminalBackend::new(
-                        std::sync::Arc::new(
-                            LocalTerminalBackend::new_local_with_login_shell_capture(
-                                resolve_search_shadows(),
-                                login_shell_capture,
-                            ),
-                        ),
-                    ),
-                )
+                std::sync::Arc::new(LocalTerminalBackend::new_local_with_login_shell_capture(
+                    resolve_search_shadows(),
+                    login_shell_capture,
+                ))
             }
         };
     if matches!(
@@ -1102,6 +1094,7 @@ pub(crate) async fn spawn_session_actor(
         write_file_enabled,
         subagents_enabled,
         subagent_toggle: subagent_toggle.clone(),
+        background_workflows_enabled,
         ask_user_question_enabled,
         persona_summaries: persona_summaries.clone(),
         prompt_audience,
@@ -1123,6 +1116,11 @@ pub(crate) async fn spawn_session_actor(
         session_id_str: session_info.id.0.to_string(),
         respect_gitignore,
         path_not_found_hints,
+        scheduler_background_loops: crate::util::config::resolve_scheduler_background_loops(
+            remote_settings
+                .as_ref()
+                .and_then(|r| r.scheduler_background_loops),
+        ),
         mcp_state: mcp_state.clone(),
         managed_gateway_tool_client: managed_gateway_tool_client.clone(),
         is_non_interactive: startup_hints.non_interactive,
@@ -1258,13 +1256,22 @@ pub(crate) async fn spawn_session_actor(
         ClientType::Desktop => prod_mc_cli_chat_proxy_types::feedback_types::ClientType::Desktop,
         ClientType::GrokPager => prod_mc_cli_chat_proxy_types::feedback_types::ClientType::Tui,
     };
+    let user_cfg = feedback_flags.user;
     let feedback_config = FeedbackManagerConfig {
         feedback_enabled: feedback_flags.enabled,
         telemetry_enabled,
         client_type: feedback_client_type,
         loc_tracking_enabled,
+        user: user_cfg.clone(),
         ..Default::default()
     };
+    if feedback_flags.enabled
+        && let Some(user_cfg) = user_cfg
+    {
+        tokio::spawn(async move {
+            let _ = crate::util::user_identity::cached_identity(Some(&user_cfg)).await;
+        });
+    }
     let feedback_manager = Arc::new(FeedbackManager::new_with_provider_boundary(
         session_info.id.0.to_string(),
         feedback_client,
@@ -1304,9 +1311,16 @@ pub(crate) async fn spawn_session_actor(
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let mut sampler_config_initial = sampling_config.clone();
     sampler_config_initial.idle_timeout_secs = Some(inference_idle_timeout_secs);
+    let task_output_budgeted = tool_context.task_output_token_budget.is_some();
+    let retry_only_before_output =
+        task_output_budgeted || tool_context.sampler_retry_only_before_output;
+    if retry_only_before_output {
+        sampler_config_initial.doom_loop_recovery = None;
+    }
     let sampler_retry_policy = xai_grok_sampler::RetryPolicy {
         max_retries: max_retries.unwrap_or(5),
         rate_limit_retry_threshold: 2,
+        retry_only_before_output,
     };
     let (sampler_event_tx, sampler_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<xai_grok_sampler::SamplingEvent>();
@@ -1360,6 +1374,227 @@ pub(crate) async fn spawn_session_actor(
     let (goal_update_tx, goal_update_rx) = tokio::sync::mpsc::unbounded_channel::<
         xai_grok_tools::implementations::grok_build::update_goal::UpdateGoalEnvelope,
     >();
+    crate::session::workflow::registry::warm_builtin_cache();
+    let workflow_session_dir = crate::session::persistence::session_dir(&session_info);
+    let (workflow_store, workflow_snapshots) =
+        crate::session::workflow::store::WorkflowRunStore::from_restored(
+            Some(workflow_session_dir.clone()),
+            persistence.tx.clone(),
+            persisted_workflow_runs,
+        );
+    let workflow_tracker = Arc::new(parking_lot::Mutex::new(
+        crate::session::workflow::tracker::WorkflowTracker::from_snapshot(workflow_snapshots),
+    ));
+    let workflow_notify = crate::session::workflow::notify::WorkflowNotifySender::new(
+        session_info.id.clone(),
+        gateway.clone(),
+        persistence.tx.clone(),
+        workflow_store.clone(),
+    );
+    for state in workflow_tracker.lock().snapshot() {
+        workflow_notify.emit(&state, state.elapsed_ms_floor, 0);
+    }
+    let workflow_manager = Arc::new(tokio::sync::Mutex::new(
+        crate::session::workflow::manager::WorkflowManager::new(
+            session_info.id.0.to_string(),
+            Some(workflow_session_dir),
+            std::path::PathBuf::from(session_info.cwd.as_str()),
+            workflow_tracker.clone(),
+            workflow_store,
+            workflow_notify,
+            tool_context.subagent_event_tx.clone().unwrap_or_else(|| {
+                tracing::warn!(
+                    "workflow manager: no subagent coordinator; agent() spawns will fail"
+                );
+                tokio::sync::mpsc::unbounded_channel().0
+            }),
+            Arc::new(|name: &str, fields: &serde_json::Value, replayed: bool| {
+                if !replayed {
+                    tracing::info!(event = name, % fields, "workflow telemetry");
+                }
+            }),
+            cmd_tx.clone(),
+            std::collections::HashMap::new(),
+        ),
+    ));
+    let (workflow_launch_tx, mut workflow_launch_rx) = tokio::sync::mpsc::unbounded_channel::<
+        xai_grok_tools::implementations::grok_build::workflow::WorkflowLaunchEnvelope,
+    >();
+    {
+        let manager = workflow_manager.clone();
+        let launch_cwd = std::path::PathBuf::from(session_info.cwd.as_str());
+        let launch_session_dir = crate::session::persistence::session_dir(&session_info);
+        tokio::spawn(async move {
+            use crate::session::workflow::registry;
+            use xai_grok_tools::implementations::grok_build::workflow::WorkflowLaunchAck;
+            while let Some((req, ack)) = workflow_launch_rx.recv().await {
+                if !background_workflows_enabled {
+                    let _ = ack.send(WorkflowLaunchAck::Rejected {
+                        code: "workflows_disabled",
+                        detail: "Background workflows are disabled for this session \
+                                 ([workflows] enabled = false / GROK_WORKFLOWS=0 / remote flag)."
+                            .into(),
+                    });
+                    continue;
+                }
+                let input = req.input;
+                if let Err(detail) = input.validate() {
+                    let _ = ack.send(WorkflowLaunchAck::Rejected {
+                        code: "workflow_invalid_input",
+                        detail,
+                    });
+                    continue;
+                }
+                if input.resume_from_run_id.is_some()
+                    && (input.name.is_some()
+                        || input.script.is_some()
+                        || input.script_path.is_some())
+                {
+                    let _ = ack
+                        .send(WorkflowLaunchAck::Rejected {
+                            code: "workflow_invalid_source",
+                            detail: "resume uses the original immutable script and args; launch edited source as a new run"
+                                .into(),
+                        });
+                    continue;
+                }
+                let registry_snapshot = registry::WorkflowRegistry::scan(Some(&launch_cwd));
+                let resolved = if let Some(name) = input.name.as_deref() {
+                    registry_snapshot.resolve_by_name(name)
+                } else if let Some(script) = input.script.clone() {
+                    registry::resolve_inline(script)
+                } else if let Some(path) = input.script_path.as_deref() {
+                    registry::resolve_by_path(
+                        std::path::Path::new(path),
+                        &launch_cwd,
+                        Some(&launch_session_dir),
+                    )
+                } else if input.resume_from_run_id.is_some() {
+                    match manager
+                        .lock()
+                        .await
+                        .script_copy_for(input.resume_from_run_id.as_deref().unwrap())
+                    {
+                        Some(script) => registry::resolve_inline(script),
+                        None => {
+                            let _ = ack.send(WorkflowLaunchAck::Rejected {
+                                code: "workflow_resume_unknown_run",
+                                detail: "no persisted script for that run id".into(),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    let _ = ack.send(WorkflowLaunchAck::Rejected {
+                        code: "workflow_invalid_source",
+                        detail: "provide one of name / script / script_path".into(),
+                    });
+                    continue;
+                };
+                let resolved = match resolved {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let code = "workflow_resolve_failed";
+                        let _ = ack.send(WorkflowLaunchAck::Rejected {
+                            code,
+                            detail: e.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if input.validate_only {
+                    let script = resolved.script.clone();
+                    let probe_args = input.args.clone();
+                    let agent_budget = input
+                        .agent_budget
+                        .unwrap_or(xai_workflow::DEFAULT_AGENT_BUDGET);
+                    tokio::spawn(async move {
+                        let verdict = tokio::task::spawn_blocking(move || {
+                            xai_workflow::validate_script_with_agent_budget(
+                                &script,
+                                probe_args,
+                                agent_budget,
+                            )
+                        })
+                        .await;
+                        let msg = match verdict {
+                            Ok(Ok(report)) => WorkflowLaunchAck::Validated {
+                                name: report.name,
+                                phases: report.phases,
+                                summary: report.outcome_summary,
+                            },
+                            Ok(Err(e)) => WorkflowLaunchAck::Rejected {
+                                code: "workflow_validation_failed",
+                                detail: e.to_string(),
+                            },
+                            Err(e) => WorkflowLaunchAck::Rejected {
+                                code: "workflow_validation_failed",
+                                detail: format!("validator panicked: {e}"),
+                            },
+                        };
+                        let _ = ack.send(msg);
+                    });
+                    continue;
+                }
+                let definition_name = resolved.meta.name.clone();
+                let args = match (&input.args, &input.resume_from_run_id) {
+                    (Some(a), _) => a.clone(),
+                    (None, Some(rid)) => manager.lock().await.args_copy_for(rid),
+                    (None, None) => serde_json::Value::Null,
+                };
+                let objective = args
+                    .get("objective")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| resolved.meta.description.clone());
+                let spec = crate::session::workflow::manager::LaunchSpec {
+                    objective,
+                    args,
+                    agent_budget: input.agent_budget,
+                    resume_run_id: input.resume_from_run_id.clone(),
+                };
+                let launch_outcome = {
+                    let mut mgr = manager.lock().await;
+                    let result = mgr.launch(resolved, spec);
+                    let script_path = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|(run_id, _)| mgr.script_copy_path(run_id))
+                        .map(|p| p.display().to_string());
+                    (result, script_path)
+                };
+                match launch_outcome {
+                    (Ok((run_id, outcome_rx)), script_path) => {
+                        let display_name = manager
+                            .lock()
+                            .await
+                            .tracker()
+                            .lock()
+                            .get(&run_id)
+                            .map(|run| run.name.clone())
+                            .unwrap_or(definition_name);
+                        let _ = ack.send(WorkflowLaunchAck::Started {
+                            task_id: run_id.clone(),
+                            run_id: run_id.clone(),
+                            name: display_name,
+                            script_path,
+                        });
+                        tokio::spawn(async move {
+                            if let Ok(outcome) = outcome_rx.await {
+                                tracing::info!(run_id, ?outcome, "background workflow finished");
+                            }
+                        });
+                    }
+                    (Err(e), _) => {
+                        let _ = ack.send(WorkflowLaunchAck::Rejected {
+                            code: "workflow_launch_failed",
+                            detail: e.to_string(),
+                        });
+                    }
+                }
+            }
+        });
+    }
     let obs_bridge = {
         let sid = xai_tool_protocol::SessionId::new(&*session_info.id.0)
             .unwrap_or_else(|_| xai_tool_protocol::SessionId::new("unknown").expect("valid"));
@@ -1403,7 +1638,7 @@ pub(crate) async fn spawn_session_actor(
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         session_info: session_info.clone(),
         auth_method_id,
-        model_auth_facts: std::cell::RefCell::new(None),
+        model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback,
         auth_manager,
         state,
@@ -1419,6 +1654,7 @@ pub(crate) async fn spawn_session_actor(
         mcp_strategy,
         initial_client_mcp_servers: initial_client_mcp_servers.clone(),
         chat_state_handle,
+        unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: current_prompt_id.clone(),
         pending_interactions: pending_interactions.clone(),
         telemetry_enabled,
@@ -1523,7 +1759,12 @@ pub(crate) async fn spawn_session_actor(
         turn_prompt_mode: turn_prompt_mode.clone(),
         plan_mode: plan_mode.clone(),
         goal_enabled,
-        goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
+        background_workflows_enabled,
+        goal_harness_enabled: std::sync::atomic::AtomicBool::new(if background_workflows_enabled {
+            goal_enabled
+        } else {
+            false
+        }),
         goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(false),
         goal_tracker,
         goal_turn_task_ids: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -1531,6 +1772,8 @@ pub(crate) async fn spawn_session_actor(
         goal_blocked_streak: std::sync::atomic::AtomicU32::new(0),
         goal_update_rx: std::cell::RefCell::new(Some(goal_update_rx)),
         goal_update_tx,
+        workflow_manager: workflow_manager.clone(),
+        workflow_launch_tx: workflow_launch_tx.clone(),
         goal_classifier_enabled: effective_config
             .resolve_goal_classifier_enabled(goal_enabled)
             .value,
@@ -1603,7 +1846,6 @@ pub(crate) async fn spawn_session_actor(
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
-        subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),
@@ -1635,6 +1877,15 @@ pub(crate) async fn spawn_session_actor(
     ) {
         let _ = session.notifications.persistence_tx.send(message);
     }
+    if goal_was_restored {
+        let current_tokens = session.chat_state_handle.get_total_tokens().await as i64;
+        let (tokens_used, finished_marginal) = session.goal_tokens(current_tokens);
+        session.goal_notify_sender().emit_goal_updated(
+            &mut session.goal_tracker.lock(),
+            tokens_used,
+            finished_marginal,
+        );
+    }
     {
         let drainer_session = session.clone();
         let mut sampler_event_rx = sampler_event_rx;
@@ -1645,7 +1896,7 @@ pub(crate) async fn spawn_session_actor(
             tracing::debug!("sampler event drainer exiting (channel closed)");
         });
     }
-    {
+    if !background_workflows_enabled {
         let drainer_session = session.clone();
         let Some(mut goal_update_rx) = session.goal_update_rx.borrow_mut().take() else {
             unreachable!("goal_update_rx must be Some at session spawn");
@@ -1703,11 +1954,23 @@ pub(crate) async fn spawn_session_actor(
         .borrow()
         .tool_bridge()
         .update_resource(
-            xai_grok_tools::implementations::grok_build::update_goal::GoalUpdateHandle(
-                session.goal_update_tx.clone(),
+            xai_grok_tools::implementations::grok_build::workflow::WorkflowLaunchHandle(
+                session.workflow_launch_tx.clone(),
             ),
         )
         .await;
+    if !background_workflows_enabled {
+        session
+            .agent
+            .borrow()
+            .tool_bridge()
+            .update_resource(
+                xai_grok_tools::implementations::grok_build::update_goal::GoalUpdateHandle(
+                    session.goal_update_tx.clone(),
+                ),
+            )
+            .await;
+    }
     if let Some(ref display_cwd) = prompt_display_cwd {
         session
             .agent
@@ -2029,6 +2292,7 @@ pub(crate) async fn spawn_session_on_thread(
     persisted_signals: Option<crate::session::signals::SessionSignals>,
     persisted_plan_mode: Option<crate::session::plan_mode::PlanModeSnapshot>,
     persisted_goal_mode: Option<crate::session::goal_tracker::GoalOrchestration>,
+    persisted_workflow_runs: Vec<crate::session::workflow::store::RestoredWorkflowRun>,
     persisted_announcement_state: Option<crate::session::announcement_state::AnnouncementState>,
     memory_config: Option<crate::config::MemoryConfig>,
     loc_tracking_enabled: bool,
@@ -2050,6 +2314,7 @@ pub(crate) async fn spawn_session_on_thread(
     app_builder_deployer_config: xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig,
     write_file_enabled: bool,
     goal_enabled: bool,
+    background_workflows_enabled: bool,
     subagents_enabled: bool,
     ask_user_question_enabled: bool,
     client_hooks: crate::extensions::hooks::ClientHooks,
@@ -2197,6 +2462,7 @@ pub(crate) async fn spawn_session_on_thread(
                         persisted_signals,
                         persisted_plan_mode,
                         persisted_goal_mode,
+                        persisted_workflow_runs,
                         persisted_announcement_state,
                         memory_config,
                         loc_tracking_enabled,
@@ -2218,6 +2484,7 @@ pub(crate) async fn spawn_session_on_thread(
                         app_builder_deployer_config,
                         write_file_enabled,
                         goal_enabled,
+                        background_workflows_enabled,
                         subagents_enabled,
                         ask_user_question_enabled,
                         client_hooks,

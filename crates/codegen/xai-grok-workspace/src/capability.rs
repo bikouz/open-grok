@@ -92,7 +92,6 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::MemoryGet,
     ToolKind::Task,
     ToolKind::AgentSwarm,
-    ToolKind::Workflow,
     ToolKind::EnterPlan,
     ToolKind::ExitPlan,
     ToolKind::AskUser,
@@ -105,6 +104,7 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::UseTool,
     ToolKind::Monitor,
     ToolKind::GoalUpdate,
+    ToolKind::Workflow,
     ToolKind::Other,
 ];
 
@@ -152,8 +152,8 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
         Execute => matches!(mode, M::Execute),
 
         // Process control (background tasks, monitors).
-        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | AgentSwarm | Workflow
-        | Monitor => {
+        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | AgentSwarm | Monitor
+        | Workflow => {
             matches!(mode, M::Execute)
         }
 

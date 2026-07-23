@@ -62,11 +62,6 @@ impl LineRange {
     pub fn new(start: usize, end: usize) -> Self {
         Self { start, end }
     }
-
-    /// Format as "(start:end)" for display.
-    pub fn display(&self) -> String {
-        format!("{}:{}", self.start, self.end)
-    }
 }
 
 impl fmt::Display for LineRange {
@@ -339,6 +334,25 @@ impl ToolCallBlock {
             }
             // Variant mismatch (shouldn't happen in practice) — skip.
             _ => {}
+        }
+    }
+
+    /// Whether the tool call finished without an error.
+    pub fn is_success(&self) -> bool {
+        match self {
+            ToolCallBlock::Execute(b) => b.is_success(),
+            ToolCallBlock::Read(b) => b.is_success(),
+            ToolCallBlock::Edit(b) => b.is_success(),
+            ToolCallBlock::Search(b) => b.is_success(),
+            ToolCallBlock::ListDir(b) => b.is_success(),
+            ToolCallBlock::WebFetch(b) => b.is_success(),
+            ToolCallBlock::WebSearch(b) => b.is_success(),
+            ToolCallBlock::IntegrationSearch(b) => b.is_success(),
+            ToolCallBlock::UseTool(b) => b.is_success(),
+            ToolCallBlock::MemorySearch(b) => b.is_success(),
+            ToolCallBlock::Skill(b) => b.is_success(),
+            ToolCallBlock::Other(b) => b.is_success(),
+            ToolCallBlock::Lifecycle(_) => true,
         }
     }
 

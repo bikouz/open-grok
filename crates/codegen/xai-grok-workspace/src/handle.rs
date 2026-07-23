@@ -3853,6 +3853,9 @@ pub async fn connect_local_workspace(
             .await;
         });
     }
+    tokio::task::spawn_blocking(|| {
+        crate::worktree::run_auto_gc_best_effort();
+    });
     let ws_handle = WorkspaceHandle::new_with_data_collection(
         ws_config,
         workspace_home,
@@ -7411,7 +7414,7 @@ pub(crate) mod tests {
             let spec = xai_grok_hooks::config::HookSpec {
                 name: "injected".into(),
                 event: xai_grok_hooks::event::HookEventName::SessionStart,
-                handler_type: "command".into(),
+                handler_type: xai_grok_hooks::config::HandlerType::Command,
                 configured_matcher: None,
                 matcher: None,
                 enabled: true,

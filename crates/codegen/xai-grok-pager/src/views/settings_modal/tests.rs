@@ -189,9 +189,10 @@ fn contextual_hints_group_sub_sheet_flow() {
         .expect("group row present");
     assert!(
         !s.rows.iter().any(|r| matches!(
-            r,
-            RowEntry::Setting { key, .. } if key.starts_with("contextual_hints.")
-        )),
+                    r,
+                    RowEntry::Setting { key, .. }
+        if key.starts_with("contextual_hints.")
+                )),
         "child rows must be hidden from the top-level list",
     );
 
@@ -857,6 +858,10 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "scroll_lines",
             "invert_scroll",
             "keep_text_selection",
+            // SHARED-owned combine_queued_prompts (Editor category; read by
+            // both the pager drain and the shell promote. Registered before
+            // multiline_mode, so it renders first).
+            "combine_queued_prompts",
             // PAGER-owned multiline (Editor category).
             "multiline_mode",
             // SHELL-owned prompt_suggestions (Editor; tab autocomplete
@@ -4466,14 +4471,23 @@ fn find_text_col(buf: &Buffer, y: u16, needle: &str) -> Option<u16> {
 #[test]
 fn section_headers_have_blank_line_above_except_first() {
     let mut s = make_state();
-    // Allocate a generous viewport so every category fits — the
-    // default registry contains 6 categories with 16 settings;
-    // the blank lines push us to ~23 lines, fits in 60.
+    // Allocate a generous viewport so every category fits, including the
+    // last one (Advanced). The blank line above a section header is only
+    // rendered when the header is not the final visible line of the row
+    // area (see `render_rows`: the gap is skipped once `y_cursor + 1`
+    // reaches `area_end`). The default registry has grown well past its
+    // original 16 settings — the Models category alone now carries the
+    // per-provider web-search-source selectors, x-search, and the
+    // Kimi/Fireworks/Perplexity credential rows — so at width 80 the full
+    // list (settings + section headers + gaps, with a few two-line rows)
+    // runs to ~65 lines. The viewport must exceed that height, otherwise
+    // the trailing `Advanced` header would render flush against the last
+    // Models row and the blank-line invariant could not be checked for it.
     let area = Rect {
         x: 0,
         y: 0,
         width: 80,
-        height: 60,
+        height: 200,
     };
     let mut buf = Buffer::empty(area);
     let theme = Theme::current();

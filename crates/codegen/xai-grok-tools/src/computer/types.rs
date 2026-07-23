@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
@@ -166,14 +165,6 @@ pub struct BackgroundHandle {
     /// gateways) or when the process exited before the PID could be
     /// captured.
     pub pid: Option<u32>,
-}
-
-/// Returned by `TerminalBackend::register_virtual_task` — control handle for
-/// a virtual (non-process) background task. `kill_task` on the backend fires
-/// the cancellation token; the task's owner observes it, winds down
-/// cooperatively, and then calls `complete_virtual_task`.
-pub struct VirtualTaskHandle {
-    pub cancellation: tokio_util::sync::CancellationToken,
 }
 
 /// Full snapshot of a task's state.
@@ -343,47 +334,6 @@ pub trait TerminalBackend: Send + Sync {
     /// backend doesn't support it (e.g. ACP/remote).
     async fn get_shell_cwd(&self) -> Option<std::path::PathBuf> {
         None
-    }
-
-    /// Register a virtual (non-process) background task tracked by this
-    /// backend — e.g. an in-process workflow run. The task then resolves
-    /// through `get_task` / `wait_for_completion` / `kill_task` /
-    /// `list_tasks` exactly like a process-backed task, for the model tools
-    /// and the TUI kill path alike. Returns `None` when the backend does not
-    /// support virtual tasks (the default).
-    async fn register_virtual_task(&self, _snapshot: TaskSnapshot) -> Option<VirtualTaskHandle> {
-        None
-    }
-
-    /// Mark a previously registered virtual task terminal, recording its
-    /// final output and exit code. Returns the finalized snapshot (including
-    /// any kill/wait flags the backend tracked), or `None` for unknown ids.
-    async fn complete_virtual_task(
-        &self,
-        _task_id: &str,
-        _output: String,
-        _exit_code: Option<i32>,
-    ) -> Option<TaskSnapshot> {
-        None
-    }
-}
-
-// ============================================================================
-// Computer struct
-// ============================================================================
-
-/// Contains the computer struct which provides access to both the terminal and the fs
-pub struct Computer {
-    pub terminal: Arc<dyn TerminalBackend>,
-    pub file_system: Arc<dyn AsyncFileSystem>,
-}
-
-impl Computer {
-    pub fn new(terminal: Arc<dyn TerminalBackend>, file_system: Arc<dyn AsyncFileSystem>) -> Self {
-        Self {
-            terminal,
-            file_system,
-        }
     }
 }
 

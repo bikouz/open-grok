@@ -719,7 +719,7 @@ async fn promo_cta_click_opens_link_and_hide_roundtrip() {
         .expect("click [label]");
 
     // Dispatch resolves the promo URL from current state and routes it via
-    // open_url_if_safe; the seam records it instead of launching a browser.
+    // try_open_url; the seam records it instead of launching a browser.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         harness.update(Duration::from_millis(100));

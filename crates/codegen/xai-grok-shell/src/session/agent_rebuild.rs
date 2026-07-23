@@ -162,6 +162,7 @@ pub(crate) struct AgentRebuildSpec {
     pub write_file_enabled: bool,
     pub subagents_enabled: bool,
     pub subagent_toggle: HashMap<String, bool>,
+    pub background_workflows_enabled: bool,
     pub ask_user_question_enabled: bool,
     pub persona_summaries: Vec<String>,
     pub prompt_audience: PromptAudience,
@@ -185,6 +186,7 @@ pub(crate) struct AgentRebuildSpec {
     pub session_id_str: String,
     pub respect_gitignore: bool,
     pub path_not_found_hints: bool,
+    pub scheduler_background_loops: bool,
     pub mcp_state: Arc<tokio::sync::Mutex<crate::session::mcp_servers::McpState>>,
     pub managed_gateway_tool_client:
         Option<xai_grok_tools::types::resources::ManagedGatewayToolClient>,
@@ -272,6 +274,7 @@ impl AgentRebuildSpec {
             write_file_enabled,
             subagents_enabled,
             subagent_toggle,
+            background_workflows_enabled,
             ask_user_question_enabled,
             persona_summaries,
             prompt_audience,
@@ -293,6 +296,7 @@ impl AgentRebuildSpec {
             session_id_str,
             respect_gitignore,
             path_not_found_hints,
+            scheduler_background_loops,
             mcp_state,
             managed_gateway_tool_client,
             is_non_interactive,
@@ -335,6 +339,7 @@ impl AgentRebuildSpec {
         .with_fs(fs_backend.clone())
         .with_subagents_enabled(*subagents_enabled)
         .with_subagent_toggle(subagent_toggle.clone())
+        .with_background_workflows_enabled(*background_workflows_enabled)
         .with_task_model_slugs({
             let mut slugs = models_manager
                 .available()
@@ -452,6 +457,12 @@ impl AgentRebuildSpec {
             .await;
         agent
             .tool_bridge()
+            .update_resource(xai_grok_tools::types::resources::SchedulerBackgroundLoops(
+                *scheduler_background_loops,
+            ))
+            .await;
+        agent
+            .tool_bridge()
             .update_resource(xai_grok_tools::types::resources::PathNotFoundHints(
                 *path_not_found_hints,
             ))
@@ -509,6 +520,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         write_file_enabled: true,
         subagents_enabled: false,
         subagent_toggle: HashMap::new(),
+        background_workflows_enabled: false,
         ask_user_question_enabled: true,
         persona_summaries: vec![],
         prompt_audience: PromptAudience::Primary,
@@ -529,6 +541,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         subagent_depth: 0,
         session_id_str: "test-session".to_string(),
         respect_gitignore: false,
+        scheduler_background_loops: true,
         path_not_found_hints: false,
         mcp_state: Arc::new(tokio::sync::Mutex::new(
             crate::session::mcp_servers::McpState::new(vec![]),

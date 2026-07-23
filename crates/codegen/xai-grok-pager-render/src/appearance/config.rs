@@ -297,22 +297,6 @@ impl Default for ScrollbarConfig {
     }
 }
 
-impl ScrollbarConfig {
-    /// Total width reserved for scrollbar (gap_left + track + gap_right).
-    pub fn total_width(&self) -> u16 {
-        if self.enabled {
-            self.gap_left + 1 + self.gap_right
-        } else {
-            0
-        }
-    }
-
-    /// Whether scrollbar fits entirely within outer_hpad_right.
-    pub fn is_outside(&self, outer_hpad_right: u16) -> bool {
-        self.gap_right < outer_hpad_right
-    }
-}
-
 /// Scroll behavior configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollConfig {

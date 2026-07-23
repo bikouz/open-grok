@@ -28,7 +28,7 @@ SubagentEvent mpsc  ──►  MvpAgent::start_subagent_coordinator (spawn_local
 | --- | --- |
 | `task` tool | `xai-grok-tools/src/implementations/grok_build/task/` |
 | `agent_swarm` tool | `xai-grok-tools/src/implementations/grok_build/agent_swarm/` |
-| `workflow` tool | `xai-grok-tools/src/implementations/grok_build/workflow/` |
+| `workflow` tool | `xai-grok-tools/src/implementations/grok_build/workflow/` (launch surface); engine `crates/codegen/xai-workflow/`; session runtime `xai-grok-shell/src/session/workflow/` |
 | Input / capability / isolation types | `crates/common/xai-tool-types/src/task.rs` |
 | Backend + events | `…/task/backend.rs`, `…/task/types.rs` |
 | Coordinator + drain | `xai-grok-shell/src/agent/subagent/`, `mvp_agent/subagent_coordinator.rs` |

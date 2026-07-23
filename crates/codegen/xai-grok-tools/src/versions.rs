@@ -292,16 +292,6 @@ pub fn tool_version_lifecycle(fq_tool_id: &str, version: &str) -> Option<Behavio
         .map(|v| v.lifecycle)
 }
 
-/// Get the suggested replacement for a specific tool+version pair.
-///
-/// Returns `None` if no replacement is configured (e.g. version is Active).
-pub fn tool_version_replacement(fq_tool_id: &str, version: &str) -> Option<&'static str> {
-    tool_supported_versions(fq_tool_id)?
-        .iter()
-        .find(|v| v.version == version)?
-        .replacement
-}
-
 /// A deprecation warning produced during version resolution.
 #[derive(Debug, Clone)]
 pub struct VersionWarning {

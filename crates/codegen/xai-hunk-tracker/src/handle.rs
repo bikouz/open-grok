@@ -7,8 +7,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::commands::HunkTrackerCommand;
 use crate::types::{
-    FileContentEntry, FileHunkData, Hunk, HunkAction, HunkActionError, HunkId, HunkSourceFilter,
-    HunkTrackerSnapshot, HunkTurnDelta, SessionSummary, TrackingMode,
+    FileContentEntry, FileHunkData, Hunk, HunkAction, HunkActionError, HunkId, HunkTrackerSnapshot,
+    HunkTurnDelta, SessionSummary,
 };
 
 /// Handle to communicate with HunkTrackerActor.
@@ -82,11 +82,6 @@ impl HunkTrackerHandle {
     /// Reset baseline for a file (after commit).
     pub fn reset_baseline(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(HunkTrackerCommand::ResetBaseline { path });
-    }
-
-    /// Set tracking mode.
-    pub fn set_mode(&self, mode: TrackingMode) {
-        let _ = self.cmd_tx.send(HunkTrackerCommand::SetMode { mode });
     }
 
     /// Apply action (accept/reject) to a specific hunk.
@@ -175,26 +170,6 @@ impl HunkTrackerHandle {
         reply_rx.await.unwrap_or_default()
     }
 
-    /// Get hunks by source.
-    pub async fn get_hunks_by_source(&self, source: HunkSourceFilter) -> Vec<Arc<Hunk>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(HunkTrackerCommand::GetHunksBySource {
-            source,
-            reply: reply_tx,
-        });
-        reply_rx.await.unwrap_or_default()
-    }
-
-    /// Get a specific hunk by ID.
-    pub async fn get_hunk(&self, hunk_id: HunkId) -> Option<Arc<Hunk>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(HunkTrackerCommand::GetHunk {
-            hunk_id,
-            reply: reply_tx,
-        });
-        reply_rx.await.ok().flatten()
-    }
-
     /// Get all tracked file paths (agent + external), regardless of hunk state.
     ///
     /// Returns every path the hunk tracker knows about — agent writes,
@@ -234,16 +209,6 @@ impl HunkTrackerHandle {
         reply_rx.await.unwrap_or_default()
     }
 
-    /// Check if path is an agent file.
-    pub async fn is_agent_file(&self, path: PathBuf) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(HunkTrackerCommand::IsAgentFile {
-            path,
-            reply: reply_tx,
-        });
-        reply_rx.await.unwrap_or(false)
-    }
-
     /// Get complete session summary (stats + pending turns).
     pub async fn get_session_summary(&self) -> SessionSummary {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -263,11 +228,6 @@ impl HunkTrackerHandle {
         reply_rx.await.unwrap_or_default()
     }
 
-    /// Reset session stats (e.g., after commit).
-    pub fn reset_stats(&self) {
-        let _ = self.cmd_tx.send(HunkTrackerCommand::ResetStats);
-    }
-
     /// Refresh all baselines from the current git HEAD and re-read current
     /// content from disk. Call this after a git HEAD/index change to
     /// reconcile stale baselines and fix phantom "file deleted" hunks.
@@ -275,21 +235,8 @@ impl HunkTrackerHandle {
         let _ = self.cmd_tx.send(HunkTrackerCommand::RefreshAllBaselines);
     }
 
-    /// Take a snapshot of all hunk tracker state for preservation across
-    /// session kill/reload cycles (e.g., fork sync-back).
-    ///
-    /// Returns `None` if the actor has been shut down.
-    pub async fn snapshot_state(&self) -> Option<HunkTrackerSnapshot> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self
-            .cmd_tx
-            .send(HunkTrackerCommand::SnapshotState { reply: reply_tx });
-        reply_rx.await.ok()
-    }
-
     /// Incremental single-turn delta for `prompt_index`: snapshots of the files
-    /// touched that turn plus its hunk-id set. Per-prompt counterpart to
-    /// [`snapshot_state`](Self::snapshot_state). `None` if the actor is shut down.
+    /// touched that turn plus its hunk-id set. `None` if the actor is shut down.
     pub async fn snapshot_turn_delta(&self, prompt_index: usize) -> Option<HunkTurnDelta> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.cmd_tx.send(HunkTrackerCommand::SnapshotTurnDelta {

@@ -877,30 +877,34 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
 fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_enum() {
     use crate::settings::SettingValue;
     use crate::views::modal::ResetSettingsResult;
-    let mut app = test_app_with_agent();
-    // Flip theme to a non-default first.
-    let _ = dispatch(Action::SetTheme("tokyonight".to_string()), &mut app);
-    assert_eq!(app.current_ui.theme.as_deref(), Some("tokyonight"));
+    // SetTheme mutates the global theme cache — serialize with the
+    // other theme tests via the theme test lock.
+    with_theme_test_env(|| {
+        let mut app = test_app_with_agent();
+        // Flip theme to a non-default first.
+        let _ = dispatch(Action::SetTheme("tokyonight".to_string()), &mut app);
+        assert_eq!(app.current_ui.theme.as_deref(), Some("tokyonight"));
 
-    setup_reset_confirm_open(&mut app, "theme");
+        setup_reset_confirm_open(&mut app, "theme");
 
-    let effects = dispatch(
-        Action::ConfirmResetSetting {
-            choice: ResetSettingsResult::Reset,
-        },
-        &mut app,
-    );
+        let effects = dispatch(
+            Action::ConfirmResetSetting {
+                choice: ResetSettingsResult::Reset,
+            },
+            &mut app,
+        );
 
-    // Reset → SetTheme("groknight") (the registered default).
-    assert_eq!(effects.len(), 1);
-    match &effects[0] {
-        Effect::PersistSetting { key, value, .. } => {
-            assert_eq!(*key, "theme");
-            assert_eq!(value, &SettingValue::Enum("groknight"));
+        // Reset → SetTheme("groknight") (the registered default).
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            Effect::PersistSetting { key, value, .. } => {
+                assert_eq!(*key, "theme");
+                assert_eq!(value, &SettingValue::Enum("groknight"));
+            }
+            other => panic!("expected PersistSetting, got {other:?}"),
         }
-        other => panic!("expected PersistSetting, got {other:?}"),
-    }
-    assert_eq!(app.current_ui.theme.as_deref(), Some("groknight"));
+        assert_eq!(app.current_ui.theme.as_deref(), Some("groknight"));
+    });
 }
 
 #[test]
@@ -914,27 +918,20 @@ fn show_usage_on_welcome_screen_is_noop() {
 }
 
 #[test]
-fn show_usage_with_redirect_url_skips_only_xai_fetch() {
+fn show_usage_with_redirect_url_fetches_session_only() {
+    // Redirect link is deferred until SessionUsageComplete (see billing tests).
     let mut app = test_app_with_agent();
     app.usage_billing_redirect_url = Some("https://billing.example.com/me".to_string());
     let before = agent_scrollback_len(&app);
     let effects = dispatch(Action::ShowUsage, &mut app);
-    assert_eq!(
-        agent_scrollback_len(&app),
-        before,
-        "the combined result should be rendered only after Codex completes"
-    );
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::FetchUsage {
-                agent_id: AgentId(0),
-                include_xai: true,
-                xai_redirect_url: Some(url),
-            }] if url == "https://billing.example.com/me"
+            [Effect::FetchSessionUsage { agent_id, .. }] if *agent_id == AgentId(0)
         ),
-        "redirect URL should bypass only xAI while Codex still fetches, got: {effects:?}"
+        "got: {effects:?}"
     );
+    assert_eq!(agent_scrollback_len(&app), before);
 }
 
 // ── Minimal update-notice tests ──────────────────────────────────────

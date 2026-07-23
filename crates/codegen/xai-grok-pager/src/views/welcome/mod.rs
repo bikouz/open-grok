@@ -626,7 +626,7 @@ pub struct WelcomeRenderParams<'a> {
     pub credit_balance: Option<&'a crate::views::credit_bar::CreditBalance>,
     /// Auto top-up rule paired with `credit_balance` for the welcome warning.
     pub auto_topup: Option<&'a crate::views::credit_bar::AutoTopupInfo>,
-    /// Whether /usage is visible (false for team users — suppresses the warning).
+    /// Consumer billing surface (false for team / API-key — no credit warning).
     pub usage_visible: bool,
     /// Cached changelog bullets for the welcome screen (up to 3).
     pub changelog_bullets: &'a [String],
@@ -2505,9 +2505,9 @@ fn render_auth_input_box(
 /// output — see `diagnostics::assemble_startup_warnings`), but only one is
 /// rendered — the severity-aware pick from `startup::banner_warning`, so a
 /// runtime-pushed Warning displaces an earlier Info entry; all of them point
-/// at `/terminal-setup`, which lists every issue. One message line, one
-/// optional action line, plus a buffer row for spacing. Severity controls
-/// color (yellow for `Warning`, dim for `Info`).
+/// at `/terminal-setup`, which remains an alias and lists every issue. One
+/// message line, one optional action line, plus a buffer row for spacing.
+/// Severity controls color (yellow for `Warning`, dim for `Info`).
 fn render_startup_warnings(
     area: Rect,
     buf: &mut Buffer,

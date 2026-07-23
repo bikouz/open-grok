@@ -206,37 +206,11 @@ pub fn blend_color(base: Color, original: Color, opacity: f32) -> Option<Color> 
     })
 }
 
-/// Blend all span colors in a line toward a base color.
-///
-/// This is useful for making content appear "faded" or "muted" by blending
-/// its colors toward the background.
-///
-/// - `opacity = 0.0`: fully faded to base color
-/// - `opacity = 1.0`: no change (original colors)
-///
-/// Named ANSI colors are left unchanged.
-pub fn blend_line(line: Line<'static>, base: Color, opacity: f32) -> Line<'static> {
-    let blended_spans: Vec<Span<'static>> = line
-        .spans
-        .into_iter()
-        .map(|span| {
-            let mut style = span.style;
-            if let Some(fg) = style.fg
-                && let Some(blended) = blend_color(base, fg, opacity)
-            {
-                style.fg = Some(blended);
-            }
-            Span::styled(span.content, style)
-        })
-        .collect();
-    Line::from(blended_spans).style(line.style)
-}
-
 /// Blend all span colors in a line toward a base color, with default foreground.
 ///
-/// Like `blend_line`, but spans without an explicit fg color are assigned
-/// `default_fg` before blending. This ensures all text gets blended, not just
-/// explicitly colored text.
+/// Spans without an explicit fg color are assigned `default_fg` before
+/// blending. This ensures all text gets blended, not just explicitly colored
+/// text.
 ///
 /// - `opacity = 0.0`: fully faded to base color
 /// - `opacity = 1.0`: no change (original colors)

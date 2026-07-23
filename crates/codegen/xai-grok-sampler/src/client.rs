@@ -140,8 +140,6 @@ fn is_unknown_top_level_response_event(error: &SamplingError, data: &str) -> boo
 /// optional `status` and provider extension fields remain on the raw object for
 /// deserialization by newer dependency versions.
 fn normalize_response_event_compat(value: &mut serde_json::Value) {
-    normalize_response_reasoning_effort(value);
-
     let Some(mut event_type) = value
         .get("type")
         .and_then(serde_json::Value::as_str)
@@ -266,7 +264,6 @@ fn normalize_actionless_web_search_item_added(value: &mut serde_json::Value) -> 
 /// This supports both synchronous responses and response objects nested in SSE
 /// terminal frames without changing the provider-native conversation model.
 fn normalize_response_compat(value: &mut serde_json::Value, default_status: &str) {
-    normalize_response_reasoning_effort(value);
     let Some(response) = value.as_object_mut() else {
         return;
     };
@@ -432,23 +429,6 @@ fn normalize_x_search_call(item: &mut serde_json::Value) {
     item.insert("call_id".to_owned(), serde_json::Value::String(call_id));
     item.insert("name".to_owned(), serde_json::Value::String(name));
     item.insert("input".to_owned(), serde_json::Value::String(input));
-}
-
-/// async-openai 0.33.1 stops at `xhigh`, while Codex may echo the accepted
-/// wire value `max`. Normalize only at the typed dependency boundary so the
-/// local Max/Ultra selection remains intact in session and picker state.
-fn normalize_response_reasoning_effort(value: &mut serde_json::Value) {
-    let path = if value.get("response").is_some() {
-        "/response/reasoning/effort"
-    } else {
-        "/reasoning/effort"
-    };
-    let Some(effort) = value.pointer_mut(path) else {
-        return;
-    };
-    if effort.as_str() == Some("max") {
-        *effort = serde_json::Value::String("xhigh".to_owned());
-    }
 }
 
 /// Apply Codex-only fields that async-openai 0.33.1 cannot represent.
@@ -4799,8 +4779,11 @@ mod tests {
     }
 
     #[test]
-    fn max_response_effort_normalizes_at_typed_boundary() {
-        let mut response = serde_json::json!({
+    fn max_response_effort_parses_at_typed_boundary() {
+        // The vendored async-openai fork carries a native `Max` variant, so a
+        // Codex-echoed `max` effort parses without any pre-normalization and
+        // the distinct tier survives into typed state.
+        let response = serde_json::json!({
             "background": false,
             "created_at": 0,
             "id": "resp_max",
@@ -4810,17 +4793,15 @@ mod tests {
             "reasoning": { "effort": "max" },
             "status": "completed"
         });
-        assert!(serde_json::from_value::<rs::Response>(response.clone()).is_err());
-        normalize_response_reasoning_effort(&mut response);
         let typed = serde_json::from_value::<rs::Response>(response).unwrap();
         assert_eq!(
             typed.reasoning.and_then(|reasoning| reasoning.effort),
-            Some(rs::ReasoningEffort::Xhigh),
+            Some(rs::ReasoningEffort::Max),
         );
     }
 
     #[test]
-    fn streamed_max_response_effort_normalizes_before_event_parse() {
+    fn streamed_max_response_effort_parses_before_event_parse() {
         let event = serde_json::json!({
             "type": "response.completed",
             "sequence_number": 1,
@@ -4836,7 +4817,6 @@ mod tests {
             }
         })
         .to_string();
-        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
         let typed = deserialize_response_event(&event).unwrap();
         let rs::ResponseStreamEvent::ResponseCompleted(completed) = typed else {
             panic!("expected response.completed");
@@ -4846,7 +4826,7 @@ mod tests {
                 .response
                 .reasoning
                 .and_then(|reasoning| reasoning.effort),
-            Some(rs::ReasoningEffort::Xhigh),
+            Some(rs::ReasoningEffort::Max),
         );
     }
 

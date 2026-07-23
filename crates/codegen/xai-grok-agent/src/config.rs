@@ -158,10 +158,6 @@ fn task_tool_config() -> ToolConfig {
 fn agent_swarm_tool_config() -> ToolConfig {
     ToolConfig::from(&grok_build::AgentSwarmTool).with_name("agent_swarm")
 }
-/// Script-driven deterministic multi-subagent orchestration.
-fn workflow_tool_config() -> ToolConfig {
-    ToolConfig::from(&grok_build::WorkflowTool).with_name("workflow")
-}
 /// Task output tool renamed for clarity:
 /// `get_task_output` → `get_command_or_subagent_output`.
 fn task_output_tool_config() -> ToolConfig {
@@ -283,7 +279,6 @@ fn default_grok_build_toolset() -> ToolServerConfig {
             wait_tasks_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
-            workflow_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -291,6 +286,7 @@ fn default_grok_build_toolset() -> ToolServerConfig {
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
         ],
         behavior_preset: None,
     }
@@ -312,41 +308,8 @@ fn grok_build_concise_toolset() -> ToolServerConfig {
             (&grok_build::SchedulerListTool).into(),
             (&grok_build::MonitorTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
         ],
-        behavior_preset: None,
-    }
-}
-/// Hashline toolset: anchor-based read/edit/search + standard utilities.
-///
-/// `hashline_tools` should be the 3 hashline `ToolConfig` entries produced by
-/// `FileToolset::Hashline.tool_configs(&hashline_config)` — they carry the
-/// scheme parameters as tool params.
-pub fn grok_build_hashline_toolset(
-    hashline_tools: Vec<xai_grok_tools::registry::types::ToolConfig>,
-) -> ToolServerConfig {
-    let mut tools: Vec<xai_grok_tools::registry::types::ToolConfig> = vec![bash_tool_config()];
-    tools.extend(hashline_tools);
-    tools.extend([
-        (&grok_build::ViewImageTool).into(),
-        (&grok_build::ListDirTool).into(),
-        kill_task_tool_config(),
-        (&grok_build::TodoWriteTool).into(),
-        task_output_tool_config(),
-        wait_tasks_tool_config(),
-        task_tool_config(),
-        agent_swarm_tool_config(),
-        workflow_tool_config(),
-        (&grok_build::WebSearchTool).into(),
-        (&grok_build::SchedulerCreateTool).into(),
-        (&grok_build::SchedulerDeleteTool).into(),
-        (&grok_build::SchedulerListTool).into(),
-        (&grok_build::MonitorTool).into(),
-        (&search_tool::SearchTool).into(),
-        (&use_tool::UseTool).into(),
-        (&grok_build::UpdateGoalTool).into(),
-    ]);
-    ToolServerConfig {
-        tools,
         behavior_preset: None,
     }
 }
@@ -365,7 +328,7 @@ fn codex_toolset() -> ToolServerConfig {
             wait_tasks_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
-            workflow_tool_config(),
+            (&grok_build::WorkflowTool).into(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -435,7 +398,6 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
             task_output_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
-            workflow_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -443,6 +405,7 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
             (&grok_build::EnterPlanModeTool).into(),
             (&grok_build::ExitPlanModeTool).into(),
             (&grok_build::AskUserQuestionTool).into(),
@@ -465,7 +428,6 @@ fn orchestrator_toolset() -> ToolServerConfig {
             (&grok_build::GrepTool).into(),
             task_tool_config(),
             agent_swarm_tool_config(),
-            workflow_tool_config(),
             task_output_tool_config(),
             wait_tasks_tool_config(),
             kill_task_tool_config(),
@@ -476,6 +438,7 @@ fn orchestrator_toolset() -> ToolServerConfig {
             (&grok_build::ExitPlanModeTool).into(),
             (&grok_build::AskUserQuestionTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -515,6 +478,7 @@ fn grok_build_plan_no_subagents_toolset() -> ToolServerConfig {
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
             (&grok_build::EnterPlanModeTool).into(),
             (&grok_build::ExitPlanModeTool).into(),
             (&grok_build::AskUserQuestionTool).into(),
@@ -541,7 +505,6 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
             wait_tasks_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
-            workflow_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -549,6 +512,7 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
             (&grok_build::AskUserQuestionTool).into(),
         ],
         behavior_preset: None,
@@ -1684,6 +1648,8 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         for required in [
             "task",
+            "agent_swarm",
+            "workflow",
             "wait_tasks",
             "get_task_output",
             "kill_task",

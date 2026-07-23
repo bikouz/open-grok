@@ -106,7 +106,6 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::KillTask(_)
         | ToolInput::Task(_)
         | ToolInput::AgentSwarm(_)
-        | ToolInput::Workflow(_)
         | ToolInput::WebSearch(_)
         | ToolInput::ImageGen(_)
         | ToolInput::ImageEdit(_)
@@ -131,6 +130,7 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::SchedulerDelete(_)
         | ToolInput::SchedulerList(_)
         | ToolInput::UpdateGoal(_)
+        | ToolInput::Workflow(_)
         | ToolInput::Dynamic(_) => return None,
     })
 }

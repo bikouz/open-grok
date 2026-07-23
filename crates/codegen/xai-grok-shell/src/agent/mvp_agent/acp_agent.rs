@@ -129,8 +129,28 @@ impl acp::Agent for MvpAgent {
         tracing::debug!(target : "sampling_log", "Received initialize request");
         xai_grok_telemetry::unified_log::info("agent initialized", None, None);
         self.start_subagent_coordinator();
-        tokio::task::spawn_blocking(|| {
+        let (auto_gc_policy, run_auto_gc) = {
+            let cfg = self.cfg.borrow();
+            let has_remote = cfg.remote_settings.is_some();
+            let run = has_remote || !crate::util::config::resolve_remote_fetch_enabled();
+            (cfg.resolve_worktree_auto_gc(), run)
+        };
+        if !run_auto_gc {
+            tracing::debug!(
+                "auto worktree gc deferred until remote_settings are available"
+            );
+        }
+        tokio::task::spawn_blocking(move || {
             crate::session::worktree_pool::cleanup_stale_pool_worktrees(None);
+            if !run_auto_gc {
+                return;
+            }
+            let opts = xai_fast_worktree::AutoGcOptions::from_resolved(auto_gc_policy);
+            if let Err(e) = xai_fast_worktree::WorktreeDb::open_default()
+                .and_then(|db| xai_fast_worktree::maybe_auto_gc(&db, &opts))
+            {
+                tracing::warn!(error = % e, "auto worktree gc failed");
+            }
         });
         tokio::task::spawn_blocking(|| {
             crate::session::persistence::cleanup_stale_sessions(None);
@@ -532,8 +552,10 @@ impl acp::Agent for MvpAgent {
                         .meta(
                             serde_json::json!(
                                 { "x.ai/fs_notify" : true, "x.ai/hooks" : { "blockingEvents"
-                                : [xai_grok_hooks::event::HookEventName::PreToolUse],
-                                "decisions" : ["deny"], }, }
+                                : crate ::extensions::hooks::ADVERTISED_BLOCKING_EVENTS,
+                                "decisions" : crate
+                                ::extensions::hooks::ADVERTISED_DECISIONS, "stopSignals" :
+                                crate ::extensions::hooks::ADVERTISED_STOP_SIGNALS, }, }
                             )
                                 .as_object()
                                 .cloned(),
@@ -1209,6 +1231,7 @@ impl acp::Agent for MvpAgent {
                         persisted_signals: None,
                         persisted_plan_mode: None,
                         persisted_goal_mode: None,
+                        persisted_workflow_runs: Vec::new(),
                         persisted_announcement_state: None,
                         previous_turn_model: None,
                         resolved_tool_policy_override: None,
@@ -1548,6 +1571,7 @@ impl acp::Agent for MvpAgent {
             signals: persisted_signals,
             announcement_state: persisted_announcement_state,
             goal_mode_state: _persisted_goal_mode,
+            workflow_runs: persisted_workflow_runs,
         } = persistence_info;
         let restored_compaction_count = persisted_signals
             .as_ref()
@@ -1857,6 +1881,7 @@ impl acp::Agent for MvpAgent {
                         persisted_signals,
                         persisted_plan_mode,
                         persisted_goal_mode: _persisted_goal_mode,
+                        persisted_workflow_runs,
                         persisted_announcement_state,
                         previous_turn_model: summary.previous_turn_model.clone(),
                         resolved_tool_policy_override: startup_tool_policy_override,
@@ -2258,12 +2283,7 @@ impl acp::Agent for MvpAgent {
     #[tracing::instrument(
         name = "agent.prompt",
         skip_all,
-        fields(
-            session_id = %arguments.session_id.0,
-            turn_number = tracing::field::Empty,
-            uploads_enabled = tracing::field::Empty,
-            upload_reason = tracing::field::Empty,
-        )
+        fields(session_id = %arguments.session_id.0, turn_number = tracing::field::Empty)
     )]
     #[allow(unused_mut)]
     async fn prompt(
@@ -2455,7 +2475,6 @@ impl acp::Agent for MvpAgent {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| self.cfg.borrow().client_version.clone());
-            let agent_config = self.cfg.borrow().clone();
             let plugin_registry = self.plugin_registry_snapshot();
             let prompt_images: Vec<agent_client_protocol::ImageContent> = arguments
                 .prompt
@@ -2537,11 +2556,9 @@ impl acp::Agent for MvpAgent {
                     let before_workspace_fut = async {};
                     futures::join!(
                         upload_session_state(& ctx, "before", session_copy_rx,
-                        UploadWait::Confirm), before_workspace_fut, upload_config(& ctx,
-                        & agent_config), crate
-                        ::upload::config_files::upload_config_files(& ctx),
-                        upload_images(& ctx, & prompt_images), upload_plugin_state(& ctx,
-                        plugin_registry.as_deref()),
+                        UploadWait::Confirm), before_workspace_fut, upload_images(& ctx,
+                        & prompt_images), upload_plugin_state(& ctx, plugin_registry
+                        .as_deref()),
                     );
                 },
             );
@@ -3663,6 +3680,12 @@ impl acp::Agent for MvpAgent {
             "x.ai/session/updates" => {
                 crate::extensions::session_updates::handle(&args, &self.gateway).await
             }
+            "x.ai/session/state" => {
+                crate::extensions::session_state::handle_state(&args).await
+            }
+            "x.ai/session/import" => {
+                crate::extensions::session_state::handle_import(&args).await
+            }
             "x.ai/session/load_history" => {
                 crate::extensions::chat_conversation_history::handle(self, &args).await
             }
@@ -3678,12 +3701,13 @@ impl acp::Agent for MvpAgent {
             | "x.ai/session/update_mcp_servers" | "x.ai/session/fork"
             | "x.ai/internal/reload_all_mcp_servers"
             | "x.ai/internal/reload_project_mcp_servers" | "x.ai/internal/reload_skills"
-            | "x.ai/internal/reload_models" | "x.ai/internal/reload_models_cache"
-            | "x.ai/internal/auth_cleared" | "x.ai/plugins/reload"
-            | "x.ai/commands/list" => {
+            | "x.ai/internal/reload_workflows" | "x.ai/internal/reload_models"
+            | "x.ai/internal/reload_models_cache" | "x.ai/internal/auth_cleared"
+            | "x.ai/plugins/reload" | "x.ai/commands/list" => {
                 crate::extensions::session_admin::handle(self, &args).await
             }
             "x.ai/session/repair" => crate::extensions::repair::handle(self, &args).await,
+            "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
             "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
                 crate::extensions::memory::handle(self, &args).await
             }
@@ -3970,9 +3994,10 @@ impl acp::Agent for MvpAgent {
                 let ops = self.resolve_workspace_ops()?;
                 crate::extensions::code_nav::handle(self, &ops, &args).await
             }
-            s if s.starts_with("x.ai/skills/") => {
+            s if s.starts_with("x.ai/skills/") || s == "x.ai/workflows/list" => {
                 let compat = self.cfg.borrow().compat_resolved;
                 crate::extensions::skills::handle(
+                        self,
                         &args,
                         self.plugin_registry_handle.snapshot().as_deref(),
                         compat,

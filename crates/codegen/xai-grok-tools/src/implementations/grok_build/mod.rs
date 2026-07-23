@@ -71,5 +71,5 @@ pub use video_gen::{
 pub use view_image::ViewImageTool;
 pub use web_fetch::{WebFetchClient, WebFetchConfig, WebFetchParams, WebFetchTool};
 pub use web_search::WebSearchTool;
-pub use workflow::WorkflowTool;
+pub use workflow::{WORKFLOW_TOOL_NAME, WorkflowTool};
 pub use x_search::XSearchTool;

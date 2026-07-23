@@ -254,6 +254,35 @@ impl SessionActor {
         }
         user_images
     }
+    pub(super) fn persist_host_turn_user_echo(&self, text: &str, prompt_id: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let mut chunk_meta = serde_json::Map::new();
+        chunk_meta.insert(
+            crate::session::storage::HOST_TURN_META_KEY.into(),
+            serde_json::json!(true),
+        );
+        if super::super::PromptOrigin::from_prompt_id(prompt_id).hide_user_echo_from_scrollback() {
+            chunk_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
+        }
+        let update = acp::SessionUpdate::UserMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                text.to_string(),
+            )))
+            .meta(Some(chunk_meta)),
+        );
+        let notification_meta = self.build_notification_meta();
+        let notification = acp::SessionNotification::new(self.session_info.id.clone(), update)
+            .meta(notification_meta.as_object().cloned());
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::Update(
+                crate::session::storage::SessionUpdate::Acp(Box::new(notification)),
+            ));
+    }
     #[tracing::instrument(
         name = "session.handle_prompt",
         skip_all,
@@ -360,11 +389,19 @@ impl SessionActor {
         };
         let availability = self.command_availability().await;
         let mut pending_skill_information: Option<String> = None;
+        let (workflow_registry, named_workflows) = self.named_workflow_snapshot();
+        let original_prompt_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
+            if let acp::ContentBlock::Text(t) = b {
+                acc.push_str(&t.text);
+            }
+            acc
+        });
         let prompt_blocks = match slash_commands::resolve(
             prompt_blocks,
             &slash_skills,
             availability,
             skill_rewrite,
+            &named_workflows,
         ) {
             Ok(blocks) => blocks,
             Err(SlashCommandOutcome::Builtin(action)) => {
@@ -386,7 +423,7 @@ impl SessionActor {
                     } => {
                         xai_grok_telemetry::session_ctx::log_event(slash_used);
                         let reminder = self.setup_goal(&objective, token_budget).await;
-                        vec![text_block(reminder), text_block(objective)]
+                        vec![text_block(reminder)]
                     }
                     BuiltinAction::GoalResume => {
                         xai_grok_telemetry::session_ctx::log_event(slash_used);
@@ -396,12 +433,24 @@ impl SessionActor {
                                 vec![text_block(reminder)]
                             }
                             GoalResumeOutcome::Message(msg) => {
-                                self.send_slash_command_output(&msg).await;
+                                self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                                self.send_host_turn_slash_command_output(&msg).await;
                                 return ok_end_turn(0, None);
                             }
                         }
                     }
-                    _ => return self.execute_builtin_slash_command(action).await,
+                    BuiltinAction::WorkflowLaunch { name, input } => {
+                        self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                        let msg = self
+                            .launch_named_workflow(&workflow_registry, &name, &input)
+                            .await;
+                        self.send_host_turn_slash_command_output(&msg).await;
+                        return ok_end_turn(0, None);
+                    }
+                    _ => {
+                        self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                        return self.execute_builtin_slash_command(action).await;
+                    }
                 }
             }
             Err(SlashCommandOutcome::SwarmPrompt { blocks }) => {
@@ -726,6 +775,7 @@ impl SessionActor {
             self.consume_deferred_completions_for_user_turn().await;
         }
         self.drain_between_turn_completions().await;
+        self.inject_workflow_status_reminder().await;
         let user_message = if user_images.is_empty() {
             user_message
         } else if self.is_cursor_harness() {
@@ -772,6 +822,9 @@ impl SessionActor {
                 }
                 super::super::PromptOrigin::SubagentCompleted { .. } => {
                     ConversationItem::subagent_completed(user_message)
+                }
+                super::super::PromptOrigin::WorkflowCompleted { .. } => {
+                    ConversationItem::notification_drain(user_message)
                 }
                 super::super::PromptOrigin::NotificationDrain => {
                     ConversationItem::notification_drain(user_message)
@@ -859,6 +912,7 @@ impl SessionActor {
             let mut round_trace = trace_gcs_config;
             let mut round_artifact = artifact_tracker;
             let mut swarm_rate_limit_attempt = 0u32;
+            let mut stop_continuations_this_turn: u32 = 0;
             loop {
                 if self.goal_harness_enabled() {
                     let goal_loop_active = self.goal_tracker.lock().status()
@@ -908,21 +962,46 @@ impl SessionActor {
                 if !matches!(round, Ok(TurnOutcome::Completed { .. })) {
                     break round;
                 }
-                if matches!(round, Ok(TurnOutcome::Completed { refusal: true, .. })) {
+                if matches!(
+                    round,
+                    Ok(TurnOutcome::Completed {
+                        refusal: Some(_),
+                        ..
+                    })
+                ) {
+                    self.auto_pause_goal_if_active_with_message(
+                        crate::session::goal_tracker::GoalPauseReason::Infra,
+                        "The model provider refused this goal round. Use /goal resume to retry."
+                            .to_string(),
+                    )
+                    .await;
                     break round;
                 }
                 let goal_active = laziness_injection_active(
                     self.goal_harness_enabled(),
                     self.goal_tracker.lock().status(),
                 );
-                if !goal_active {
-                    break round;
-                }
-                match self.run_goal_round_end().await {
-                    GoalRoundDecision::Continue(directive) => {
+                if goal_active {
+                    let decision = if self.goal_runs_on_workflow_engine() {
+                        self.run_goal_round_end().await
+                    } else {
+                        self.run_goal_round_end_legacy().await
+                    };
+                    if let GoalRoundDecision::Continue(directive) = decision {
                         self.inject_goal_continuation_message(directive).await;
+                        continue;
                     }
-                    GoalRoundDecision::EndTurn => break round,
+                }
+                match self
+                    .run_stop_gate(prompt_id, stop_continuations_this_turn)
+                    .await
+                {
+                    StopGateDecision::AllowStop => break round,
+                    StopGateDecision::KeepWorking { feedback } => {
+                        stop_continuations_this_turn += 1;
+                        self.chat_state_handle
+                            .push_user_message(ConversationItem::stop_hook_feedback(feedback));
+                    }
                 }
             }
         };
@@ -950,12 +1029,26 @@ impl SessionActor {
             })
             .await;
         match &result {
-            Ok(TurnOutcome::Completed { .. }) => {
+            Ok(TurnOutcome::Completed { refusal, .. }) => {
                 self.emit_turn_ended(
                     crate::session::events::TurnOutcomeLabel::Completed,
                     None,
                     None,
                 );
+                if let Some(explanation) = refusal {
+                    let details = (!explanation.is_empty()).then(|| explanation.clone());
+                    self.dispatch_hook(
+                        xai_grok_hooks::event::HookEventName::StopFailure,
+                        xai_grok_hooks::event::HookPayload::StopFailure {
+                            error: xai_grok_hooks::event::StopFailureKind::InvalidRequest,
+                            error_details: details.clone(),
+                            last_assistant_message: details,
+                        },
+                        Some(prompt_id),
+                        None,
+                    )
+                    .await;
+                }
                 self.send_after_turn_event(xai_tool_protocol::turn_hook::AfterTurnPayload {
                     turn_number: current_prompt_index as u64,
                     outcome: xai_tool_protocol::turn_hook::TurnHookOutcome::Completed,
@@ -994,7 +1087,7 @@ impl SessionActor {
                     tool_call_count: turn_tool_count,
                     model_id: turn_model_id.clone(),
                     written_repo_paths: Vec::new(),
-                    cancellation_category: cancellation_category_wire_string(*category),
+                    cancellation_category: cancellation_category_to_wire_string(*category),
                     cancellation_context: context.clone(),
                 })
                 .await;
@@ -1077,7 +1170,9 @@ impl SessionActor {
                 self.dispatch_hook(
                     xai_grok_hooks::event::HookEventName::StopFailure,
                     xai_grok_hooks::event::HookPayload::StopFailure {
-                        error: format!("{err}"),
+                        error: Self::stop_failure_error_type(err),
+                        error_details: Self::turn_error_detail(err),
+                        last_assistant_message: Some(Self::format_turn_error_message(err)),
                     },
                     Some(prompt_id),
                     None,
@@ -1104,22 +1199,6 @@ impl SessionActor {
                 },
             );
         }
-        let stop_reason_str = match &result {
-            Ok(TurnOutcome::Completed { .. }) => "end_turn",
-            Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. }) => {
-                "cancelled"
-            }
-            Err(_) => "error",
-        };
-        self.dispatch_hook(
-            xai_grok_hooks::event::HookEventName::Stop,
-            xai_grok_hooks::event::HookPayload::Stop {
-                reason: stop_reason_str.to_string(),
-            },
-            Some(prompt_id),
-            None,
-        )
-        .await;
         match &result {
             Ok(TurnOutcome::Completed { .. }) => {
                 for contributor in self.extension_registry.turn_lifecycle_contributors() {
@@ -1179,7 +1258,7 @@ impl SessionActor {
                         refusal,
                         ..
                     } => (
-                        if refusal {
+                        if refusal.is_some() {
                             acp::StopReason::Refusal
                         } else {
                             acp::StopReason::EndTurn
@@ -1309,6 +1388,14 @@ impl SessionActor {
         &self,
         incomplete: bool,
     ) -> Option<crate::extensions::notification::PromptUsage> {
+        let actor_background_spend = self
+            .unattributed_background_usage
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let shared_background_spend = self
+            .tool_context
+            .unattributed_background_usage
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let incomplete = incomplete || actor_background_spend || shared_background_spend;
         match self.chat_state_handle.try_get_prompt_usage().await {
             Ok(ledger) => {
                 let incomplete = incomplete || ledger.as_ref().is_some_and(|l| l.incomplete);
@@ -1345,6 +1432,11 @@ impl SessionActor {
             .map(str::to_owned)
             .or_else(|| self.current_prompt_id.lock().ok().and_then(|g| g.clone()));
         let Some(pid) = resolved else {
+            self.unattributed_background_usage
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.tool_context
+                .unattributed_background_usage
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return false;
         };
         let Some(tx) = &self.tool_context.subagent_event_tx else {
@@ -1423,11 +1515,6 @@ impl SessionActor {
     /// before this method and already transitioned the goal out of
     /// Active), both branches are skipped: neither streak moves and the
     /// existing pause cause is preserved.
-    ///
-    /// `goal_blocked_streak` is never touched here — blocked attempts end
-    /// their turns successfully, so a per-turn reset would make the
-    /// 3-streak pause unreachable. It resets on goal create / resume /
-    /// clear and on a `completed: true` `update_goal`.
     pub(crate) async fn handle_turn_end(&self, turn_succeeded: bool) {
         let goal_active_now = laziness_injection_active(
             self.goal_harness_enabled(),
@@ -2163,7 +2250,8 @@ impl SessionActor {
                 );
             }
             self.maybe_inject_mcp_reminder().await;
-            if self.two_pass_active()
+            if self.tool_context.task_output_token_budget.is_none()
+                && self.two_pass_active()
                 && !self.compaction.prefire.has_cache()
                 && self.should_prefire_two_pass().await
                 && self.compaction.prefire.try_begin()
@@ -2174,7 +2262,8 @@ impl SessionActor {
                 });
                 self.compaction.prefire.set_handle(handle);
             }
-            if let Some(trigger_info) = self.check_auto_compact_needed().await
+            if self.tool_context.task_output_token_budget.is_none()
+                && let Some(trigger_info) = self.check_auto_compact_needed().await
                 && let Err(e) = self.run_compact_only(trigger_info).await
             {
                 tracing::error!(error = % e, "Pre-sampling auto-compaction failed");
@@ -2234,6 +2323,10 @@ impl SessionActor {
                 request.json_schema = json_schema.clone();
             }
             request.hosted_tools = tool_surface.hosted_tools;
+            request.max_output_tokens = self
+                .tool_context
+                .clamp_task_model_request(request.max_output_tokens)
+                .map_err(|message| acp::Error::internal_error().data(message))?;
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2253,10 +2346,17 @@ impl SessionActor {
                 )),
             );
             let model_timer = std::time::Instant::now();
-            let (response, latency) = match self
+            let sampler_outcome = match self
                 .run_turn_via_sampler(request.clone(), !codex_auth_retry_attempted)
-                .await?
+                .await
             {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.tool_context.fail_task_output_usage_closed();
+                    return Err(error);
+                }
+            };
+            let (response, latency) = match sampler_outcome {
                 SamplerTurnOutcome::Response(r, latency) => (r, latency),
                 SamplerTurnOutcome::CompactAndResubmit => {
                     auth_retry_schedule.reset();
@@ -2566,7 +2666,7 @@ impl SessionActor {
                     snapshot: Box::new(snapshot),
                     tools_called: turn_tools_called,
                     structured_output,
-                    refusal: turn_refused,
+                    refusal: turn_refused.then(|| refusal_explanation.clone().unwrap_or_default()),
                 });
             }
             if structured_output_tool && let Some(validator) = structured_output_validator.as_ref()
@@ -2593,7 +2693,7 @@ impl SessionActor {
                             snapshot: Box::new(snapshot),
                             tools_called: turn_tools_called,
                             structured_output: Some(validated),
-                            refusal: false,
+                            refusal: None,
                         });
                     }
                     StructuredOutputStep::Retry => continue,
@@ -2702,7 +2802,9 @@ impl SessionActor {
                 return Ok(TurnOutcome::MaxTurnsReached { limit });
             }
             tool_turn_count = next_turn;
-            if let Some(trigger_info) = self.check_preflight_overflow().await {
+            if self.tool_context.task_output_token_budget.is_none()
+                && let Some(trigger_info) = self.check_preflight_overflow().await
+            {
                 if let Err(e) = self.run_compact_only(trigger_info).await {
                     tracing::error!(error = % e, "Preflight overflow compaction failed");
                 }

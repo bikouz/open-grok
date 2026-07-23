@@ -1346,7 +1346,6 @@ pub fn apply_sandbox(
             None => {}
         }
     }
-    xai_grok_sandbox::warn_sandbox_profile_conflicts(&workspace);
     if sandbox_profile != xai_grok_sandbox::ProfileName::Off {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let is_custom = matches!(sandbox_profile, xai_grok_sandbox::ProfileName::Custom(_));

@@ -17,7 +17,7 @@ use super::blocks::{
     EditToolCallBlock, ExecuteToolCallBlock, LineRange, ListDirToolCallBlock, OtherToolCallBlock,
     ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent, SessionEventBlock,
     SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock, ToolCallBlock,
-    UserPromptBlock,
+    UserPromptBlock, WorkflowBlock,
 };
 use super::types::{
     AccentStyle, BlockBackground, BlockContext, BlockOutput, DisplayMode, RenderedBlockOutput,
@@ -381,6 +381,8 @@ pub enum RenderBlock {
     Subagent(SubagentBlock),
     /// Grouped coordinated subagent swarm.
     Swarm(crate::scrollback::blocks::SwarmBlock),
+    /// Native workflow progress card.
+    Workflow(WorkflowBlock),
     /// /btw side-question response (golden accent).
     Btw(BtwBlock),
     /// `/context` snapshot with categorical bar + breakdown.
@@ -403,6 +405,7 @@ macro_rules! delegate_block {
             RenderBlock::BgTask(b) => b.$method($($arg),*),
             RenderBlock::Subagent(b) => b.$method($($arg),*),
             RenderBlock::Swarm(b) => b.$method($($arg),*),
+            RenderBlock::Workflow(b) => b.$method($($arg),*),
             RenderBlock::Btw(b) => b.$method($($arg),*),
             RenderBlock::ContextInfo(b) => b.$method($($arg),*),
             RenderBlock::CreditLimit(b) => b.$method($($arg),*),
@@ -619,9 +622,6 @@ impl RenderBlock {
     }
 
     /// Create an empty streaming agent message block.
-    ///
-    /// Use `as_agent_message_mut()` to get the block and call `push_chunk()`
-    /// to append streaming content.
     pub fn agent_message_streaming() -> Self {
         RenderBlock::AgentMessage(AgentMessageBlock::streaming())
     }
@@ -709,13 +709,6 @@ impl RenderBlock {
         RenderBlock::ToolCall(ToolCallBlock::Edit(EditToolCallBlock::new(path, hunks)))
     }
 
-    /// Create a failed Edit block (with error message).
-    pub fn edit_failed(path: impl Into<String>, error: impl Into<String>) -> Self {
-        RenderBlock::ToolCall(ToolCallBlock::Edit(
-            EditToolCallBlock::new(path, vec![]).with_error(error),
-        ))
-    }
-
     /// Create a simple Edit block (no hunks, for legacy compatibility).
     pub fn edit(path: impl Into<String>, edit_info: Option<String>) -> Self {
         let mut block = EditToolCallBlock::new(path, vec![]);
@@ -743,9 +736,6 @@ impl RenderBlock {
     }
 
     /// Create an empty streaming thinking block.
-    ///
-    /// Use `as_thinking_mut()` to get the block and call `push_chunk()`
-    /// to append streaming content.
     pub fn thinking_streaming() -> Self {
         RenderBlock::Thinking(ThinkingBlock::streaming())
     }
@@ -823,53 +813,6 @@ impl RenderBlock {
             b.description = description;
         }
         self
-    }
-
-    /// Get mutable access to a StubBlock if this is one.
-    pub fn as_stub_mut(&mut self) -> Option<&mut StubBlock> {
-        match self {
-            RenderBlock::Stub(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Get mutable access to a ToolCallBlock if this is one.
-    pub fn as_tool_call_mut(&mut self) -> Option<&mut ToolCallBlock> {
-        match self {
-            RenderBlock::ToolCall(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Get mutable access to an AgentMessageBlock if this is one.
-    ///
-    /// This is useful for streaming: get the block, then call `push_chunk()`
-    /// to append streaming content.
-    pub fn as_agent_message_mut(&mut self) -> Option<&mut AgentMessageBlock> {
-        match self {
-            RenderBlock::AgentMessage(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Get shared (read-only) access to an AgentMessageBlock if this is one.
-    ///
-    /// The read-only counterpart of [`as_agent_message_mut`](Self::as_agent_message_mut),
-    /// for inspecting a message's content (e.g. its detected diagrams) without
-    /// mutating it.
-    pub fn as_agent_message(&self) -> Option<&AgentMessageBlock> {
-        match self {
-            RenderBlock::AgentMessage(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Get mutable access to a ThinkingBlock if this is one.
-    pub fn as_thinking_mut(&mut self) -> Option<&mut ThinkingBlock> {
-        match self {
-            RenderBlock::Thinking(b) => Some(b),
-            _ => None,
-        }
     }
 
     /// Check if this block is a UserPrompt.
@@ -981,6 +924,7 @@ impl RenderBlock {
         match self {
             RenderBlock::UserPrompt(_) => Some(theme.text_primary),
             RenderBlock::AgentMessage(_) => None, // No accent for agent messages
+            RenderBlock::Workflow(_) => None,
             RenderBlock::ToolCall(block) => {
                 // Execute: Green for success, red for failure
                 // Read/Edit/ListDir/Search: No accent
@@ -1152,6 +1096,9 @@ impl RenderBlock {
                         .join("\\n"),
                 ),
             ]),
+            RenderBlock::Workflow(b) => {
+                join_searchable([Some(b.name.clone()), Some(b.objective.clone())])
+            }
             RenderBlock::Subagent(b) => {
                 // Only the failed variant carries an error string worth indexing.
                 let error = match &b.kind {

@@ -74,11 +74,6 @@ impl ModelState {
         }
     }
 
-    /// Machine-readable model ID string for the current model (e.g. "grok-4.5").
-    pub fn current_model_id_str(&self) -> Option<&str> {
-        Some(self.current.as_ref()?.0.as_ref())
-    }
-
     /// Total context window tokens for the current model (if available).
     fn current_context_window_tokens(&self) -> Option<u64> {
         let meta = self.available.get(self.current.as_ref()?)?.meta.as_ref()?;
@@ -231,9 +226,6 @@ impl ModelState {
         {
             return Some(option.value);
         }
-        // Canonical level (e.g. "high", "max"→xhigh) only if the model menu
-        // actually offers that value — not free-form power-user aliases that
-        // would 400 on the server (e.g. `none` on grok-4.5).
         let parsed = token.parse::<ReasoningEffort>().ok()?;
         options
             .iter()
