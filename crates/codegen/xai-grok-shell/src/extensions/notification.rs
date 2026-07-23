@@ -669,19 +669,26 @@ pub enum SessionUpdate {
         /// Number of errors encountered so far.
         error_count: u32,
     },
-    /// Transient runtime status for a coordinated swarm member.
+    /// Transient runtime status for a subagent.
     ///
-    /// Currently used for provider rate-limit backoff and retry attempts.
-    /// This update is never persisted to session history.
+    /// Used for coordinated-swarm provider rate-limit backoff/retry attempts,
+    /// and for out-of-process (Antigravity) member heartbeats that carry a
+    /// ready-made `label` phase. This update is never persisted to session
+    /// history.
     SubagentStatus {
         subagent_id: String,
         parent_session_id: String,
         child_session_id: String,
-        /// "rate_limit_waiting" or "rate_limit_retrying".
+        /// "rate_limit_waiting", "rate_limit_retrying", or "antigravity_phase".
         status: String,
         attempt: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
+        /// Ready-made activity label for the subagent card. When present the
+        /// client uses it verbatim (used by the Antigravity heartbeat); when
+        /// absent the client derives a label from `status`/`attempt`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     /// A subagent session has finished (success, failure, or cancellation).
     ///
@@ -1513,10 +1520,33 @@ mod tests {
             status: "rate_limit_waiting".into(),
             attempt: 2,
             retry_after_ms: Some(6_000),
+            label: None,
         };
         let json = serde_json::to_value(&update).unwrap();
         assert_eq!(json["sessionUpdate"], "subagent_status");
         assert_eq!(json["retry_after_ms"], 6_000);
+        assert!(
+            json.get("label").is_none(),
+            "None label is omitted on the wire"
+        );
+        let parsed: SessionUpdate = serde_json::from_value(json).unwrap();
+        assert_eq!(update, parsed);
+    }
+
+    #[test]
+    fn subagent_status_roundtrips_with_phase_label() {
+        let update = SessionUpdate::SubagentStatus {
+            subagent_id: "sub-agy".into(),
+            parent_session_id: "p".into(),
+            child_session_id: "c".into(),
+            status: "antigravity_phase".into(),
+            attempt: 0,
+            retry_after_ms: None,
+            label: Some("Working".into()),
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["sessionUpdate"], "subagent_status");
+        assert_eq!(json["label"], "Working");
         let parsed: SessionUpdate = serde_json::from_value(json).unwrap();
         assert_eq!(update, parsed);
     }

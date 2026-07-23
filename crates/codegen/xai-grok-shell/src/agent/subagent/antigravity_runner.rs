@@ -36,6 +36,10 @@ use super::{
 /// `OPENGROK_SUBAGENT_TIMEOUT_MS` is unset.
 const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Cadence for the live `agy.log` tailer: at most one heartbeat / quota-probe
+/// poll every this interval while a run is active.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
 fn run_timeout() -> Duration {
     std::env::var("OPENGROK_SUBAGENT_TIMEOUT_MS")
         .ok()
@@ -110,6 +114,20 @@ pub(super) async fn run_antigravity_subagent(
         let msg = format!(
             "Unknown antigravity model \"{agy_model}\". Available: {}",
             status.prefixed_models().join(", ")
+        );
+        pending_guard.set_error(msg.clone());
+        send_failure(request, &msg);
+        return;
+    }
+    // Pre-spawn availability: a prior run in this process may have cached
+    // `GetAvailableModels`. Fail fast (with quota/availability context and a
+    // reference-model suggestion) when it marks this model exhausted or absent.
+    // No-op when the cache is empty, so a cold cache never blocks a spawn.
+    if let Some(issue) = antigravity::model_availability_issue(&agy_model, &status.models) {
+        let msg = antigravity::unavailable_model_message(&agy_model, issue);
+        tracing::info!(
+            subagent_id = %request.id, model = %agy_model, ?issue,
+            "antigravity spawn short-circuited on cached availability"
         );
         pending_guard.set_error(msg.clone());
         send_failure(request, &msg);
@@ -256,7 +274,78 @@ pub(super) async fn run_antigravity_subagent(
         resumed_conversation = inherited_conversation.is_some(),
         "Running antigravity subagent via CLI"
     );
-    let run_result = antigravity::run_print(&agy_run, &status.models, &cancel_token).await;
+    // Run the CLI while tailing its log for two best-effort side channels that
+    // never affect the run result:
+    //  1. Quota probe — the LanguageServer binds a random HTTP port (logged
+    //     within ~1s) that answers `RetrieveUserQuotaSummary` only while the
+    //     run is live. We fire ONE request once the port appears and cache the
+    //     parsed summary process-globally for `/usage`.
+    //  2. Heartbeat — coarse milestone phases mapped from new log lines,
+    //     emitted (deduped, ≤1 per interval) as a `SubagentStatus` so the TUI
+    //     card shows a live phase + elapsed instead of nothing.
+    let run_result = {
+        let run_fut = antigravity::run_print(&agy_run, &status.models, &cancel_token);
+        tokio::pin!(run_fut);
+        let log_path = agy_run.log_file.clone();
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut quota_probe_started = false;
+        let mut last_phase: Option<&'static str> = None;
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut run_fut => break result,
+                _ = ticker.tick() => {
+                    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    // One-shot quota probe against the live LS port.
+                    if !quota_probe_started
+                        && let Some(port) = antigravity::parse_http_port(&log)
+                    {
+                        quota_probe_started = true;
+                        tokio::spawn(async move {
+                            // Both RPCs share the live port; fetch concurrently.
+                            let (quota, models) = tokio::join!(
+                                antigravity::fetch_quota_summary(port),
+                                antigravity::fetch_available_models(port),
+                            );
+                            match quota {
+                                Ok(buckets) => antigravity::cache_quota_summary(buckets),
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "agy quota probe failed");
+                                }
+                            }
+                            match models {
+                                Ok(models) => antigravity::cache_available_models(models),
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "agy models probe failed");
+                                }
+                            }
+                        });
+                    }
+                    // Heartbeat: emit only when the phase label changes; the
+                    // card renders elapsed live from its own spawn timestamp.
+                    let phase = antigravity::phase_from_log(&log);
+                    if last_phase != Some(phase) {
+                        last_phase = Some(phase);
+                        emit_subagent_notification(
+                            gateway,
+                            &ctx.parent_session_id,
+                            SessionUpdate::SubagentStatus {
+                                subagent_id: subagent_id.clone(),
+                                parent_session_id: ctx.parent_session_id.clone(),
+                                child_session_id: child_session_id.0.to_string(),
+                                status: "antigravity_phase".to_string(),
+                                attempt: 0,
+                                retry_after_ms: None,
+                                label: Some(phase.to_string()),
+                            },
+                            ctx.parent_cmd_tx.as_ref(),
+                        );
+                    }
+                }
+            }
+        }
+    };
     let duration_ms = start.elapsed().as_millis() as u64;
     let (result, conversation_id) = match run_result {
         Ok(outcome) => {
@@ -304,6 +393,12 @@ pub(super) async fn run_antigravity_subagent(
             (result, inherited_conversation.clone())
         }
         Err(AgyRunError::Failed(msg)) => {
+            // When the cached quota shows a relevant bucket exhausted, append it
+            // to the failure so the operator sees the likely cause + reset time.
+            let msg = match antigravity::exhausted_quota_note() {
+                Some(note) => format!("{msg}\n{note}"),
+                None => msg,
+            };
             let result = SubagentResult {
                 success: false,
                 error: Some(msg),

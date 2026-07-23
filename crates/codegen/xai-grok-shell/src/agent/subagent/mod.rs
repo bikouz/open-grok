@@ -2728,6 +2728,7 @@ fn spawn_swarm_status_relay(
                     status,
                     attempt,
                     retry_after_ms,
+                    label: None,
                 },
                 parent_cmd_tx.as_ref(),
             );

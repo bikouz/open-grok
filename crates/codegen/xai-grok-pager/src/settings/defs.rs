@@ -749,7 +749,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Agent,
             owner: SettingOwner::Shell,
             label: "Antigravity subagents",
-            description: "Let Antigravity CLI (agy) models serve as subagents for task, swarm, and workflow tools. Requires being signed in to agy. Subagents run with full access (agy skip-permissions) by default; set [antigravity] skip_permissions = false to force read-only, and callers that pin a read-only capability mode stay read-only either way. Restart required.",
+            description: "Let Antigravity CLI (agy) models serve as subagents for task, swarm, and workflow tools (e.g. antigravity:gemini-3.6-flash, the reference model). Requires being signed in to agy. Subagents run with full access (agy skip-permissions) by default; set [antigravity] skip_permissions = false to force read-only, and callers that pin a read-only capability mode stay read-only either way. Restart required.",
             keywords: &[
                 "antigravity",
                 "agy",

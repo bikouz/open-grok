@@ -598,24 +598,30 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             status,
             attempt,
             retry_after_ms,
+            label,
             ..
         } => {
-            let activity_label = match status.as_str() {
-                "rate_limit_waiting" => {
-                    let retry_after = retry_after_ms.unwrap_or_default();
-                    let retry_after = std::time::Duration::from_millis(retry_after);
-                    let retry_after_label =
-                        if retry_after.as_secs() < 10 && retry_after.subsec_millis() == 0 {
-                            format!("{}s", retry_after.as_secs())
-                        } else {
-                            crate::util::format_duration(retry_after)
-                        };
-                    format!(
-                        "Rate limited · retrying in {} · attempt {attempt}",
-                        retry_after_label
-                    )
-                }
-                _ => format!("Retrying after rate limit · attempt {attempt}"),
+            // A ready-made `label` (Antigravity heartbeat phase) is used
+            // verbatim; otherwise derive a rate-limit label from status/attempt.
+            let activity_label = match label {
+                Some(label) if !label.trim().is_empty() => label,
+                _ => match status.as_str() {
+                    "rate_limit_waiting" => {
+                        let retry_after = retry_after_ms.unwrap_or_default();
+                        let retry_after = std::time::Duration::from_millis(retry_after);
+                        let retry_after_label =
+                            if retry_after.as_secs() < 10 && retry_after.subsec_millis() == 0 {
+                                format!("{}s", retry_after.as_secs())
+                            } else {
+                                crate::util::format_duration(retry_after)
+                            };
+                        format!(
+                            "Rate limited · retrying in {} · attempt {attempt}",
+                            retry_after_label
+                        )
+                    }
+                    _ => format!("Retrying after rate limit · attempt {attempt}"),
+                },
             };
             if let Some(info) = agent.subagent_sessions.get_mut(&child_session_id) {
                 info.last_progress_at = std::time::Instant::now();
