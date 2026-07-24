@@ -246,6 +246,12 @@ impl crate::types::resources::ResourceType for BashParams {
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Product default advertised in the model-facing schema (FG). Not applied as a
+/// serde default: omit/`None` must remain "use host/FG policy, BG unbounded".
+fn schema_default_timeout_ms() -> Option<u64> {
+    Some(120_000)
+}
+
 /// Input for the bash/terminal command tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BashToolInput {
@@ -258,11 +264,14 @@ pub struct BashToolInput {
     /// the task runs until it exits or is killed via the kill task tool.
     // keep in sync with the rustdoc above
     #[schemars(
-        description = "Optional timeout in milliseconds (max 300000). Default: 120000 (2 minutes). `timeout: 0` in background mode disables the wrapper timeout entirely; the task runs until it exits or is killed via the kill task tool."
+        description = "Optional timeout in milliseconds (max 300000). Default: 120000 (2 minutes). `timeout: 0` in background mode disables the wrapper timeout entirely; the task runs until it exits or is killed via the kill task tool.",
+        default = "schema_default_timeout_ms"
     )]
     // Some models serialize numeric tool args
     // as JSON strings (`"120000"`), which a plain `Option<u64>` rejects. Accept
     // string-or-number here; the schema still advertises an integer.
+    // Serde default stays None so omit ≠ Some(120000): background omit must stay
+    // unbounded (see resolve_effective_timeout). Schema still advertises 120000.
     #[serde(
         default,
         deserialize_with = "crate::types::schema::deserialize_lenient_u64",
@@ -2028,6 +2037,7 @@ impl xai_tool_runtime::Tool for BashTool {
                 foreground_block_budget: None,
                 kind: crate::computer::types::TaskKind::Bash,
                 owner_session_id: owner_session_id.clone(),
+                description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
             };
 
             let handle = match backend.run_background(request).await {
@@ -2063,7 +2073,7 @@ impl xai_tool_runtime::Tool for BashTool {
                 output_file: bg_output_file.clone(),
                 task_id: task_id.clone(),
                 monitor_description: None,
-                description: Some(input.description.clone()),
+                description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
             });
 
             let retrieval_hint = Self::background_retrieval_hint(&resources, &task_id).await?;
@@ -2124,6 +2134,7 @@ impl xai_tool_runtime::Tool for BashTool {
                 foreground_block_budget: Self::effective_foreground_block_budget(&params),
                 kind: crate::computer::types::TaskKind::Bash,
                 owner_session_id: owner_session_id.clone(),
+                description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
             };
 
             let result = match backend.run(request).await {
@@ -2157,7 +2168,7 @@ impl xai_tool_runtime::Tool for BashTool {
                     output_file: output_file.clone(),
                     task_id: tool_call_id.as_str().to_owned(),
                     monitor_description: None,
-                    description: Some(input.description.clone()),
+                    description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
                 });
 
                 let retrieval_hint =
@@ -2224,7 +2235,7 @@ impl xai_tool_runtime::Tool for BashTool {
                 truncated: result.truncated,
                 signal: result.signal,
                 timed_out: result.timed_out,
-                description: Some(input.description),
+                description: Some(input.description).filter(|d| !d.trim().is_empty()),
                 current_dir: cwd.to_string_lossy().to_string(),
                 output_file: output_file.to_string_lossy().to_string(),
                 total_bytes: result.total_bytes,
@@ -2276,6 +2287,34 @@ impl xai_tool_runtime::Tool for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bash_timeout_schema_defaults_to_120s() {
+        let schema = serde_json::to_value(schemars::schema_for!(BashToolInput)).unwrap();
+        let timeout = &schema["properties"]["timeout"];
+        assert_eq!(
+            timeout.get("default"),
+            Some(&serde_json::json!(120_000)),
+            "timeout schema should advertise default 120000, got {timeout}"
+        );
+        // Serde omit stays None so background without timeout remains unbounded.
+        let missing: BashToolInput =
+            serde_json::from_str(r#"{"command":"ls","description":"list"}"#).unwrap();
+        assert_eq!(missing.timeout, None);
+        let zero: BashToolInput =
+            serde_json::from_str(r#"{"command":"ls","description":"list","timeout":0}"#).unwrap();
+        assert_eq!(zero.timeout, Some(0));
+        // Explicit BG omit still resolves unbounded.
+        assert_eq!(
+            BashTool::resolve_effective_timeout(
+                missing.timeout,
+                true,
+                DEFAULT_TIMEOUT,
+                DEFAULT_MAX_TIMEOUT_MS,
+            ),
+            std::time::Duration::MAX
+        );
+    }
+
     use crate::computer::types::{
         BackgroundHandle, ComputerError, KillOutcome, TaskSnapshot, TerminalBackend,
         TerminalRunRequest, TerminalRunResult,
@@ -2288,8 +2327,7 @@ mod tests {
 
     /// Models occasionally serialize numeric tool args as JSON strings. The
     /// `timeout` field must accept both `120000` and `"120000"`, stay `None`
-    /// when omitted or null. Regression for the `invalid type: string
-    /// "120000", expected u64` failure seen with some models.
+    /// when omitted or null (FG host policy / BG unbounded).
     #[test]
     fn timeout_accepts_string_or_integer() {
         let from_int: BashToolInput =

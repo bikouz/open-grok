@@ -191,7 +191,8 @@ pub(crate) fn merge_and_filter(
     for mcp_tool in mcp_snapshot {
         if baseline_ids.contains(mcp_tool.id.as_str()) {
             tracing::warn!(
-                mcp_id = % mcp_tool.id, session = % session_id,
+                mcp_id = %mcp_tool.id,
+                session = %session_id,
                 "skipping MCP tool: id collides with baseline"
             );
             continue;
@@ -199,8 +200,9 @@ pub(crate) fn merge_and_filter(
         let client_name = mcp_tool.resolve_client_name(&mcp_tool.id);
         if !taken_names.insert(client_name.clone()) {
             tracing::warn!(
-                mcp_id = % mcp_tool.id, client_name = % client_name, session = %
-                session_id,
+                mcp_id = %mcp_tool.id,
+                client_name = %client_name,
+                session = %session_id,
                 "skipping MCP tool: resolved client name collides with another tool"
             );
             continue;
@@ -211,14 +213,16 @@ pub(crate) fn merge_and_filter(
     for hub_tool in hub_snapshot {
         if baseline_ids.contains(hub_tool.id.as_str()) {
             tracing::debug!(
-                hub_id = % hub_tool.id, session = % session_id,
+                hub_id = %hub_tool.id,
+                session = %session_id,
                 "skipping remote tool: id collides with baseline"
             );
             continue;
         }
         if mcp_tool_ids.contains(hub_tool.id.as_str()) {
             tracing::debug!(
-                hub_id = % hub_tool.id, session = % session_id,
+                hub_id = %hub_tool.id,
+                session = %session_id,
                 "skipping remote tool: id collides with MCP tool"
             );
             continue;
@@ -226,8 +230,9 @@ pub(crate) fn merge_and_filter(
         let client_name = hub_tool.resolve_client_name(&hub_tool.id);
         if !taken_names.insert(client_name.clone()) {
             tracing::debug!(
-                hub_id = % hub_tool.id, client_name = % client_name, session = %
-                session_id,
+                hub_id = %hub_tool.id,
+                client_name = %client_name,
+                session = %session_id,
                 "skipping remote tool: resolved client name collides with another tool"
             );
             continue;
@@ -363,13 +368,16 @@ impl WorkspaceSessionContextFactory {
         let (dir, created) = ensure_session_dir(home, session_id);
         if let Err(e) = created {
             tracing::warn!(
-                session = % session_id, dir = % dir.display(), error = % e,
+                session = %session_id,
+                dir = %dir.display(),
+                error = %e,
                 "tool_state: failed to create session dir; persistence disabled for session"
             );
             return PathBuf::new();
         }
         tracing::debug!(
-            session = % session_id, dir = % dir.display(),
+            session = %session_id,
+            dir = %dir.display(),
             "tool_state: persistence bound to session-keyed dir"
         );
         dir.join("tool_state.json")
@@ -379,7 +387,9 @@ impl WorkspaceSessionContextFactory {
         let (dir, created) = ensure_session_dir(std::path::Path::new("/tmp"), session_id);
         if let Err(e) = created {
             tracing::warn!(
-                session = % session_id, dir = % dir.display(), error = % e,
+                session = %session_id,
+                dir = %dir.display(),
+                error = %e,
                 "session_folder: failed to create dir; tools may create it on write"
             );
         }
@@ -415,6 +425,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 image_gen_enabled: true,
                                 image_edit_enabled: true,
                                 model_override: None,
+                                edit_model_override: None,
                                 tier_restricted: false,
                             },
                             VideoGenConfig::Enabled {
@@ -457,6 +468,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
             session_env,
             notification_handle,
             owner_session_id: None,
+            subagent: None,
             parent_scheduler_handle: None,
             skills: vec![],
             state_path: self.resolve_state_path(session_id),
@@ -581,6 +593,7 @@ pub mod test_support {
                 session_env,
                 notification_handle: ToolNotificationHandle::noop(),
                 owner_session_id: None,
+                subagent: None,
                 parent_scheduler_handle: None,
                 skills: vec![],
                 state_path: session_root.join("tool_state.json"),
@@ -723,6 +736,7 @@ mod tests {
             tools: vec![
                 test_support::tc("GrokBuild:search_replace", None),
                 test_support::tc("adhoc.opaque", None),
+                // Pre-set kinds must never be overwritten by the registry.
                 test_support::tc("GrokBuild:read_file", Some(ToolKind::Search)),
             ],
             behavior_preset: Some("current".to_owned()),

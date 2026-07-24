@@ -593,6 +593,63 @@ fn show_usage_skips_hidden_xai_billing_but_still_fetches_codex() {
 }
 
 #[test]
+fn usage_fetched_appends_antigravity_section_when_quota_cached() {
+    use xai_grok_shell::agent::antigravity::{self, QuotaBucket};
+
+    let mut app = test_app_with_agent();
+    // Populate the process-global quota cache the agy runner would fill.
+    antigravity::invalidate_status_cache();
+    antigravity::cache_quota_summary(vec![
+        QuotaBucket {
+            group: "Gemini Models".to_string(),
+            display_name: "Weekly Limit".to_string(),
+            bucket_id: Some("gemini-weekly".to_string()),
+            window: Some("weekly".to_string()),
+            remaining_fraction: 1.0,
+            reset_time: Some("2026-07-30T16:00:30Z".to_string()),
+        },
+        QuotaBucket {
+            group: "Gemini Models".to_string(),
+            display_name: "Daily Limit".to_string(),
+            bucket_id: Some("gemini-daily".to_string()),
+            window: Some("daily".to_string()),
+            remaining_fraction: 0.4,
+            reset_time: None,
+        },
+    ]);
+    dispatch(
+        Action::TaskComplete(TaskResult::UsageFetched {
+            agent_id: AgentId(0),
+            xai: Ok(crate::app::actions::XaiUsageSnapshot {
+                balance: Some(test_bal(25.0)),
+                subscription_tier: None,
+                autotopup: crate::views::credit_bar::AutoTopupFetch::Cleared,
+            }),
+            codex: Err("Not connected; run `open-grok login --codex`".to_string()),
+        }),
+        &mut app,
+    );
+    let text = last_system_text(&app, AgentId(0));
+    antigravity::invalidate_status_cache();
+    assert!(text.contains("xAI\nUsage: 25%"), "got: {text}");
+    assert!(text.contains("OpenAI Codex\nNot connected."), "got: {text}");
+    assert!(
+        text.contains(
+            "Antigravity\nGemini Models · Weekly Limit: 100% left (resets 2026-07-30T16:00:30Z)"
+        ),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("Gemini Models · Daily Limit: 40% left"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("refreshed when agy subagents run"),
+        "got: {text}"
+    );
+}
+
+#[test]
 fn usage_fetched_renders_xai_and_explicit_codex_disconnected_state() {
     let mut app = test_app_with_agent();
     let before = agent_scrollback_len(&app);

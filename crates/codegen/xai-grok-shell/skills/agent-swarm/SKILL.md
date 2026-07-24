@@ -172,15 +172,26 @@ in its final message — do not instruct members to fan out again.
 
 `model` sets the model for every **new** member (resumes keep theirs). Any
 available model slug works, including the fork's Antigravity subagent slugs of
-the form **`antigravity:<model>`** (e.g. `antigravity:gemini-3.1-pro`), which run
-each member through the `agy` CLI instead of an in-process child.
+the form **`antigravity:<model>`** (reference model:
+**`antigravity:gemini-3.6-flash`**), which run each member through the `agy`
+CLI instead of an in-process child.
+
+Reasoning effort and model ids: prefer a **base id** (e.g.
+`antigravity:gemini-3.6-flash`) and let `reasoning_effort` pick the level — base
+ids accept `low|medium|high` (the fork's `xhigh`/`max`/`ultra` all collapse to
+`high`). An **effort-suffixed** id (`antigravity:gemini-3.6-flash-high`) pins the
+level itself; `--effort` is never applied to it. When a model is out of quota or
+unavailable the spawn fails fast with the reset time and suggests the reference
+model, so lead with `antigravity:gemini-3.6-flash` unless you need another.
 
 Antigravity slugs are gated: the **"Antigravity subagents"** setting
 (`[ui].antigravity_subagents`) must be on, `agy` must be installed, and you must
 be signed in to it. When the setting is off the slug is rejected with
 *"Antigravity subagents are disabled. Enable the \"Antigravity subagents\"
-setting…"*. Antigravity members run read-only unless
-`[antigravity].skip_permissions` is set.
+setting…"*. Antigravity members run with full access (agy's
+skip-permissions flag) by default; set `[antigravity] skip_permissions =
+false` to force read-only, and members whose capability mode is pinned
+read-only stay read-only either way.
 
 ## How results and failures come back
 

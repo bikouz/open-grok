@@ -899,6 +899,7 @@
             status: "rate_limit_waiting".into(),
             attempt: 1,
             retry_after_ms: Some(3_000),
+            label: None,
         };
         let _ = handle(
             make_ext_session_notification("sess-parent", waiting),
@@ -932,6 +933,7 @@
             status: "rate_limit_retrying".into(),
             attempt: 1,
             retry_after_ms: None,
+            label: None,
         };
         let _ = handle(
             make_ext_session_notification("sess-parent", retrying),

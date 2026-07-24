@@ -459,14 +459,36 @@ pub(super) fn handle_usage_fetched(
     };
     let codex_summary = match codex {
         Ok(snapshot) => crate::views::usage::format_codex_usage_summary(&snapshot),
-        Err(error) => crate::views::usage::format_codex_usage_error(&error),
+        Err(error) => {
+            let body = crate::views::usage::format_codex_usage_error(&error);
+            // The usage numbers failed to load, but the signed-in identity is
+            // known from the startup credential — still show which account is
+            // connected so `/usage` answers "who am I signed in as" regardless.
+            match app
+                .startup_codex_account
+                .as_ref()
+                .and_then(crate::views::usage::format_codex_account_header)
+            {
+                Some(header) => format!("{header}\n{body}"),
+                None => body,
+            }
+        }
     };
 
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        let mut text =
+            crate::views::usage::format_combined_usage_summary(&xai_summary, &codex_summary);
+        // Append a best-effort Antigravity section when an agy subagent has
+        // captured a quota summary this process. The cache is process-global
+        // (populated by the agy runner); nothing to show means no section.
+        if let Some(summary) = xai_grok_shell::agent::antigravity::cached_quota_summary() {
+            text.push_str("\n\nAntigravity\n");
+            text.push_str(&crate::views::usage::format_antigravity_usage_summary(
+                &summary,
+            ));
+        }
         agent.scrollback.push_block(RenderBlock::System(
-            crate::scrollback::blocks::SystemMessageBlock::new(
-                crate::views::usage::format_combined_usage_summary(&xai_summary, &codex_summary),
-            ),
+            crate::scrollback::blocks::SystemMessageBlock::new(text),
         ));
     }
     vec![]

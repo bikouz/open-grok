@@ -31,8 +31,12 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Namespace prefix that marks a task/swarm/workflow `model` argument as an
-/// Antigravity model (e.g. `antigravity:gemini-3.1-pro`).
+/// Antigravity model (e.g. `antigravity:gemini-3.6-flash`).
 pub const MODEL_PREFIX: &str = "antigravity:";
+/// The blessed reference / default Antigravity model. It is a base id (so it
+/// accepts `--effort low|medium|high`), is advertised first in the roster, and
+/// is suggested when a requested model is unavailable.
+pub const REFERENCE_MODEL: &str = "gemini-3.6-flash";
 /// Default binary name; `[antigravity].binary` overrides.
 pub const DEFAULT_BINARY: &str = "agy";
 /// `agy models` probe timeout. The command answers in ~1s when healthy.
@@ -101,13 +105,39 @@ impl AntigravityStatus {
         }
     }
 
-    /// Roster as task-tool slugs (`antigravity:<model>`).
+    /// Roster as task-tool slugs (`antigravity:<model>`), with the reference
+    /// model surfaced first (then reference effort-variants, then the rest in
+    /// probe order) so guidance leads with the blessed default.
     pub fn prefixed_models(&self) -> Vec<String> {
-        self.models
-            .iter()
+        let mut ordered: Vec<&String> = self.models.iter().collect();
+        ordered.sort_by_key(|m| reference_rank(m.as_str()));
+        ordered
+            .into_iter()
             .map(|m| format!("{MODEL_PREFIX}{m}"))
             .collect()
     }
+}
+
+/// Ordering key that floats the reference model to the front: the exact
+/// reference id first (0), its effort-variants next (1), everything else last
+/// (2). Stable within each rank, preserving the CLI's probe order.
+fn reference_rank(model: &str) -> u8 {
+    if model == REFERENCE_MODEL {
+        0
+    } else if base_model_id(model) == REFERENCE_MODEL {
+        1
+    } else {
+        2
+    }
+}
+
+/// Strip a trailing effort suffix (`-low|-medium|-high`) to recover the base
+/// model id; returns the input unchanged when there is no such suffix.
+pub fn base_model_id(model: &str) -> &str {
+    EFFORT_SUFFIXES
+        .iter()
+        .find_map(|s| model.strip_suffix(s))
+        .unwrap_or(model)
 }
 
 /// Parse `agy models` output. Exit status is deliberately ignored: agy
@@ -202,6 +232,8 @@ pub async fn cached_status(binary: &str) -> AntigravityStatus {
 pub fn invalidate_status_cache() {
     *STATUS_CACHE.lock().unwrap() = None;
     *FEATURE_CACHE.lock().unwrap() = None;
+    *QUOTA_CACHE.lock().unwrap() = None;
+    *MODELS_CACHE.lock().unwrap() = None;
 }
 
 /// Snapshot of the feature gates: `[ui].antigravity_subagents`, binary
@@ -357,13 +389,16 @@ pub fn task_slug_error_nonblocking(slug: &str) -> Option<String> {
     None
 }
 
-/// Clamp a subagent `reasoning_effort` string onto agy's `low|medium|high`.
-/// Unknown values map to `None` (omit the flag).
+/// Clamp a fork `ReasoningEffort` string onto agy's `low|medium|high`. The
+/// fork's ladder (`minimal < low < medium < high < xhigh < max < ultra`) is
+/// collapsed onto agy's three levels: anything above `medium` — including
+/// `max` and `ultra` — maps to `high`. `none`, absent, and unknown values map
+/// to `None` (omit the flag entirely).
 pub fn normalize_effort(effort: &str) -> Option<&'static str> {
     match effort.trim().to_ascii_lowercase().as_str() {
         "minimal" | "low" => Some("low"),
         "medium" => Some("medium"),
-        "high" | "xhigh" | "max" => Some("high"),
+        "high" | "xhigh" | "max" | "ultra" => Some("high"),
         _ => None,
     }
 }
@@ -623,9 +658,396 @@ pub async fn run_print(
     })
 }
 
+// ── LanguageServer quota probe (best-effort) ────────────────────────────────
+//
+// Every `agy --print` run spawns a LanguageServer that binds a random HTTP
+// port and logs it to our `--log-file` within ~1s. While the run is live, that
+// port answers a small Connect-protocol JSON RPC surface — including
+// `RetrieveUserQuotaSummary`, which reports the Gemini/model quota buckets. The
+// runner fires one such request per run and caches the parsed result
+// process-globally (mirroring [`STATUS_CACHE`]) so `/usage` can surface it. The
+// port dies with the run, so the cache is the only cross-run view of quota.
+
+/// Timeout for the single best-effort quota request fired during a run.
+const QUOTA_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One quota bucket from `RetrieveUserQuotaSummary`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaBucket {
+    /// Group `displayName`, e.g. `Gemini Models`.
+    pub group: String,
+    /// Bucket `displayName`, e.g. `Weekly Limit`.
+    pub display_name: String,
+    /// Bucket id, e.g. `gemini-weekly`.
+    pub bucket_id: Option<String>,
+    /// Window, e.g. `weekly`.
+    pub window: Option<String>,
+    /// Fraction of quota remaining in `[0, 1]`; `0` means exhausted.
+    pub remaining_fraction: f64,
+    /// RFC3339 reset time as reported by agy.
+    pub reset_time: Option<String>,
+}
+
+impl QuotaBucket {
+    /// Best display name for the bucket (falls back to the group name).
+    pub fn label(&self) -> &str {
+        if self.display_name.trim().is_empty() {
+            self.group.trim()
+        } else {
+            self.display_name.trim()
+        }
+    }
+
+    /// Whether this bucket reports no remaining quota.
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining_fraction <= 0.0
+    }
+}
+
+/// Cached quota summary plus when it was captured.
+#[derive(Debug, Clone)]
+pub struct QuotaSummary {
+    pub buckets: Vec<QuotaBucket>,
+    pub fetched_at: Instant,
+}
+
+impl QuotaSummary {
+    /// Wall-clock age of the cached summary.
+    pub fn age(&self) -> Duration {
+        self.fetched_at.elapsed()
+    }
+
+    /// First fully-exhausted bucket, if any.
+    pub fn first_exhausted(&self) -> Option<&QuotaBucket> {
+        self.buckets.iter().find(|b| b.is_exhausted())
+    }
+}
+
+/// The agy LanguageServer's HTTP port, parsed from its `--log-file`.
+///
+/// The log emits `Language server listening on random port at <PORT> for HTTP`
+/// within ~1s of a `--print` run starting. A sibling HTTPS/gRPC port line is
+/// deliberately ignored — only the line ending in `for HTTP` is the plain-JSON
+/// Connect endpoint we can POST to.
+pub fn parse_http_port(log: &str) -> Option<u16> {
+    const MARKER: &str = "listening on random port at ";
+    for line in log.lines() {
+        let trimmed = line.trim_end();
+        if !trimmed.ends_with("for HTTP") {
+            continue;
+        }
+        let Some(idx) = trimmed.find(MARKER) else {
+            continue;
+        };
+        let after = &trimmed[idx + MARKER.len()..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(port) = digits.parse::<u16>()
+            && port != 0
+        {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Parse a `RetrieveUserQuotaSummary` (or `GetAvailableModels`-shaped) response
+/// into a flat bucket list. Returns `None` for a Connect error envelope
+/// (`{"code":...,"message":...}`) or any body without a usable `response`.
+pub fn parse_quota_summary(json: &str) -> Option<Vec<QuotaBucket>> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    // Connect error envelope carries a top-level `code`/`message` and no
+    // `response` — never treat that as quota data.
+    if value.get("response").is_none() {
+        return None;
+    }
+    let groups = value.pointer("/response/groups")?.as_array()?;
+    let mut buckets = Vec::new();
+    for group in groups {
+        let group_name = group
+            .get("displayName")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let Some(bucket_values) = group.get("buckets").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for bucket in bucket_values {
+            buckets.push(QuotaBucket {
+                group: group_name.clone(),
+                display_name: bucket
+                    .get("displayName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                bucket_id: bucket
+                    .get("bucketId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                window: bucket
+                    .get("window")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                remaining_fraction: bucket
+                    .get("remainingFraction")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(1.0),
+                reset_time: bucket
+                    .get("resetTime")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            });
+        }
+    }
+    (!buckets.is_empty()).then_some(buckets)
+}
+
+/// POST `RetrieveUserQuotaSummary` to the live LanguageServer on `port`.
+/// Best-effort: any transport/parse failure returns `Err` for the caller to
+/// log at debug. The body is a literal `{}` and the response is parsed as
+/// Connect JSON, so no reqwest `json` feature is required.
+pub async fn fetch_quota_summary(port: u16) -> Result<Vec<QuotaBucket>, String> {
+    let url = format!(
+        "http://localhost:{port}/exa.language_server_pb.LanguageServerService/\
+         RetrieveUserQuotaSummary"
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Connect-Protocol-Version", "1")
+        .body("{}")
+        .timeout(QUOTA_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("agy quota request failed: {e}"))?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("agy quota body read failed: {e}"))?;
+    parse_quota_summary(&body).ok_or_else(|| {
+        let excerpt: String = body.chars().take(200).collect();
+        format!("agy quota response not parseable: {excerpt}")
+    })
+}
+
+static QUOTA_CACHE: Mutex<Option<QuotaSummary>> = Mutex::new(None);
+
+/// Store a freshly fetched quota summary, stamped now.
+pub fn cache_quota_summary(buckets: Vec<QuotaBucket>) {
+    *QUOTA_CACHE.lock().unwrap() = Some(QuotaSummary {
+        buckets,
+        fetched_at: Instant::now(),
+    });
+}
+
+/// Read the cached quota summary (populated whenever an agy subagent runs).
+pub fn cached_quota_summary() -> Option<QuotaSummary> {
+    QUOTA_CACHE.lock().unwrap().clone()
+}
+
+/// Spawn-failure annotation: when the cached quota shows any bucket fully
+/// exhausted, a short `Antigravity quota: <bucket> exhausted, resets <time>`.
+/// `None` when no cache exists or nothing is exhausted — never blocks a spawn.
+pub fn exhausted_quota_note() -> Option<String> {
+    let summary = cached_quota_summary()?;
+    let bucket = summary.first_exhausted()?;
+    Some(match bucket.reset_time.as_deref() {
+        Some(reset) if !reset.trim().is_empty() => {
+            format!(
+                "Antigravity quota: {} exhausted, resets {reset}",
+                bucket.label()
+            )
+        }
+        _ => format!("Antigravity quota: {} exhausted", bucket.label()),
+    })
+}
+
+// ── GetAvailableModels availability probe ───────────────────────────────────
+//
+// The same live LanguageServer port that answers `RetrieveUserQuotaSummary`
+// also answers `GetAvailableModels`, whose payload carries a per-model
+// `quotaInfo.remainingFraction` (plus whatever effort/reasoning-capability
+// fields agy exposes). We cache the full per-model JSON so a spawn can fail
+// fast when the requested model is out of quota, instead of eating a full run.
+
+/// One model entry from `GetAvailableModels`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelAvailability {
+    /// Model key as reported by agy (e.g. `gemini-3.6-flash`).
+    pub key: String,
+    /// `quotaInfo.remainingFraction`; `0` means exhausted.
+    pub remaining_fraction: f64,
+    /// Full per-model JSON, preserved so any effort/reasoning-capability fields
+    /// agy adds remain inspectable without a parser change.
+    pub raw: serde_json::Value,
+}
+
+impl ModelAvailability {
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining_fraction <= 0.0
+    }
+}
+
+/// A pre-spawn availability problem discovered from the cached `GetAvailableModels`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityIssue {
+    /// The model is listed but has no remaining quota.
+    Exhausted,
+    /// The model is absent from a payload whose key format matches the roster.
+    Absent,
+}
+
+/// Parse a `GetAvailableModels` response into per-model availability. Returns
+/// `None` for a Connect error envelope or any body without a usable `response`.
+pub fn parse_available_models(json: &str) -> Option<Vec<ModelAvailability>> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    if value.get("response").is_none() {
+        return None;
+    }
+    let models = value.pointer("/response/models")?.as_object()?;
+    let mut out = Vec::with_capacity(models.len());
+    for (key, entry) in models {
+        out.push(ModelAvailability {
+            key: key.clone(),
+            remaining_fraction: entry
+                .pointer("/quotaInfo/remainingFraction")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0),
+            raw: entry.clone(),
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// POST `GetAvailableModels` to the live LanguageServer on `port`. Best-effort;
+/// mirrors [`fetch_quota_summary`].
+pub async fn fetch_available_models(port: u16) -> Result<Vec<ModelAvailability>, String> {
+    let url = format!(
+        "http://localhost:{port}/exa.language_server_pb.LanguageServerService/\
+         GetAvailableModels"
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Connect-Protocol-Version", "1")
+        .body("{}")
+        .timeout(QUOTA_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("agy models request failed: {e}"))?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("agy models body read failed: {e}"))?;
+    parse_available_models(&body).ok_or_else(|| {
+        let excerpt: String = body.chars().take(200).collect();
+        format!("agy models response not parseable: {excerpt}")
+    })
+}
+
+static MODELS_CACHE: Mutex<Option<Vec<ModelAvailability>>> = Mutex::new(None);
+
+/// Store a freshly fetched per-model availability payload.
+pub fn cache_available_models(models: Vec<ModelAvailability>) {
+    *MODELS_CACHE.lock().unwrap() = Some(models);
+}
+
+/// Read the cached per-model availability payload (populated when an agy
+/// subagent runs).
+pub fn cached_available_models() -> Option<Vec<ModelAvailability>> {
+    MODELS_CACHE.lock().unwrap().clone()
+}
+
+fn key_matches(key: &str, model: &str, base: &str) -> bool {
+    key.eq_ignore_ascii_case(model)
+        || key.eq_ignore_ascii_case(base)
+        || base_model_id(key).eq_ignore_ascii_case(base)
+}
+
+/// Pre-spawn availability check against the cached `GetAvailableModels`.
+///
+/// - Returns `Exhausted` when the model is present with no remaining quota.
+/// - Returns `Absent` only when the model is missing AND the payload's key
+///   format is provably compatible with `roster` (some roster id maps to some
+///   cached key by base id). This guard prevents a differently-named payload
+///   from false-flagging every model as absent and blocking valid spawns.
+/// - Returns `None` on an empty/missing cache (never blocks on staleness).
+pub fn model_availability_issue(model: &str, roster: &[String]) -> Option<AvailabilityIssue> {
+    let models = cached_available_models()?;
+    if models.is_empty() {
+        return None;
+    }
+    let base = base_model_id(model);
+    if let Some(entry) = models.iter().find(|m| key_matches(&m.key, model, base)) {
+        return entry.is_exhausted().then_some(AvailabilityIssue::Exhausted);
+    }
+    // Not matched: only trust an "absent" verdict when the payload's naming
+    // scheme lines up with the roster; otherwise stay silent.
+    let key_format_compatible = roster.iter().any(|roster_id| {
+        let roster_base = base_model_id(roster_id);
+        models
+            .iter()
+            .any(|m| key_matches(&m.key, roster_id, roster_base))
+    });
+    key_format_compatible.then_some(AvailabilityIssue::Absent)
+}
+
+/// Build the spawn-failure message for an unavailable model: the availability
+/// verdict, a reference-model suggestion (unless the model already is the
+/// reference), and the exhausted-bucket note when the quota cache has one.
+pub fn unavailable_model_message(model: &str, issue: AvailabilityIssue) -> String {
+    let mut msg = match issue {
+        AvailabilityIssue::Exhausted => {
+            format!("Antigravity model \"{model}\" is out of quota.")
+        }
+        AvailabilityIssue::Absent => {
+            format!("Antigravity model \"{model}\" is not currently available.")
+        }
+    };
+    if base_model_id(model) != REFERENCE_MODEL {
+        msg.push_str(&format!(
+            " Try the reference model `{MODEL_PREFIX}{REFERENCE_MODEL}`."
+        ));
+    }
+    if let Some(note) = exhausted_quota_note() {
+        msg.push('\n');
+        msg.push_str(&note);
+    }
+    msg
+}
+
+/// Map the current agy `--log-file` contents to a short heartbeat phase for the
+/// subagent card. Best-effort and driven by log markers: the `for HTTP` port
+/// line and the `shutting down` line are empirically verified; the activity /
+/// conversation markers are coarse heuristics. Returns a stable `&'static str`
+/// so the runner can dedupe emissions.
+pub fn phase_from_log(log: &str) -> &'static str {
+    if log.contains("Language server shutting down") {
+        return "Wrapping up";
+    }
+    if log.contains("cascade")
+        || log.contains("Cascade")
+        || log.contains("tool_call")
+        || log.contains("ExecuteCommand")
+        || log.contains("RunCommand")
+    {
+        return "Working";
+    }
+    if log.contains("for HTTP") && log.contains("listening on random port at") {
+        return "Language server ready";
+    }
+    if log.contains("Print mode: conversation=") || log.contains("Created conversation ") {
+        return "Model resolved";
+    }
+    "Starting"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate the process-global antigravity caches
+    /// (quota / available-models), which cargo would otherwise run in parallel.
+    static CACHE_TEST_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn model_prefix_strips_and_rejects_empty() {
@@ -734,5 +1156,298 @@ mod tests {
         );
         assert_eq!(normalize_effort("minimal"), Some("low"));
         assert_eq!(normalize_effort("bogus"), None);
+    }
+
+    #[test]
+    fn effort_compat_first_attempt_suffixed_vs_base() {
+        let roster = vec![
+            "gemini-3.6-flash".to_string(),
+            "gemini-3.6-flash-high".to_string(),
+            "gemini-3.6-pro".to_string(),
+        ];
+        // Base id + any effort: --effort flows on the FIRST attempt (base ids
+        // accept it), never a suffix swap.
+        assert_eq!(
+            plan_model_args("gemini-3.6-flash", Some("ultra"), &roster),
+            ("gemini-3.6-flash".to_string(), Some("high".to_string()))
+        );
+        assert_eq!(
+            plan_model_args("gemini-3.6-flash", Some("max"), &roster),
+            ("gemini-3.6-flash".to_string(), Some("high".to_string()))
+        );
+        assert_eq!(
+            plan_model_args("gemini-3.6-pro", Some("medium"), &roster),
+            ("gemini-3.6-pro".to_string(), Some("medium".to_string()))
+        );
+        // Base id, no/none effort: omit the flag entirely.
+        assert_eq!(
+            plan_model_args("gemini-3.6-flash", Some("none"), &roster),
+            ("gemini-3.6-flash".to_string(), None)
+        );
+        assert_eq!(
+            plan_model_args("gemini-3.6-flash", None, &roster),
+            ("gemini-3.6-flash".to_string(), None)
+        );
+        // Suffixed id: NEVER pass --effort on the first attempt (agy rejects it
+        // for concrete variants); with no roster sibling the id is kept as-is.
+        assert_eq!(
+            plan_model_args("gemini-3.6-flash-high", Some("ultra"), &roster),
+            ("gemini-3.6-flash-high".to_string(), None)
+        );
+        assert_eq!(normalize_effort("ultra"), Some("high"));
+        assert_eq!(normalize_effort("none"), None);
+        assert_eq!(base_model_id("gemini-3.6-flash-high"), "gemini-3.6-flash");
+        assert_eq!(base_model_id("gemini-3.6-flash"), "gemini-3.6-flash");
+    }
+
+    #[test]
+    fn roster_advertises_reference_model_first() {
+        let status = parse_models_output(
+            "claude-sonnet-4-6\ngemini-3.6-flash-high\ngemini-3.6-flash\ngemini-3.6-pro\n",
+            "",
+        );
+        let slugs = status.prefixed_models();
+        assert_eq!(slugs[0], "antigravity:gemini-3.6-flash");
+        // Effort-variants of the reference follow it, ahead of other models.
+        assert_eq!(slugs[1], "antigravity:gemini-3.6-flash-high");
+        assert!(slugs.contains(&"antigravity:claude-sonnet-4-6".to_string()));
+        // Non-reference models keep their probe order after the reference block.
+        let pro = slugs.iter().position(|s| s == "antigravity:gemini-3.6-pro");
+        let claude = slugs
+            .iter()
+            .position(|s| s == "antigravity:claude-sonnet-4-6");
+        assert!(claude < pro, "probe order preserved within the tail");
+    }
+
+    #[test]
+    fn available_models_parse_and_reject_errors() {
+        let json = r#"{"response":{"models":{
+            "gemini-3.6-flash":{"quotaInfo":{"remainingFraction":1},"supportsEffort":true},
+            "gemini-3.6-pro":{"quotaInfo":{"remainingFraction":0}}
+        }}}"#;
+        let models = parse_available_models(json).expect("models");
+        assert_eq!(models.len(), 2);
+        let flash = models.iter().find(|m| m.key == "gemini-3.6-flash").unwrap();
+        assert_eq!(flash.remaining_fraction, 1.0);
+        assert!(!flash.is_exhausted());
+        // Unknown per-model fields are preserved in `raw`.
+        assert_eq!(
+            flash.raw.get("supportsEffort").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let pro = models.iter().find(|m| m.key == "gemini-3.6-pro").unwrap();
+        assert!(pro.is_exhausted());
+
+        assert_eq!(
+            parse_available_models(r#"{"code":"failed_precondition","message":"x"}"#),
+            None
+        );
+        assert_eq!(parse_available_models("not json"), None);
+    }
+
+    #[test]
+    fn availability_issue_flags_exhausted_and_absent_with_key_guard() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_status_cache();
+        let roster = vec!["gemini-3.6-flash".to_string(), "gemini-3.6-pro".to_string()];
+        // Cold cache never blocks.
+        assert_eq!(model_availability_issue("gemini-3.6-flash", &roster), None);
+
+        cache_available_models(vec![
+            ModelAvailability {
+                key: "gemini-3.6-flash".to_string(),
+                remaining_fraction: 1.0,
+                raw: serde_json::json!({}),
+            },
+            ModelAvailability {
+                key: "gemini-3.6-pro".to_string(),
+                remaining_fraction: 0.0,
+                raw: serde_json::json!({}),
+            },
+        ]);
+        // Present + available → None; a suffixed request matches its base key.
+        assert_eq!(model_availability_issue("gemini-3.6-flash", &roster), None);
+        assert_eq!(
+            model_availability_issue("gemini-3.6-flash-high", &roster),
+            None
+        );
+        // Present + exhausted → Exhausted.
+        assert_eq!(
+            model_availability_issue("gemini-3.6-pro", &roster),
+            Some(AvailabilityIssue::Exhausted)
+        );
+        // Absent, key format compatible with the roster → Absent.
+        assert_eq!(
+            model_availability_issue("gemini-9.9-ghost", &roster),
+            Some(AvailabilityIssue::Absent)
+        );
+        // Absent BUT key format incompatible (roster is entirely foreign) →
+        // stay silent rather than block a valid spawn.
+        let foreign_roster = vec!["totally-different-scheme".to_string()];
+        assert_eq!(
+            model_availability_issue("gemini-9.9-ghost", &foreign_roster),
+            None
+        );
+        invalidate_status_cache();
+    }
+
+    #[test]
+    fn unavailable_message_suggests_reference_and_appends_note() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_status_cache();
+        cache_quota_summary(vec![QuotaBucket {
+            group: "Gemini Models".to_string(),
+            display_name: "Daily Limit".to_string(),
+            bucket_id: Some("gemini-daily".to_string()),
+            window: Some("daily".to_string()),
+            remaining_fraction: 0.0,
+            reset_time: Some("2026-07-24T00:00:00Z".to_string()),
+        }]);
+        let msg = unavailable_model_message("gemini-3.6-pro", AvailabilityIssue::Exhausted);
+        assert!(msg.contains("out of quota"), "got: {msg}");
+        assert!(
+            msg.contains("reference model `antigravity:gemini-3.6-flash`"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("Antigravity quota: Daily Limit exhausted, resets 2026-07-24T00:00:00Z"),
+            "got: {msg}"
+        );
+        // The reference model itself is never told to switch to itself.
+        let ref_msg = unavailable_model_message("gemini-3.6-flash", AvailabilityIssue::Absent);
+        assert!(
+            !ref_msg.contains("Try the reference model"),
+            "got: {ref_msg}"
+        );
+        invalidate_status_cache();
+    }
+
+    #[test]
+    fn http_port_parsed_from_the_http_line_only() {
+        let log = "\
+I0722 lsp.go:88] Language server listening on random port at 51037 for HTTPS/gRPC\n\
+I0722 lsp.go:90] Language server listening on random port at 51042 for HTTP\n";
+        assert_eq!(parse_http_port(log), Some(51042));
+    }
+
+    #[test]
+    fn http_port_absent_when_no_http_line() {
+        let log =
+            "I0722 lsp.go:88] Language server listening on random port at 51037 for HTTPS/gRPC";
+        assert_eq!(parse_http_port(log), None);
+        assert_eq!(parse_http_port("nothing here"), None);
+    }
+
+    #[test]
+    fn quota_summary_parses_gemini_buckets() {
+        let json = r#"{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+            {"bucketId":"gemini-weekly","displayName":"Weekly Limit","window":"weekly","remainingFraction":1,"resetTime":"2026-07-30T16:00:30Z"},
+            {"bucketId":"gemini-daily","displayName":"Daily Limit","window":"daily","remainingFraction":0.25,"resetTime":"2026-07-24T00:00:00Z"}
+        ]}]}}"#;
+        let buckets = parse_quota_summary(json).expect("buckets");
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].group, "Gemini Models");
+        assert_eq!(buckets[0].display_name, "Weekly Limit");
+        assert_eq!(buckets[0].bucket_id.as_deref(), Some("gemini-weekly"));
+        assert_eq!(buckets[0].window.as_deref(), Some("weekly"));
+        assert_eq!(buckets[0].remaining_fraction, 1.0);
+        assert_eq!(
+            buckets[0].reset_time.as_deref(),
+            Some("2026-07-30T16:00:30Z")
+        );
+        assert_eq!(buckets[1].remaining_fraction, 0.25);
+        assert!(!buckets[0].is_exhausted());
+    }
+
+    #[test]
+    fn quota_summary_rejects_connect_error_envelope() {
+        let err = r#"{"code":"failed_precondition","message":"auth RPC unavailable in cli mode"}"#;
+        assert_eq!(parse_quota_summary(err), None);
+        assert_eq!(parse_quota_summary("not json"), None);
+        assert_eq!(parse_quota_summary(r#"{"response":{"groups":[]}}"#), None);
+    }
+
+    #[test]
+    fn quota_summary_defaults_missing_remaining_fraction_to_full() {
+        let json =
+            r#"{"response":{"groups":[{"displayName":"G","buckets":[{"displayName":"B"}]}]}}"#;
+        let buckets = parse_quota_summary(json).expect("buckets");
+        assert_eq!(buckets[0].remaining_fraction, 1.0);
+        assert_eq!(buckets[0].label(), "B");
+    }
+
+    #[test]
+    fn bucket_label_falls_back_to_group_name() {
+        let bucket = QuotaBucket {
+            group: "Gemini Models".to_string(),
+            display_name: String::new(),
+            bucket_id: None,
+            window: None,
+            remaining_fraction: 0.0,
+            reset_time: None,
+        };
+        assert_eq!(bucket.label(), "Gemini Models");
+        assert!(bucket.is_exhausted());
+    }
+
+    #[test]
+    fn exhausted_quota_note_reads_the_cache() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_status_cache();
+        assert_eq!(exhausted_quota_note(), None);
+        cache_quota_summary(vec![
+            QuotaBucket {
+                group: "Gemini Models".to_string(),
+                display_name: "Weekly Limit".to_string(),
+                bucket_id: Some("gemini-weekly".to_string()),
+                window: Some("weekly".to_string()),
+                remaining_fraction: 1.0,
+                reset_time: Some("2026-07-30T16:00:30Z".to_string()),
+            },
+            QuotaBucket {
+                group: "Gemini Models".to_string(),
+                display_name: "Daily Limit".to_string(),
+                bucket_id: Some("gemini-daily".to_string()),
+                window: Some("daily".to_string()),
+                remaining_fraction: 0.0,
+                reset_time: Some("2026-07-24T00:00:00Z".to_string()),
+            },
+        ]);
+        let note = exhausted_quota_note().expect("note");
+        assert_eq!(
+            note,
+            "Antigravity quota: Daily Limit exhausted, resets 2026-07-24T00:00:00Z"
+        );
+        let cached = cached_quota_summary().expect("cache");
+        assert_eq!(cached.buckets.len(), 2);
+        assert_eq!(
+            cached.first_exhausted().unwrap().display_name,
+            "Daily Limit"
+        );
+        invalidate_status_cache();
+        assert_eq!(cached_quota_summary().is_none(), true);
+    }
+
+    #[test]
+    fn phase_from_log_maps_milestones() {
+        assert_eq!(phase_from_log(""), "Starting");
+        assert_eq!(
+            phase_from_log("I0722 printmode.go:216] Print mode: conversation=abc"),
+            "Model resolved"
+        );
+        assert_eq!(
+            phase_from_log(
+                "I0722 lsp.go:90] Language server listening on random port at 51042 for HTTP"
+            ),
+            "Language server ready"
+        );
+        assert_eq!(
+            phase_from_log("I0722 cascade.go:12] cascade step running"),
+            "Working"
+        );
+        assert_eq!(
+            phase_from_log("I0722 server.go:1] Language server shutting down"),
+            "Wrapping up"
+        );
     }
 }

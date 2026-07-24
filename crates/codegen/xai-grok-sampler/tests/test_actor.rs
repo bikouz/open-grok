@@ -83,6 +83,8 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         provider: Default::default(),
         auth_scheme: Default::default(),
         extra_headers: IndexMap::new(),
+        query_params: IndexMap::new(),
+        env_http_headers: IndexMap::new(),
         context_window: 128_000,
         force_http1: false,
         // Keep retries minimal so tests don't take forever.
@@ -1022,7 +1024,10 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
             ConversationItem::system("Open Grok Codex base instructions"),
             ConversationItem::user("search the web"),
         ]);
-        request.hosted_tools = vec![HostedTool::web_search(None), HostedTool::XSearch];
+        request.hosted_tools = vec![
+            HostedTool::web_search(None),
+            HostedTool::XSearch { options: None },
+        ];
         request.x_grok_conv_id = Some("must-not-leak".into());
         request.x_grok_req_id = Some("must-not-leak".into());
         request.x_grok_session_id = Some("must-not-leak".into());
